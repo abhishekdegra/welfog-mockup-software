@@ -4003,6 +4003,144 @@ class Compositor:
         return np.clip(cover, 0.0, 1.0).astype(np.float32)
 
     @staticmethod
+    def _fill_silhouette_holes(binary: np.ndarray) -> np.ndarray:
+        """
+        Fill interior holes (camera/flash) so only the OUTER product outline
+        is used for boundary AA. Does not grow or shrink the outer edge.
+        """
+        bin_u8 = (binary > 0).astype(np.uint8) * 255
+        if np.count_nonzero(bin_u8) < 64:
+            return (binary > 0).astype(np.uint8)
+        h, w = bin_u8.shape[:2]
+        inv = cv2.bitwise_not(bin_u8)
+        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(inv, flood_mask, (0, 0), 0)
+        # Remaining non-zero in inv = closed interior holes.
+        filled = cv2.bitwise_or(bin_u8, inv)
+        return (filled > 0).astype(np.uint8)
+
+    @staticmethod
+    def _exact_coverage_aa(binary: np.ndarray, scale: int = 4) -> np.ndarray:
+        """
+        Sub-pixel coverage of an exact binary silhouette.
+
+        Upsamples with NEAREST (geometry unchanged) and downsamples once with
+        AREA — no blur, dilate, erode, or padding.
+        """
+        h, w = map(int, binary.shape[:2])
+        bin_u8 = (binary > 0).astype(np.uint8) * 255
+        ss = max(1, int(scale))
+        if ss <= 1:
+            return bin_u8.astype(np.float32) / 255.0
+        big = cv2.resize(
+            bin_u8, (w * ss, h * ss), interpolation=cv2.INTER_NEAREST
+        )
+        return (
+            cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA).astype(
+                np.float32
+            )
+            / 255.0
+        )
+
+    @staticmethod
+    def _rasterize_outer_boundary_aa(
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        coverage: np.ndarray,
+        hole_w: Optional[np.ndarray],
+        gate_f: Optional[np.ndarray] = None,
+        corner_w: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Final outer-perimeter raster only — float coverage AA, never 1-bit.
+
+        Uses the existing geometric rim gate (same corner radius / boundary)
+        as continuous coverage. Silhouette tips (side buttons) stay from the
+        current wrap mask. Camera/inner pixels are not modified.
+        """
+        if output is None or phone_bgr is None or coverage is None:
+            return output
+        h, w = output.shape[:2]
+        cov_src = np.clip(coverage.astype(np.float32), 0.0, 1.0)
+        if cov_src.shape[:2] != (h, w):
+            cov_src = cv2.resize(
+                cov_src, (w, h), interpolation=cv2.INTER_LINEAR
+            )
+        binary = (cov_src >= 0.50).astype(np.uint8)
+        if int(np.count_nonzero(binary)) < 64:
+            return output
+
+        filled = Compositor._fill_silhouette_holes(binary)
+        # Coverage AA of the current outer silhouette (buttons included).
+        sil_aa = Compositor._exact_coverage_aa(filled, scale=8)
+
+        if gate_f is not None and float(np.max(gate_f)) > 0.05:
+            g = np.clip(gate_f.astype(np.float32), 0.0, 1.0)
+            if g.shape[:2] != (h, w):
+                g = cv2.resize(g, (w, h), interpolation=cv2.INTER_LINEAR)
+            # Gate only inside the existing silhouette — same footprint, no pad.
+            gate_inside = np.where(filled > 0, g, 0.0)
+            if corner_w is not None and corner_w.shape[:2] == (h, w):
+                cw = np.clip(corner_w.astype(np.float32), 0.0, 1.0)
+                # Corners: continuous geometric arc (existing corner radius).
+                # Mid-sides: silhouette coverage (keeps volume/power tips).
+                outer_cov = (1.0 - cw) * sil_aa + cw * gate_inside
+            else:
+                outer_cov = gate_inside
+            outer_cov = np.where(filled > 0, outer_cov, 0.0)
+        else:
+            # Fallback: supersampled fill of the exact outer contour, expand=0.
+            from .mesh import _fill_closed_polyline_aa
+
+            contours, _ = cv2.findContours(
+                (filled * 255).astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_NONE,
+            )
+            if contours:
+                outer = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(
+                    np.float32
+                )
+                outer_cov = _fill_closed_polyline_aa(
+                    outer, (h, w), scale=10, expand_px=0.0
+                )
+                outer_cov = np.where(filled > 0, outer_cov, 0.0)
+            else:
+                outer_cov = sil_aa
+
+        outer_cov = np.clip(outer_cov.astype(np.float32), 0.0, 1.0)
+
+        out_f = output.astype(np.float32)
+        phone_f = phone_bgr.astype(np.float32)
+        # RGB only from inside the existing silhouette — no exterior bleed.
+        inside = filled.astype(np.float32)[:, :, np.newaxis]
+        wrap_rgb = out_f * inside + phone_f * (1.0 - inside)
+        cov3 = outer_cov[:, :, np.newaxis]
+        # Premultiplied-style over with FLOAT coverage (not re-thresholded).
+        blended = wrap_rgb * cov3 + phone_f * (1.0 - cov3)
+
+        # Touch outer transition + exterior only. Deep interior & cutouts stay.
+        apply = outer_cov < 0.997
+        if hole_w is not None and float(np.max(hole_w)) > 0.05:
+            hw = hole_w
+            if hw.shape[:2] != (h, w):
+                hw = cv2.resize(hw, (w, h), interpolation=cv2.INTER_LINEAR)
+            apply = apply & (np.clip(hw, 0.0, 1.0) < 0.45)
+        if corner_w is not None and corner_w.shape[:2] == (h, w):
+            # Always refresh corner pockets (where stairs are most visible).
+            apply = apply | ((corner_w > 0.20) & (outer_cov < 0.999) & (outer_cov > 0.0))
+            if hole_w is not None and float(np.max(hole_w)) > 0.05:
+                hw = hole_w
+                if hw.shape[:2] != (h, w):
+                    hw = cv2.resize(hw, (w, h), interpolation=cv2.INTER_LINEAR)
+                apply = apply & (np.clip(hw, 0.0, 1.0) < 0.45)
+
+        if not np.any(apply):
+            return output
+        result = np.where(apply[:, :, np.newaxis], blended, out_f)
+        return np.clip(np.round(result), 0, 255).astype(np.uint8)
+
+    @staticmethod
     def _trim_exterior_speckles(
         alpha: np.ndarray,
         phone_mask: Optional[np.ndarray],
@@ -4848,33 +4986,16 @@ class Compositor:
 
         output = np.clip(np.round(result * 255.0), 0, 255).astype(np.uint8)
 
-        # Outer-corner polish only — never blend over camera/flash cutout arcs.
-        outer_dist = MaterialRenderingEngine._outer_perimeter_distance(
-            np.clip(mask.astype(np.float32), 0.0, 1.0)
+        # Outer boundary raster AA only — camera/inner composite untouched.
+        # Float coverage from existing geometric gate (not re-binarized).
+        output = self._rasterize_outer_boundary_aa(
+            output,
+            phone_bgr,
+            mask,
+            hole_w,
+            gate_f=gate_f,
+            corner_w=corner_w,
         )
-        gate_blend = gate_f
-        if gate_blend is not None and float(np.max(gate_blend)) > 0.05:
-            if gate_blend.shape[:2] != (h, w):
-                gate_blend = cv2.resize(
-                    gate_blend, (w, h), interpolation=cv2.INTER_LINEAR
-                )
-            gate_blend = np.clip(gate_blend.astype(np.float32), 0.0, 1.0)
-        else:
-            gate_blend = rim
-        soft_band = (
-            (outer_dist > 0.0)
-            & (outer_dist <= max(4.0, float(min(h, w)) * 0.009))
-            & (corner_w > 0.28)
-        )
-        if cutout_guard is not None:
-            soft_band = soft_band & ~cutout_guard
-        if np.any(soft_band):
-            out_f = output.astype(np.float32)
-            phone_f = phone_bgr.astype(np.float32)
-            w3 = np.clip(gate_blend, 0.04, 0.92)[:, :, np.newaxis]
-            blended = out_f * w3 + phone_f * (1.0 - w3)
-            out_f = np.where(soft_band[:, :, np.newaxis], blended, out_f)
-            output = np.clip(np.round(out_f), 0, 255).astype(np.uint8)
 
         # Hard guarantee: opaque hole cores stay pixel-identical to the phone.
         # Threshold high so the soft SDF AA rim is not crushed into stairs.
