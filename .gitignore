@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.spec.bak
+
+# App runtime (regenerated locally)
+data/logs/*.log
+data/debug_iter/
+
+# One-off debug dumps (never commit)
+_*.png
+_*.jpg
+debug_*.png
+tools/diag/
+tools/diag31/
+*.pcms.bak
