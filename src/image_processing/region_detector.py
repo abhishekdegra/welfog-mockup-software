@@ -1998,9 +1998,9 @@ class HardwareRegionDetector:
                     pts = coords[i:j]
                     xs = [p[0] for p in pts]
                     ys = [p[1] for p in pts]
-                    pad_out = max(3, band // 4)
-                    pad_in = max(7, int(band * (0.58 if relaxed else 0.50)))
-                    pad_y = max(5, band // 4)
+                    pad_out = max(2, band // 5)
+                    pad_in = max(5, int(band * (0.42 if relaxed else 0.36)))
+                    pad_y = max(4, band // 5)
                     mid_x = int(round(0.5 * (min(xs) + max(xs))))
                     mid_y = int(round(0.5 * (min(ys) + max(ys))))
                     if mid_y < h * 0.06 or mid_y > h * 0.94:
@@ -2028,6 +2028,279 @@ class HardwareRegionDetector:
                             mask, x1, y1, x2, y2, corner
                         )
                 i = j
+
+    @staticmethod
+    def detect_verified_side_hardware(
+        phone_bgr: np.ndarray,
+        outer_quad: np.ndarray,
+        *,
+        phone_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Dynamic side volume / power / mute / fingerprint openings.
+
+        Photo-driven only: ridge profiles along each live bezel + optional
+        silhouette bumps. No fixed height seeds (those invented ghost wraps on
+        empty sides). Corner glare and bottom contact-shadow are rejected.
+        """
+        phone = to_bgr(phone_bgr)
+        h, w = phone.shape[:2]
+        quad = order_points(np.asarray(outer_quad, dtype=np.float32))
+        out = np.zeros((h, w), dtype=np.uint8)
+
+        strict = np.zeros((h, w), dtype=np.uint8)
+        HardwareRegionDetector._detect_side_hardware_fullres(
+            phone, strict, quad, relaxed=False
+        )
+        # Prefer strict mid-bezel hits. Fat relaxed merges climb into the
+        # camera island and later collapse with the camera cutout.
+        combined = strict.copy()
+        relaxed = np.zeros((h, w), dtype=np.uint8)
+        HardwareRegionDetector._detect_side_hardware_fullres(
+            phone, relaxed, quad, relaxed=True
+        )
+        if np.count_nonzero(relaxed):
+            gray = cv2.cvtColor(phone, cv2.COLOR_BGR2GRAY)
+            gray = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(
+                gray
+            )
+            sobel = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+            y_min = float(quad[:, 1].min())
+            y_max = float(quad[:, 1].max())
+            height = max(y_max - y_min, 1.0)
+            max_bh = height * 0.16
+            near_strict = cv2.dilate(
+                strict,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
+                iterations=1,
+            )
+            num, labels, stats, _ = cv2.connectedComponentsWithStats(
+                (relaxed > 0).astype(np.uint8), connectivity=8
+            )
+            for label in range(1, num):
+                area = int(stats[label, cv2.CC_STAT_AREA])
+                bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+                bw = int(stats[label, cv2.CC_STAT_WIDTH])
+                if area < 40 or bh > max_bh:
+                    continue
+                comp = labels == label
+                touches = np.count_nonzero(near_strict[comp]) > 0
+                e_mean = float(sobel[comp].mean()) if np.any(comp) else 0.0
+                contrast = float(gray[comp].std()) if np.any(comp) else 0.0
+                # Compact flush FP / power only — never tall wall slabs.
+                if touches or (e_mean >= 20.0 and contrast >= 7.0 and bw <= bh * 1.35):
+                    combined[comp] = 255
+
+        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+            sil = phone_mask
+            if sil.shape[:2] != (h, w):
+                sil = cv2.resize(
+                    sil, (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            bumps = HardwareRegionDetector.detect_buttons_from_silhouette(
+                sil, quad
+            )
+            if np.count_nonzero(bumps):
+                combined = cv2.max(combined, bumps)
+
+        return HardwareRegionDetector._filter_verified_side_blobs(
+            combined, phone, quad, phone_mask=phone_mask
+        )
+
+    @staticmethod
+    def _filter_verified_side_blobs(
+        mask: np.ndarray,
+        phone_bgr: np.ndarray,
+        outer_quad: np.ndarray,
+        *,
+        phone_mask: Optional[np.ndarray] = None,
+        max_per_side: int = 4,
+    ) -> np.ndarray:
+        """Keep compact mid-bezel pills; drop corners / face / studio spill."""
+        binary = (mask > 0).astype(np.uint8) * 255
+        out = np.zeros_like(binary)
+        if np.count_nonzero(binary) < 24:
+            return out
+        h, w = binary.shape[:2]
+        phone = to_bgr(phone_bgr)
+        if phone.shape[:2] != (h, w):
+            phone = cv2.resize(phone, (w, h), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(phone, cv2.COLOR_BGR2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        sobel = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+        quad = order_points(np.asarray(outer_quad, dtype=np.float32))
+        x_min = float(quad[:, 0].min())
+        x_max = float(quad[:, 0].max())
+        y_min = float(quad[:, 1].min())
+        y_max = float(quad[:, 1].max())
+        width = max(x_max - x_min, 1.0)
+        height = max(y_max - y_min, 1.0)
+        mid_x = 0.5 * (x_min + x_max)
+        side_band = width * 0.16
+        gate = None
+        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+            gate = phone_mask
+            if gate.shape[:2] != (h, w):
+                gate = cv2.resize(
+                    gate, (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            gate = cv2.dilate(
+                (gate > 127).astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                iterations=1,
+            )
+
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        scored_l: List[Tuple[float, int]] = []
+        scored_r: List[Tuple[float, int]] = []
+        for label in range(1, num):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < 28 or area > int(h * w * 0.04):
+                continue
+            x = int(stats[label, cv2.CC_STAT_LEFT])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            bw = int(stats[label, cv2.CC_STAT_WIDTH])
+            bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+            cx = x + bw * 0.5
+            cy = y + bh * 0.5
+            t = (cy - y_min) / height
+            # Corners are glare / contact shadow — never side hardware.
+            if t < 0.09 or t > 0.88:
+                continue
+            near_side = (cx - x_min) <= side_band or (x_max - cx) <= side_band
+            if not near_side:
+                continue
+            # Stay on the thin bezel — face/camera islands sit further inward.
+            edge_dist = min(cx - x_min, x_max - cx)
+            if edge_dist > width * 0.11:
+                continue
+            if bw > width * 0.15 or bh > height * 0.20:
+                continue
+            # Camera module lives on the upper face, not the outer 6% bezel.
+            if t < 0.16 and edge_dist > width * 0.08:
+                continue
+            # Long thin wall slabs are ghosts, not buttons.
+            if bh > height * 0.20 and bw < width * 0.045:
+                continue
+            aspect = max(bw, bh) / max(min(bw, bh), 1e-3)
+            if aspect < 1.05 and max(bw, bh) > width * 0.12:
+                continue
+            comp = labels == label
+            if gate is not None:
+                overlap = float(np.count_nonzero(comp & (gate > 0)))
+                if overlap < area * 0.35:
+                    continue
+            contrast = float(gray[comp].std())
+            edge_mean = float(sobel[comp].mean())
+            if contrast < 3.0 and edge_mean < 10.0:
+                continue
+            score = (
+                float(area)
+                + 3.0 * float(bh)
+                + 1.5 * edge_mean
+                + 2.0 * contrast
+            )
+            # Prefer mid-upper bezel (volume / power / side FP cluster).
+            score += 40.0 * (1.0 - abs(t - 0.28))
+            if cx < mid_x:
+                scored_l.append((score, label))
+            else:
+                scored_r.append((score, label))
+
+        for scored in (scored_l, scored_r):
+            scored.sort(reverse=True)
+            for _, label in scored[: max(1, int(max_per_side))]:
+                # Paint a tight capsule from the blob bounds (not the fat pad).
+                x = int(stats[label, cv2.CC_STAT_LEFT])
+                y = int(stats[label, cv2.CC_STAT_TOP])
+                bw = int(stats[label, cv2.CC_STAT_WIDTH])
+                bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+                cx = x + bw * 0.5
+                # Slight shrink so wrap wall remains around the opening.
+                pad = max(1, int(round(min(bw, bh) * 0.08)))
+                x1 = max(0, x + pad)
+                y1 = max(0, y + pad)
+                x2 = min(w - 1, x + bw - pad)
+                y2 = min(h - 1, y + bh - pad)
+                # Snap to the outer bezel so volume/FP cut on the rim, not the face.
+                box_w = max(4, x2 - x1)
+                if cx < mid_x:
+                    x1 = int(np.clip(round(x_min + width * 0.004), 0, w - 2))
+                    x2 = int(np.clip(x1 + box_w, x1 + 4, w - 1))
+                else:
+                    x2 = int(np.clip(round(x_max - width * 0.004), 1, w - 1))
+                    x1 = int(np.clip(x2 - box_w, 0, x2 - 4))
+                if x2 - x1 < 4 or y2 - y1 < 6:
+                    continue
+                corner = max(2, min(x2 - x1, y2 - y1) // 2)
+                HardwareRegionDetector._rounded_rectangle(
+                    out, x1, y1, x2, y2, corner
+                )
+        return out
+
+    @staticmethod
+    def filter_volume_button_mask(
+        mask: np.ndarray,
+        outer_quad: np.ndarray,
+        *,
+        allow_compact: bool = False,
+    ) -> Optional[np.ndarray]:
+        """
+        Keep volume-rocker-like side openings (elongated bezel pills).
+
+        Shape is judged relative to the live phone quad — no fixed millimetre
+        sizes. Compact power / FP pills are dropped unless ``allow_compact``.
+        """
+        binary = (mask > 0).astype(np.uint8) * 255
+        if np.count_nonzero(binary) < 24:
+            return None
+        h, w = binary.shape[:2]
+        quad = order_points(np.asarray(outer_quad, dtype=np.float32))
+        x_min = float(quad[:, 0].min())
+        x_max = float(quad[:, 0].max())
+        y_min = float(quad[:, 1].min())
+        y_max = float(quad[:, 1].max())
+        width = max(x_max - x_min, 1.0)
+        height = max(y_max - y_min, 1.0)
+        out = np.zeros((h, w), dtype=np.uint8)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        kept = 0
+        for label in range(1, num):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < 20:
+                continue
+            bw = int(stats[label, cv2.CC_STAT_WIDTH])
+            bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+            cy = float(
+                stats[label, cv2.CC_STAT_TOP]
+                + stats[label, cv2.CC_STAT_HEIGHT] * 0.5
+            )
+            t = (cy - y_min) / height
+            if t < 0.08 or t > 0.90:
+                continue
+            # Volume rockers are elongated along the bezel. Thresholds are
+            # fractions of the live phone height — no fixed pixel sizes.
+            long_edge = max(bw, bh)
+            short_edge = max(min(bw, bh), 1)
+            aspect = long_edge / float(short_edge)
+            span_frac = long_edge / height
+            is_volume = aspect >= 1.25 and span_frac >= 0.045
+            # Compact FP / power pills — skip unless caller allows mid-bezel
+            # ridges that are only mildly elongated.
+            is_compact_fp = aspect < 1.20 and span_frac < 0.055
+            if is_volume:
+                out[labels == label] = 255
+                kept += 1
+            elif allow_compact and not is_compact_fp and aspect >= 1.18:
+                out[labels == label] = 255
+                kept += 1
+        if kept == 0 or np.count_nonzero(out) < 24:
+            return None
+        return out
 
     @staticmethod
     def detect_buttons_from_silhouette(

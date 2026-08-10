@@ -2141,11 +2141,11 @@ def create_mesh_mask(
         outline,
         (height, width),
         # Higher supersample = smooth quarter-circles (no stair-step "katna").
-        scale=8,
+        scale=10,
         expand_px=(
             0.20
             if prefer_live_boundary
-            else (0.85 if smooth_boundary else 0.0)
+            else (0.95 if smooth_boundary else 0.0)
         ),
     )
 

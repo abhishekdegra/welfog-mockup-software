@@ -53,10 +53,10 @@ class LightingProfile:
 MATERIALS: Dict[str, MaterialProfile] = {
     "Glossy": MaterialProfile(
         "Glossy",
-        # Keep gloss lively but never bleach print colours.
-        reflection=0.48, highlight=0.42, shadow_softness=0.38,
-        surface_contrast=0.58, texture_strength=0.50, opacity=1.0,
-        grain=0.0, micro_blur=0.0, edge_softness=0.025, texture_kind="none",
+        # Lively rim sheen without bleaching print colours.
+        reflection=0.56, highlight=0.50, shadow_softness=0.36,
+        surface_contrast=0.60, texture_strength=0.48, opacity=1.0,
+        grain=0.0, micro_blur=0.0, edge_softness=0.02, texture_kind="none",
     ),
     "Matte": MaterialProfile(
         "Matte",
@@ -688,8 +688,8 @@ class MaterialRenderingEngine:
         lighting: Optional[LightingProfile] = None,
     ) -> np.ndarray:
         """
-        Raised volume/power wrap: design stays on the buttons with moulded
-        capsule shading so sides read as hugged ridges, not a flat print.
+        Subtle volume ridge: design stays on the rockers with light AO + sheen
+        so buttons read as thin raised hardware — not thick pillows.
         """
         lighting = lighting or LightingProfile("Studio")
         coverage = np.clip(mask.astype(np.float32), 0.0, 1.0)
@@ -701,7 +701,8 @@ class MaterialRenderingEngine:
         result = np.clip(design.astype(np.float32), 0.0, 1.0).copy()
         h, w = coverage.shape[:2]
         short = float(min(h, w))
-        ridge_w = float(np.clip(short * 0.010, 3.0, 7.0))
+        # Narrow ridge — real side keys are shallow under a skin wrap.
+        ridge_w = float(np.clip(short * 0.008, 2.4, 5.5))
 
         core = (gate > 0.40).astype(np.uint8)
         if int(np.count_nonzero(core)) < 16:
@@ -712,10 +713,10 @@ class MaterialRenderingEngine:
         dist_out = cv2.distanceTransform(
             (1 - core) * 255, cv2.DIST_L2, 5
         ).astype(np.float32)
-        height = np.clip(dist_in / max(ridge_w * 0.85, 1e-3), 0.0, 1.0)
-        height = height * np.clip(1.0 - dist_out / ridge_w, 0.0, 1.0)
+        height = np.clip(dist_in / max(ridge_w * 0.90, 1e-3), 0.0, 1.0)
+        height = height * np.clip(1.0 - dist_out / max(ridge_w * 0.85, 1e-3), 0.0, 1.0)
         height = height * coverage
-        height = cv2.GaussianBlur(height, (0, 0), max(0.6, ridge_w * 0.18))
+        height = cv2.GaussianBlur(height, (0, 0), max(0.45, ridge_w * 0.12))
         if float(np.max(height)) < 0.02:
             return result
 
@@ -727,25 +728,34 @@ class MaterialRenderingEngine:
         dx, dy = lighting.direction
         length = max(float(np.hypot(dx, dy)), 1e-6)
         lx, ly = -dx / length, -dy / length
-        l_up = 0.78 + 0.08 * lighting.softness
+        l_up = 0.80 + 0.08 * lighting.softness
         l_side = float(np.sqrt(max(1.0 - l_up * l_up, 1e-4)))
         Lx, Ly, Lz = lx * l_side, ly * l_side, l_up
         diffuse = np.clip(nx * Lx + ny * Ly + nz * Lz, 0.0, 1.0)
         lit = np.clip((diffuse - Lz) / max(1.0 - Lz, 1e-3), 0.0, 1.0)
         dim = np.clip((Lz - diffuse) / max(Lz, 1e-3), 0.0, 1.0)
-        band = np.clip(height * 1.55, 0.0, 1.0)
+        band = np.clip(height * 1.35, 0.0, 1.0)
 
-        sheen = lit * band * (0.72 * lighting.highlight_scale)
-        sheen = cv2.GaussianBlur(sheen, (0, 0), max(0.45, ridge_w * 0.12))
-        result = MaterialRenderingEngine._soft_specular_lift(
-            result, sheen, preserve_chroma=True, white_mix=0.06
+        # Soft contact shadow under the key — keeps the button "on top".
+        rim = np.clip(1.0 - dist_out / max(ridge_w * 0.70, 1e-3), 0.0, 1.0)
+        rim = rim * (1.0 - np.clip(dist_in / max(ridge_w * 0.45, 1e-3), 0.0, 1.0))
+        rim = rim * coverage
+        rim = cv2.GaussianBlur(rim, (0, 0), max(0.4, ridge_w * 0.08))
+        ao = np.clip(
+            dim * band * (0.14 + 0.08 * lighting.softness) + rim * 0.10,
+            0.0,
+            0.22,
         )
-        ao = dim * band * (0.20 + 0.10 * lighting.softness)
         result = np.clip(result * (1.0 - ao[:, :, np.newaxis]), 0.0, 1.0)
-        # Tiny crest lift so volume/power read as moulded ridges on the wrap.
-        crest = np.clip(height * height * 0.18, 0.0, 0.16)
+
+        sheen = lit * band * (0.55 * lighting.highlight_scale)
+        sheen = cv2.GaussianBlur(sheen, (0, 0), max(0.35, ridge_w * 0.08))
         result = MaterialRenderingEngine._soft_specular_lift(
-            result, crest, preserve_chroma=True, white_mix=0.03
+            result, sheen, preserve_chroma=True, white_mix=0.04
+        )
+        crest = np.clip(height * height * 0.14, 0.0, 0.12)
+        result = MaterialRenderingEngine._soft_specular_lift(
+            result, crest, preserve_chroma=True, white_mix=0.025
         )
         return np.clip(result, 0.0, 1.0)
 

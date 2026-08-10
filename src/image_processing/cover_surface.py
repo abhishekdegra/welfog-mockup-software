@@ -757,8 +757,8 @@ class CoverSurfaceEngine:
         thr = float(max(2.5, np.percentile(core_dist, 5) * 0.32))
         device = (dist >= thr).astype(np.uint8) * 255
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        # Soft shadows + silver rim sit below pure card white.
-        not_card = (gray < 250).astype(np.uint8) * 255
+        # Soft shadows + silver rim — keep near-white metal (not pure card).
+        not_card = (gray < 254).astype(np.uint8) * 255
         device = cv2.bitwise_or(device, not_card)
         ring = cv2.bitwise_and(grown, device)
         out = cv2.bitwise_or(m, ring)
@@ -798,7 +798,7 @@ class CoverSurfaceEngine:
             return m
         # If a soft content silhouette (phone + contact shadow) is only a few
         # pixels larger, absorb it so wrap reaches the visible outer rim.
-        content = (gray < 250).astype(np.uint8) * 255
+        content = (gray < 254).astype(np.uint8) * 255
         content = cv2.morphologyEx(
             content,
             cv2.MORPH_CLOSE,
@@ -976,6 +976,175 @@ class CoverSurfaceEngine:
         if g_overlap / max(phone_a, 1.0) < 0.75:
             return CoverSurfaceEngine._manufacture_smooth_cover(photo)
         return CoverSurfaceEngine._manufacture_smooth_cover(guided)
+
+    @staticmethod
+    def detect_phone_wrap_silhouette(
+        phone_bgr: Optional[np.ndarray],
+        cover_quad: Optional[np.ndarray] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Full photo silhouette for wrap clip (any phone / studio shot).
+
+        Unlike ``detect_phone_body_mask``, this does **not** run
+        ``_manufacture_smooth_cover`` — contour smoothing chords off round
+        corners and leaves a silver rim gap under the wrap. Oversized edit
+        cages are ignored; only the photo product rim matters.
+        """
+        if phone_bgr is None or getattr(phone_bgr, "size", 0) == 0:
+            return None
+        from ..utils.helpers import to_bgr
+
+        img = to_bgr(phone_bgr)
+        h, w = img.shape[:2]
+        frame = float(h * w)
+
+        photo: Optional[np.ndarray] = None
+        try:
+            est = PhoneBoundaryDetector.detect(img)
+            if (
+                est is not None
+                and getattr(est, "mask", None) is not None
+                and np.count_nonzero(est.mask) >= frame * 0.04
+            ):
+                photo = (est.mask > 127).astype(np.uint8) * 255
+        except Exception:
+            photo = None
+        if photo is None:
+            photo = CoverSurfaceEngine.estimate_phone_mask_from_photo(
+                img, cover_quad=None
+            )
+        if photo is None or np.count_nonzero(photo) < 64:
+            return None
+
+        photo = CoverSurfaceEngine._fuller_phone_candidate(img, photo)
+        photo = CoverSurfaceEngine.seal_phone_body(photo, phone_bgr=img)
+        if photo is None or np.count_nonzero(photo) < 64:
+            return None
+        photo = CoverSurfaceEngine._expand_mask_to_visible_rim(img, photo)
+        # Second gentle nudge — silver bezels often sit 1–2 px past GrabCut.
+        photo = CoverSurfaceEngine._expand_mask_to_visible_rim(img, photo)
+        if photo is None or np.count_nonzero(photo) < 64:
+            return None
+
+        # Optional: if the user cage already hugs the phone, refine once.
+        if cover_quad is not None:
+            try:
+                pts = order_points(
+                    np.asarray(cover_quad, dtype=np.float32).reshape(-1, 2)
+                )
+            except Exception:
+                pts = None
+            if pts is not None and pts.shape[0] >= 4:
+                phone_a = float(np.count_nonzero(photo > 127))
+                cage = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillConvexPoly(cage, np.round(pts).astype(np.int32), 255)
+                cage_a = float(np.count_nonzero(cage))
+                if cage_a >= 64:
+                    overlap = float(
+                        np.count_nonzero((cage > 0) & (photo > 127))
+                    )
+                    iou = overlap / max(cage_a + phone_a - overlap, 1.0)
+                    if cage_a <= phone_a * 1.12 and iou >= 0.55:
+                        guided = CoverSurfaceEngine.estimate_phone_mask_from_photo(
+                            img, cover_quad=pts
+                        )
+                        if guided is not None and np.count_nonzero(guided) >= 64:
+                            guided = CoverSurfaceEngine.seal_phone_body(
+                                guided, phone_bgr=img
+                            )
+                            guided = CoverSurfaceEngine._expand_mask_to_visible_rim(
+                                img, guided
+                            )
+                            g_a = float(np.count_nonzero(guided > 127))
+                            if phone_a * 0.85 <= g_a <= phone_a * 1.15:
+                                photo = guided
+
+        # Tiny dilate then keep only near-device pixels — closes chalk tips.
+        tip = max(2, int(round(min(h, w) * 0.004)))
+        grown = cv2.dilate(
+            (photo > 127).astype(np.uint8) * 255,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (tip * 2 + 1, tip * 2 + 1)
+            ),
+            iterations=1,
+        )
+        device = CoverSurfaceEngine._device_pixels_from_photo(img)
+        # Soft studio reject — keep specular silver (gray can be 248–254).
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        keep = cv2.bitwise_or(device, (gray < 254).astype(np.uint8) * 255)
+        # Always keep original photo core so we never shrink.
+        out = cv2.bitwise_or(photo, cv2.bitwise_and(grown, keep))
+        # Fill holes only inside the outer contour.
+        contours, _ = cv2.findContours(
+            out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if contours:
+            outer = max(contours, key=cv2.contourArea)
+            filled = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(filled, [outer], -1, 255, -1)
+            if float(np.count_nonzero(filled)) <= float(h * w) * 0.82:
+                out = filled
+        return out
+
+    @staticmethod
+    def polish_product_silhouette(mask: np.ndarray) -> np.ndarray:
+        """
+        Clean jagged photo-rim stairs into smooth product curves.
+
+        Removes outward pixel speckles at corners / side buttons while keeping
+        the same fill area (no bald gaps). Relative to mask size — no hardcode.
+        """
+        from .mesh import AdaptiveMeshBuilder, _fill_closed_polyline_aa
+
+        binary = (mask > 127).astype(np.uint8) * 255
+        if np.count_nonzero(binary) < 64:
+            return mask.astype(np.uint8) if mask.dtype == np.uint8 else binary
+
+        h, w = binary.shape[:2]
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        if not contours:
+            return binary
+
+        outer = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(
+            np.float32
+        )
+        if outer.shape[0] < 20:
+            return binary
+
+        short = float(min(h, w))
+        win1 = max(13, min(37, int(outer.shape[0] // 14) * 2 + 1))
+        win2 = max(9, min(23, win1 // 2 * 2 + 1))
+        smooth = AdaptiveMeshBuilder._smooth_closed_polyline(
+            outer, window=win1
+        )
+        smooth = AdaptiveMeshBuilder._smooth_closed_polyline(
+            smooth, window=win2
+        )
+        expand = float(np.clip(short * 0.0028, 0.40, 1.15))
+        gate = _fill_closed_polyline_aa(
+            smooth, (h, w), scale=8, expand_px=expand
+        )
+        gate = np.clip(gate, 0.0, 1.0)
+
+        # Interior core must stay solid — polish only replaces the noisy rim.
+        core_k = max(3, int(round(short * 0.008)) | 1)
+        core = cv2.erode(
+            binary,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (core_k, core_k)
+            ),
+            iterations=1,
+        )
+        out_f = np.maximum(gate, core.astype(np.float32) / 255.0)
+        # Drop outward spikes beyond the smooth gate.
+        out_f = np.where(gate < 0.05, 0.0, out_f)
+        out = (out_f > 0.50).astype(np.uint8) * 255
+        out = cv2.bitwise_or(out, core)
+        if np.count_nonzero(out) < np.count_nonzero(binary) * 0.97:
+            out = cv2.bitwise_or(out, binary)
+        return out
 
     @staticmethod
     def estimate_phone_mask_from_photo(
@@ -1815,8 +1984,8 @@ class CoverSurfaceEngine:
         gate = _fill_closed_polyline_aa(
             outline,
             binary.shape[:2],
-            scale=8,
-            expand_px=0.95,
+            scale=10,
+            expand_px=1.05,
         )
         short = float(min(binary.shape[:2]))
         pad = max(2, int(round(short * 0.005)))
