@@ -1954,52 +1954,124 @@ class CoverSurfaceEngine:
         corner_radius_percent: float,
         *,
         corner_radii: Optional[CornerRadii] = None,
+        edge_inset_px: float = 0.0,
     ) -> Optional[np.ndarray]:
         """
-        Product rim with identical corner turns on all four corners.
+        Float outer-rim coverage with continuous corner arcs.
 
-        Photo silhouettes are perspective-skewed — one corner can look perfect
-        while the other three show white slivers. A symmetric rounded quad
-        clipped to the phone envelope fixes that.
+        Built from the phone wrap silhouette contour (not the edit cage). Soft
+        fringe must sit on the visible outer perimeter — an oversized cage or
+        AABB-only rounded rect parks AA in empty corner pockets while photo
+        stairs remain inside gate=1 and stay jagged against the studio plate.
+
+        ``edge_inset_px`` > 0 pulls the float AA fringe inward for the final
+        outer raster only. Leave 0 when clipping wrap coverage.
         """
-        from .mesh import _fill_closed_polyline_aa, _sample_rounded_quad_perimeter
+        from .mesh import (
+            AdaptiveMeshBuilder,
+            _chaikin_closed,
+            _corner_proximity_map,
+            _fill_closed_polyline_aa,
+            _sample_rounded_quad_perimeter,
+        )
 
         binary = (phone_mask > 0).astype(np.uint8)
         if np.count_nonzero(binary) < 64:
             return None
-        ordered = order_points(np.asarray(quad, dtype=np.float32))
+
         radii_tuple = None
         corner = float(corner_radius_percent)
         if corner_radii is not None:
-            # Top-right is the reference corner in product photos — match the
-            # other three to that turn instead of averaging (which over-rounds).
             corner = float(np.clip(corner_radii.tr, 2.5, 22.0))
             radii_tuple = (corner, corner, corner, corner)
-        outline = _sample_rounded_quad_perimeter(
-            ordered,
-            corner,
-            samples_per_edge=128,
-            corner_radii=radii_tuple,
+
+        ys, xs = np.nonzero(binary)
+        short = float(min(int(xs.max() - xs.min()), int(ys.max() - ys.min())))
+        r_px = float(np.clip(corner / 100.0 * short, 4.0, short * 0.28))
+        expand = -float(abs(edge_inset_px))
+
+        # Silhouette contour → radius-scaled smooth + Chaikin → float AA.
+        sil_outline = AdaptiveMeshBuilder.outer_contour_polyline(
+            binary * 255, smooth=False
         )
-        gate = _fill_closed_polyline_aa(
-            outline,
+        sil_gate = None
+        if sil_outline is not None and sil_outline.shape[0] >= 24:
+            win = int(np.clip(round(r_px * 1.35), 9, 41))
+            if win % 2 == 0:
+                win += 1
+            sil_outline = AdaptiveMeshBuilder._smooth_closed_polyline(
+                sil_outline, window=win
+            )
+            sil_outline = _chaikin_closed(sil_outline, iterations=2)
+            sil_gate = _fill_closed_polyline_aa(
+                sil_outline,
+                binary.shape[:2],
+                scale=10,
+                expand_px=expand,
+            ).astype(np.float32)
+
+        phone_quad = AdaptiveMeshBuilder._aabb_quad_from_mask(binary * 255)
+        if phone_quad is None:
+            phone_quad = AdaptiveMeshBuilder._tight_aabb_quad_from_mask(
+                binary * 255
+            )
+        mesh_quad = order_points(np.asarray(quad, dtype=np.float32))
+        if phone_quad is not None:
+            pq = order_points(np.asarray(phone_quad, dtype=np.float32))
+            pb = (
+                float(pq[:, 0].min()),
+                float(pq[:, 1].min()),
+                float(pq[:, 0].max()),
+                float(pq[:, 1].max()),
+            )
+            mb = (
+                float(mesh_quad[:, 0].min()),
+                float(mesh_quad[:, 1].min()),
+                float(mesh_quad[:, 0].max()),
+                float(mesh_quad[:, 1].max()),
+            )
+            pw = max(pb[2] - pb[0], 1.0)
+            ph = max(pb[3] - pb[1], 1.0)
+            inflate = max(
+                abs(mb[0] - pb[0]) / pw,
+                abs(mb[1] - pb[1]) / ph,
+                abs(mb[2] - pb[2]) / pw,
+                abs(mb[3] - pb[3]) / ph,
+            )
+            ordered = mesh_quad if inflate <= 0.04 else pq
+        else:
+            ordered = mesh_quad
+
+        rounded = _fill_closed_polyline_aa(
+            _sample_rounded_quad_perimeter(
+                ordered,
+                corner,
+                samples_per_edge=128,
+                corner_radii=radii_tuple,
+            ),
             binary.shape[:2],
             scale=10,
-            expand_px=1.05,
-        )
-        short = float(min(binary.shape[:2]))
-        pad = max(2, int(round(short * 0.005)))
-        dilated = cv2.dilate(
-            binary,
-            cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)
-            ),
-            iterations=1,
-        )
-        # Hard outer cull only — soft envelope min() was blurring L/R vertical
-        # borders that already had a perfect finish. Geometric AA owns corners.
-        gate = np.where(dilated > 0, gate, 0.0).astype(np.float32)
-        return np.clip(gate, 0.0, 1.0)
+            expand_px=expand,
+        ).astype(np.float32)
+
+        if sil_gate is None:
+            return np.clip(rounded, 0.0, 1.0)
+
+        if phone_quad is not None:
+            pq = order_points(np.asarray(phone_quad, dtype=np.float32))
+            cw = _corner_proximity_map(
+                binary.shape[:2],
+                x0=float(pq[:, 0].min()),
+                y0=float(pq[:, 1].min()),
+                x1=float(pq[:, 0].max()),
+                y1=float(pq[:, 1].max()),
+                corner_frac=max(0.22, corner / 100.0 * 2.2),
+            )
+        else:
+            cw = np.zeros(binary.shape, dtype=np.float32)
+        corner_gate = np.minimum(rounded, np.clip(sil_gate + 0.12, 0.0, 1.0))
+        gate = sil_gate * (1.0 - cw) + corner_gate * cw
+        return np.clip(gate.astype(np.float32), 0.0, 1.0)
 
     @staticmethod
     def recommend_mesh_density(

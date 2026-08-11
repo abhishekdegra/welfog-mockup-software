@@ -2041,12 +2041,21 @@ def _fill_closed_polyline_aa(
     local = (pts - np.array([ix0, iy0], dtype=np.float32)) * float(s)
     local_i = np.round(local).astype(np.int32).reshape(-1, 1, 2)
     cv2.fillPoly(big, [local_i], 255)
-    grow = max(0, int(round(float(expand_px) * s)))
+    grow = int(round(float(expand_px) * s))
     if grow > 0:
         big = cv2.dilate(
             big,
             cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1)
+            ),
+            iterations=1,
+        )
+    elif grow < 0:
+        rad = -grow
+        big = cv2.erode(
+            big,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (rad * 2 + 1, rad * 2 + 1)
             ),
             iterations=1,
         )
