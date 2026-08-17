@@ -2022,12 +2022,12 @@ def _fill_closed_polyline_aa(
     if pts.shape[0] < 3:
         return np.zeros((height, width), dtype=np.float32)
 
-    s = max(2, min(int(scale), 10))
+    s = max(2, min(int(scale), 16))
     x0 = float(pts[:, 0].min())
     y0 = float(pts[:, 1].min())
     x1 = float(pts[:, 0].max())
     y1 = float(pts[:, 1].max())
-    pad = max(3, int(np.ceil(expand_px + 2.0)))
+    pad = max(3, int(np.ceil(abs(expand_px) + 2.0)))
     ix0 = max(0, int(np.floor(x0)) - pad)
     iy0 = max(0, int(np.floor(y0)) - pad)
     ix1 = min(width, int(np.ceil(x1)) + pad + 1)

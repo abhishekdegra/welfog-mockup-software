@@ -297,7 +297,14 @@ class ProjectStore:
                             if key not in placement_keys:
                                 compositor.settings[key] = value
                     # Autosaves often keep a loose cage + bitten template mask
-                    # (half-wrap / sharp sticker). Heal to photo rim for any model.
+                    # (half-wrap / sharp sticker). Sync rounded wrap mesh first
+                    # so the edit UI blue outline matches what will render.
+                    try:
+                        compositor._finalize_fullbleed_mesh()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Wrap finalize after project load failed: %s", exc
+                        )
                     try:
                         compositor.heal_realistic_wrap(include_hardware=True)
                     except Exception as exc:  # noqa: BLE001

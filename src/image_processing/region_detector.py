@@ -2174,12 +2174,12 @@ class HardwareRegionDetector:
                 continue
             # Stay on the thin bezel — face/camera islands sit further inward.
             edge_dist = min(cx - x_min, x_max - cx)
-            if edge_dist > width * 0.11:
+            if edge_dist > width * 0.085:
                 continue
-            if bw > width * 0.15 or bh > height * 0.20:
+            if bw > width * 0.12 or bh > height * 0.20:
                 continue
-            # Camera module lives on the upper face, not the outer 6% bezel.
-            if t < 0.16 and edge_dist > width * 0.08:
+            # Camera module lives on the upper face, not the outer bezel.
+            if t < 0.20 and edge_dist > width * 0.06:
                 continue
             # Long thin wall slabs are ghosts, not buttons.
             if bh > height * 0.20 and bw < width * 0.045:
