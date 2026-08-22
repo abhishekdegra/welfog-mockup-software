@@ -16,9 +16,12 @@ data/logs/*.log
 data/debug/
 data/debug_iter/
 data/wrap_qa/
+data/autosave/
+*.pcms
 debug-*.log
 
 # One-off debug dumps (never commit)
+_tmp*/
 _*.png
 _*.jpg
 debug_*.png
