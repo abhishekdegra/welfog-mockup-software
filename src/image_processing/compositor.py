@@ -1154,7 +1154,14 @@ class Compositor:
                     > 127
                 )
             body_b = bb
-        protect = Compositor._dilate_bool(tips, 3)
+        protect = (
+            cv2.dilate(
+                tips.astype(np.uint8) * 255,
+                np.ones((1, 3), np.uint8),
+                iterations=1,
+            )
+            > 0
+        )
         nlab, labels, stats, _ = cv2.connectedComponentsWithStats(
             tips.astype(np.uint8) * 255, connectivity=8
         )
@@ -2979,6 +2986,35 @@ class Compositor:
             return restored
         return None
 
+    @staticmethod
+    def _fill_scaled_row_interval(
+        cov: np.ndarray,
+        mask: np.ndarray,
+        yd0: float,
+        yd1: float,
+        xd0: float,
+        xd1: float,
+    ) -> None:
+        """Coverage-fill dest pixels overlapping ``[yd0,yd1) x [xd0,xd1)``."""
+        dh, dw = cov.shape[:2]
+        y0 = int(np.clip(np.floor(yd0), 0, dh))
+        y1 = int(np.clip(np.ceil(yd1), 0, dh))
+        x0 = int(np.clip(np.floor(min(xd0, xd1)), 0, dw))
+        x1 = int(np.clip(np.ceil(max(xd0, xd1)), 0, dw))
+        if y1 <= y0 or x1 <= x0:
+            return
+        lo, hi = (xd0, xd1) if xd0 <= xd1 else (xd1, xd0)
+        yy = np.arange(y0, y1, dtype=np.float32)
+        xx = np.arange(x0, x1, dtype=np.float32)
+        y_ov = np.clip(np.minimum(yy + 1.0, yd1) - np.maximum(yy, yd0), 0.0, 1.0)
+        x_ov = np.clip(np.minimum(xx + 1.0, hi) - np.maximum(xx, lo), 0.0, 1.0)
+        patch = y_ov[:, None] * x_ov[None, :]
+        cov[y0:y1, x0:x1] = np.maximum(cov[y0:y1, x0:x1], patch)
+        hard = patch >= 0.50
+        mask[y0:y1, x0:x1] = np.where(
+            hard, np.uint8(255), mask[y0:y1, x0:x1]
+        )
+
     def _rasterize_side_buttons_at_size(
         self,
         dest_hw: Tuple[int, int],
@@ -2988,11 +3024,10 @@ class Compositor:
         """
         Paint native button contours at ``dest_hw``.
 
-        Scales contour vertices (not a previously resized bitmask) so preview
-        and export share the same physical keys.
+        Each native tip row is the interval from the detected outer lip to the
+        body wall. That interval is scaled by the same ``sx/sy`` as the body
+        so preview/export cannot invent a vertical strip or a 1px seam.
         """
-        from .mesh import _fill_closed_polyline_aa
-
         dh, dw = int(dest_hw[0]), int(dest_hw[1])
         ph, pw = native.shape[:2]
         btn = ((native > 127).astype(np.uint8) * 255)
@@ -3007,34 +3042,133 @@ class Compositor:
         sy = float(dh) / float(max(ph, 1))
         mask = np.zeros((dh, dw), dtype=np.uint8)
         cov = np.zeros((dh, dw), dtype=np.float32)
+        body_n = self._phone_wrap_mask
+        if body_n is not None and body_n.shape[:2] != (ph, pw):
+            body_n = cv2.resize(
+                body_n.astype(np.uint8),
+                (pw, ph),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        body_b = (
+            body_n > 127
+            if body_n is not None and np.count_nonzero(body_n) >= 64
+            else None
+        )
         num, labels, stats, _ = cv2.connectedComponentsWithStats(btn, 8)
-        for label in range(1, num):
-            if int(stats[label, cv2.CC_STAT_AREA]) < 4:
-                continue
-            comp = (labels == label).astype(np.uint8) * 255
-            contours, _ = cv2.findContours(
-                comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-            )
-            if not contours:
-                continue
-            pts = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(
-                np.float32
-            )
-            pts[:, 0] *= sx
-            pts[:, 1] *= sy
-            patch = _fill_closed_polyline_aa(
-                pts, (dh, dw), scale=8, expand_px=0.0
-            )
-            hard = np.zeros((dh, dw), dtype=np.uint8)
-            cv2.fillPoly(
-                hard,
-                [np.round(pts).astype(np.int32).reshape(-1, 1, 2)],
-                255,
-            )
-            patch = np.maximum(patch, hard.astype(np.float32) / 255.0)
-            patch = np.where(hard > 0, patch, 0.0)
-            cov = np.maximum(cov, patch)
-            mask = np.maximum(mask, hard)
+        if body_b is None:
+            from .mesh import _fill_closed_polyline_aa
+
+            for label in range(1, num):
+                if int(stats[label, cv2.CC_STAT_AREA]) < 4:
+                    continue
+                comp = (labels == label).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(
+                    comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+                )
+                if not contours:
+                    continue
+                pts = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(
+                    np.float32
+                )
+                pts[:, 0] *= sx
+                pts[:, 1] *= sy
+                patch = _fill_closed_polyline_aa(
+                    pts, (dh, dw), scale=8, expand_px=0.0
+                )
+                hard = np.zeros((dh, dw), dtype=np.uint8)
+                cv2.fillPoly(
+                    hard,
+                    [np.round(pts).astype(np.int32).reshape(-1, 1, 2)],
+                    255,
+                )
+                patch = np.maximum(patch, hard.astype(np.float32) / 255.0)
+                patch = np.where(hard > 0, patch, 0.0)
+                cov = np.maximum(cov, patch)
+                mask = np.maximum(mask, hard)
+        else:
+            phone_n = None
+            if self.phone_image is not None:
+                phone_n = to_bgr(self.phone_image)
+                if phone_n.shape[:2] != (ph, pw):
+                    phone_n = cv2.resize(
+                        phone_n, (pw, ph), interpolation=cv2.INTER_NEAREST
+                    )
+            left_x_out = np.full(ph, np.nan, dtype=np.float32)
+            left_x_in = np.full(ph, np.nan, dtype=np.float32)
+            right_x_in = np.full(ph, np.nan, dtype=np.float32)
+            right_x_out = np.full(ph, np.nan, dtype=np.float32)
+            all_tips = btn > 127
+            for label in range(1, num):
+                if int(stats[label, cv2.CC_STAT_AREA]) < 4:
+                    continue
+                comp = labels == label
+                t_xs_all = np.where(comp)[1]
+                if t_xs_all.size == 0:
+                    continue
+                left_side = float(t_xs_all.mean()) < 0.5 * float(pw)
+                if phone_n is not None:
+                    paint, _, _ = Compositor._button_photo_wrap_alpha(
+                        comp, all_tips, body_b, phone_n, left_side=left_side
+                    )
+                    if np.any(paint):
+                        comp = paint
+                ys = np.where(np.any(comp, axis=1))[0]
+                for y in ys:
+                    txs = np.where(comp[y])[0]
+                    if txs.size == 0:
+                        continue
+                    bxs = np.where(body_b[y])[0]
+                    if left_side:
+                        x_out = float(txs.min())
+                        x_in = float(txs.max()) + 1.0
+                        if bxs.size and float(bxs.min()) > x_out:
+                            x_in = float(bxs.min())
+                        if x_in > x_out:
+                            left_x_out[y] = x_out
+                            left_x_in[y] = x_in
+                    else:
+                        x_out = float(txs.max()) + 1.0
+                        x_in = float(txs.min())
+                        if bxs.size and float(bxs.max()) + 1.0 < x_out:
+                            x_in = float(bxs.max()) + 1.0
+                        if x_out > x_in:
+                            right_x_in[y] = x_in
+                            right_x_out[y] = x_out
+
+            def _lerp_pair(a: np.ndarray, b: np.ndarray, yd: int):
+                ys = (float(yd) + 0.5) / sy
+                y0 = int(np.floor(ys))
+                if y0 < 0 or y0 >= ph:
+                    return None
+                y1 = min(y0 + 1, ph - 1)
+                t = float(ys - y0)
+                a0, b0 = float(a[y0]), float(b[y0])
+                a1, b1 = float(a[y1]), float(b[y1])
+                ok0 = np.isfinite(a0) and np.isfinite(b0)
+                ok1 = np.isfinite(a1) and np.isfinite(b1)
+                if ok0 and ok1:
+                    return a0 + t * (a1 - a0), b0 + t * (b1 - b0)
+                if ok0:
+                    return a0, b0
+                if ok1:
+                    return a1, b1
+                return None
+
+            for yd in range(dh):
+                pair_l = _lerp_pair(left_x_out, left_x_in, yd)
+                if pair_l is not None:
+                    Compositor._fill_scaled_row_interval(
+                        cov, mask,
+                        float(yd), float(yd) + 1.0,
+                        pair_l[0] * sx, pair_l[1] * sx,
+                    )
+                pair_r = _lerp_pair(right_x_in, right_x_out, yd)
+                if pair_r is not None:
+                    Compositor._fill_scaled_row_interval(
+                        cov, mask,
+                        float(yd), float(yd) + 1.0,
+                        pair_r[0] * sx, pair_r[1] * sx,
+                    )
         cam_c = self._side_button_camera_block(
             (dh, dw), exclusion_mask, self._phone_wrap_mask
         ) > 127
@@ -7221,8 +7355,9 @@ class Compositor:
                     xi = int(x)
                     pix = _pick_wrap(y, 2 * wall - xi - 1)
                     t_out = float(wall - xi) / depth_den
-                    # Very mild side-face depth only — no dark outline.
-                    shade = 0.97 + 0.04 * t_out + 0.02 * cap
+                    # Wall pixel matches body wrap (no dark seam). Outer lip
+                    # keeps a mild highlight so the key still reads in relief.
+                    shade = 1.0 + 0.035 * t_out + 0.02 * cap * t_out
                     painted = np.clip(pix * shade, 0.0, 255.0)
                     if float(np.mean(painted)) < 18.0 and ref_rgb is not None:
                         painted = np.clip(ref_rgb * shade, 0.0, 255.0)
@@ -7235,7 +7370,7 @@ class Compositor:
                     xi = int(x)
                     pix = _pick_wrap(y, 2 * wall - xi + 1)
                     t_out = float(xi - wall) / depth_den
-                    shade = 0.97 + 0.04 * t_out + 0.02 * cap
+                    shade = 1.0 + 0.035 * t_out + 0.02 * cap * t_out
                     painted = np.clip(pix * shade, 0.0, 255.0)
                     if float(np.mean(painted)) < 18.0 and ref_rgb is not None:
                         painted = np.clip(ref_rgb * shade, 0.0, 255.0)
@@ -7520,7 +7655,23 @@ class Compositor:
             )
             dropped = tip_comp & ~paint
             if np.any(dropped):
-                result[dropped] = studio_bgr
+                # Outer photo-AA snaps to studio. Inner dropped pixels sit on
+                # the body junction — wrap them or they read as a dark seam.
+                inner = np.zeros_like(dropped)
+                for yy in range(y0, y1):
+                    txs = np.where(tip_comp[yy])[0]
+                    if txs.size == 0:
+                        continue
+                    mid = 0.5 * (float(txs.min()) + float(txs.max()))
+                    if left_side:
+                        inner[yy, int(np.ceil(mid)) : int(txs.max()) + 1] = True
+                    else:
+                        inner[yy, int(txs.min()) : int(np.floor(mid)) + 1] = True
+                wrap_inner = dropped & inner & tip_comp
+                aa_drop = dropped & ~wrap_inner
+                if np.any(aa_drop):
+                    result[aa_drop] = studio_bgr
+                paint = paint | wrap_inner
             if not np.any(paint):
                 continue
             result = Compositor._wrap_validated_button_surface(
@@ -10071,6 +10222,7 @@ class Compositor:
                     )
                 keep_c = keep_c | (tm > 127)
                 tip_src = tm
+            keep_src = keep_c.copy()
             keep_c = (
                 cv2.dilate(
                     keep_c.astype(np.uint8) * 255,
@@ -10097,6 +10249,22 @@ class Compositor:
                     corner_frac=cf_c,
                 )
                 mid_c = np.clip(cw_c, 0.0, 1.0) < 0.28
+            # Dilating keep on a keyed mid-side preserved 1px wrap past the
+            # wall (vertical strips between buttons). Corners / unkeyed sides
+            # still use the halo so their AA is unchanged.
+            if tip_src is not None:
+                sides_k, _ = Compositor._sides_with_buttons(
+                    tip_src, pm_c, (h, w)
+                )
+                xx_k = np.arange(w, dtype=np.int32)[None, :]
+                if "left" in sides_k:
+                    keep_c = np.where(
+                        mid_c & (xx_k < (w // 2)), keep_src, keep_c
+                    )
+                if "right" in sides_k:
+                    keep_c = np.where(
+                        mid_c & (xx_k >= (w // 2)), keep_src, keep_c
+                    )
             keep_halo = (
                 cv2.dilate(
                     keep_c.astype(np.uint8) * 255,

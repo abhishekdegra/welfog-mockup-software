@@ -773,6 +773,82 @@ class ModelAgnosticRimTests(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertEqual(got.shape[:2], (h, w))
 
+    def test_dest_button_raster_fills_to_wall_without_outward_strip(self) -> None:
+        """Upsample must keep native [outer, wall) and not invent a gap or bar."""
+        h, w = 80, 40
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[:, 20:] = 255
+        tips = np.zeros((h, w), dtype=np.uint8)
+        tips[20:50, 17:20] = 255  # flush against wall x=20
+        # Second key, with a quiet gap between them.
+        tips[58:70, 18:20] = 255
+        comp = Compositor()
+        comp.phone_image = np.zeros((h, w, 3), dtype=np.uint8)
+        comp._phone_wrap_mask = body
+        mask, cov = comp._rasterize_side_buttons_at_size(
+            (h * 2, w * 2), tips, None
+        )
+        self.assertEqual(mask.shape[:2], (h * 2, w * 2))
+        # Dest wall is x=40. Tips occupy [34, 40) for the tall key.
+        self.assertGreater(int(np.count_nonzero(mask[44:96, 34:40])), 80)
+        self.assertEqual(int(np.count_nonzero(mask[44:96, :34])), 0)
+        self.assertEqual(int(np.count_nonzero(mask[44:96, 40:])), 0)
+        # Gap between native keys (rows 50-57 → dest 100-115) stays empty.
+        self.assertEqual(int(np.count_nonzero(mask[102:114, :40])), 0)
+        # Junction column just inside the wall is present (no 1px seam).
+        self.assertGreater(int(np.count_nonzero(mask[44:96, 39])), 20)
+
+    def test_dest_raster_omits_native_aa_lip(self) -> None:
+        """Bright native outer lip is not a dest wrap column."""
+        h, w = 80, 40
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[:, 20:] = 255
+        tips = np.zeros((h, w), dtype=np.uint8)
+        tips[20:50, 17:20] = 255
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[:, 18:] = (50, 50, 50)
+        phone[20:50, 17] = (220, 220, 220)
+        phone[20:50, 18:20] = (70, 70, 72)
+        comp = Compositor()
+        comp.phone_image = phone
+        comp._phone_wrap_mask = body
+        mask, _ = comp._rasterize_side_buttons_at_size(
+            (h * 2, w * 2), tips, None
+        )
+        # Native solid key is x=18,19 → dest [36, 40). Outer AA x=17 stays out.
+        self.assertEqual(int(np.count_nonzero(mask[44:96, :36])), 0)
+        self.assertGreater(int(np.count_nonzero(mask[44:96, 36:40])), 40)
+        self.assertEqual(int(np.count_nonzero(mask[44:96, 40:])), 0)
+
+    def test_button_wrap_wall_pixel_matches_body_ink(self) -> None:
+        """Inner key column must not be darkened into a seam."""
+        h, w = 180, 120
+        output = np.zeros((h, w, 3), dtype=np.uint8)
+        output[:, 50:] = (30, 50, 90)
+        wrap_src = np.zeros((h, w, 3), dtype=np.float32)
+        wrap_src[:, 50:] = (30 / 255.0, 50 / 255.0, 90 / 255.0)
+        phone = np.full((h, w, 3), 40, dtype=np.uint8)
+        phone[70:120, 46:50] = (130, 128, 120)
+        tips = np.zeros((h, w), dtype=bool)
+        tips[70:120, 46:50] = True
+        body = np.zeros((h, w), dtype=bool)
+        body[:, 50:] = True
+        wrapped = Compositor._wrap_validated_button_surface(
+            output,
+            phone,
+            tips,
+            body,
+            left_side=True,
+            wrap_src=wrap_src,
+        )
+        inner = wrapped[70:120, 49]
+        body_col = wrapped[70:120, 50]
+        self.assertLess(
+            float(np.abs(inner.astype(np.float32) - body_col.astype(np.float32)).mean()),
+            8.0,
+        )
+        self.assertGreater(float(wrapped[70:120, 46].mean()), float(inner.mean()))
+
 
 if __name__ == "__main__":
     unittest.main()
