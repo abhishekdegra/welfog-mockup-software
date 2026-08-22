@@ -723,6 +723,89 @@ class ModelAgnosticRimTests(unittest.TestCase):
         self.assertGreater(int(np.count_nonzero(cleaned[120:150, 40:50])), 0)
         self.assertEqual(int(np.count_nonzero(cleaned[:, 180:])), right_before)
 
+    def test_shave_wall_nubs_is_side_symmetric_without_buttons(self) -> None:
+        """1px AA nicks drop on any straight wall; the quiet edge stays."""
+        mask = _rounded_rect_mask(400, 220, 40, 20, 180, 380, 18)
+        mask[90:96, 38:40] = 255  # left nick
+        mask[200:204, 181:184] = 255  # right nick
+        right_before = int(np.count_nonzero(mask[:, 180:]))
+        left_before = int(np.count_nonzero(mask[:, :40]))
+        shaved = Compositor._shave_straight_wall_nubs_from_body(mask)
+        self.assertEqual(int(np.count_nonzero(shaved[90:96, 38:40])), 0)
+        self.assertEqual(int(np.count_nonzero(shaved[200:204, 181:184])), 0)
+        # Quiet wall columns remain.
+        self.assertGreater(int(np.count_nonzero(shaved[120:160, 40:42])), 0)
+        self.assertGreater(int(np.count_nonzero(shaved[120:160, 178:180])), 0)
+        self.assertLess(int(np.count_nonzero(shaved[:, :40])), left_before)
+        self.assertLess(int(np.count_nonzero(shaved[:, 180:])), right_before)
+
+    def test_straight_mid_wall_face_skips_ellipse(self) -> None:
+        mask = _ellipse_mask(420, 300, ((150, 210), (160, 300), 0))
+        face = Compositor._straight_mid_wall_face(mask > 127)
+        self.assertEqual(int(np.count_nonzero(face)), 0)
+
+    def test_straight_mid_wall_face_covers_outer_column(self) -> None:
+        mask = _rounded_rect_mask(400, 220, 40, 20, 180, 380, 18)
+        face = Compositor._straight_mid_wall_face(mask > 127)
+        self.assertGreater(int(np.count_nonzero(face[140:260, 40])), 40)
+        self.assertGreater(int(np.count_nonzero(face[140:260, 180])), 40)
+        # Rounded corner pocket is not a straight wall.
+        self.assertEqual(int(np.count_nonzero(face[20:28, 40:55])), 0)
+
+    def test_mid_side_gate_outer_column_is_opaque(self) -> None:
+        from src.image_processing.mesh import ControlMesh
+
+        mask = _rounded_rect_mask(400, 220, 40, 20, 180, 380, 18)
+        quad = np.array(
+            [[40.0, 20.0], [180.0, 20.0], [180.0, 380.0], [40.0, 380.0]],
+            dtype=np.float32,
+        )
+        mesh = ControlMesh.from_quad(quad, 9, 7)
+        gate = Compositor()._product_rim_gate(mesh, mask, mask.shape)
+        self.assertIsNotNone(gate)
+        left = [
+            float(gate[y, 40])
+            for y in range(140, 260)
+            if mask[y, 40] > 127
+        ]
+        right = [
+            float(gate[y, 180])
+            for y in range(140, 260)
+            if mask[y, 180] > 127
+        ]
+        self.assertGreater(len(left), 40)
+        self.assertGreaterEqual(min(left), 0.98)
+        self.assertGreaterEqual(min(right), 0.98)
+        gate_d = Compositor()._product_rim_gate(mesh, mask, (800, 440))
+        body_d = (
+            cv2.resize(
+                mask.astype(np.float32),
+                (440, 800),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            > 127.0
+        )
+        dest_left = []
+        for y in range(280, 520):
+            xs = np.where(body_d[y])[0]
+            if xs.size:
+                dest_left.append(float(gate_d[y, int(xs.min())]))
+        self.assertGreater(len(dest_left), 40)
+        self.assertGreaterEqual(min(dest_left), 0.98)
+
+    def test_finalize_does_not_paste_studio_onto_body_rim(self) -> None:
+        h, w = 80, 60
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[10:70, 20:50] = 255
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[10:70, 21:50] = (40, 30, 50)
+        phone[10:70, 20] = (220, 220, 220)
+        output = phone.copy()
+        output[10:70, 20:50] = (18, 12, 28)
+        out = Compositor._finalize_body_boundary_raster(output, phone, body)
+        self.assertLess(float(np.mean(out[40, 20])), 60.0)
+        self.assertGreater(float(np.mean(out[40, 10])), 240.0)
+
     def test_protrusion_paint_stays_on_the_key_row(self) -> None:
         body = np.zeros((80, 60), dtype=np.uint8)
         body[:, 20:50] = 255

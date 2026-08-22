@@ -1101,6 +1101,78 @@ class Compositor:
         return nubs
 
     @staticmethod
+    def _shave_straight_wall_nubs_from_body(body: np.ndarray) -> np.ndarray:
+        """
+        Drop 1px raster nubs past a straight mid-wall.
+
+        Corners and curved/tapered sides are unchanged. Does not read button
+        masks — genuine keys sit outside this body wall.
+        """
+        out = (body > 127).astype(np.uint8) * 255
+        if np.count_nonzero(out) < 64:
+            return out
+        state = Compositor._silhouette_wall_state(out)
+        if state is None:
+            return out
+        nubs = Compositor._straight_wall_nub_mask(state, out.shape, eps=0.50)
+        if not np.any(nubs):
+            return out
+        shaved = out.copy()
+        shaved[nubs] = 0
+        if np.count_nonzero(shaved) < 64:
+            return out
+        return shaved
+
+    @staticmethod
+    def _straight_mid_wall_face(
+        body: np.ndarray,
+        *,
+        depth_px: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Body pixels on a straight mid-side, including the outer column.
+
+        Used so wrap coverage stays opaque on the true wall. Corners and
+        curved/tapered sides stay False. Does not read button masks.
+        """
+        on = np.asarray(body).astype(bool)
+        out = np.zeros(on.shape[:2], dtype=bool)
+        if int(np.count_nonzero(on)) < 64:
+            return out
+        state = Compositor._silhouette_wall_state(on.astype(np.uint8) * 255)
+        if state is None:
+            return out
+        from .mesh import _along_edge_maps
+
+        h, w = on.shape[:2]
+        along_lr, along_tb = _along_edge_maps(
+            (h, w),
+            x0=float(state["x0"]),
+            y0=float(state["y0"]),
+            x1=float(state["x1"]),
+            y1=float(state["y1"]),
+            corner_frac=float(state["corner_frac"]),
+        )
+        mid_lr = along_lr * (1.0 - along_tb)
+        xx = np.arange(w, dtype=np.float32)[None, :]
+        depth = float(depth_px) if depth_px is not None else float(
+            max(1.5, 0.004 * float(min(h, w)))
+        )
+        if float(state["s_l"]) >= 0.45:
+            out = out | (
+                on
+                & (mid_lr * float(state["s_l"]) > 0.35)
+                & (xx <= float(state["l"]) + depth)
+            )
+        if float(state["s_r"]) >= 0.45:
+            out = out | (
+                on
+                & (mid_lr * float(state["s_r"]) > 0.35)
+                & (xx >= float(state["r"]) - depth)
+            )
+        return out
+
+    @staticmethod
     def _dilate_bool(mask: np.ndarray, px: int) -> np.ndarray:
         """Isotropic dilate of a bool mask (any phone scale)."""
         if mask is None or not np.any(mask) or int(px) < 1:
@@ -2362,6 +2434,9 @@ class Compositor:
         body = self._detach_side_button_nubs_from_body(
             body, self._canonical_side_button_mask()
         )
+        # Same geometry shave on every straight side (left and right). Photo
+        # AA / segmentation nicks are not the case edge; keys are not used.
+        body = Compositor._shave_straight_wall_nubs_from_body(body)
         # Do not re-clip with a strict device mask here — that carved white
         # under-wrap gaps along the left/bottom chrome. Silhouette + tip
         # split above is the printable authority; studio purge is finalize.
@@ -8630,6 +8705,18 @@ class Compositor:
                 hw = cv2.resize(hw, (w, h), interpolation=cv2.INTER_LINEAR)
             m = m * (1.0 - np.clip(hw, 0.0, 1.0))
 
+        # Gate / rim AA must not thin the straight outer wall back to
+        # partial coverage (that mixed wrap with noisy left-side photo AA).
+        wall_face = Compositor._straight_mid_wall_face(phone_bin > 0)
+        if np.any(wall_face):
+            m = np.where(wall_face, np.maximum(m, 0.985), m)
+            if a_out is not None:
+                a_out = np.where(
+                    wall_face,
+                    np.maximum(np.clip(a_out.astype(np.float32), 0.0, 1.0), 0.985),
+                    a_out,
+                )
+
         return np.clip(m, 0.0, 1.0), a_out
 
     def _resolve_phone_boundary_mask(
@@ -8965,6 +9052,13 @@ class Compositor:
         # Deep interior stays opaque (Chaikin must not punch white holes).
         cov = np.where(on & (dist_in >= 8.0), 1.0, cov)
         cov = np.where(mid & on & (dist_in >= 1.0), 1.0, cov)
+        # Outer column of a straight wall: exact-AA is ~0.5 on the binary
+        # rim pixel, so wrap mixed with the photo plate. Left plate AA is
+        # noisy (keys/shadows); right plate is uniform — same gate, jagged
+        # left. Opaque wrap on that face; AA stays outside the silhouette.
+        wall_face = Compositor._straight_mid_wall_face(on)
+        if np.any(wall_face):
+            cov = np.where(wall_face, 1.0, cov)
         # Outside the binary silhouette: exact-AA sub-pixel band only.
         cov = np.where(on, cov, exact)
         cov = np.where((~on) & (dist_out > 0.65), 0.0, cov)
@@ -9021,6 +9115,13 @@ class Compositor:
             dist_out_d = cv2.distanceTransform(
                 (~body_up).astype(np.uint8), cv2.DIST_L2, 5
             ).astype(np.float32)
+            dist_in_d = cv2.distanceTransform(
+                body_up.astype(np.uint8), cv2.DIST_L2, 5
+            ).astype(np.float32)
+            cov = np.where(body_up & (dist_in_d >= 8.0), 1.0, cov)
+            wall_face_d = Compositor._straight_mid_wall_face(body_up)
+            if np.any(wall_face_d):
+                cov = np.where(wall_face_d, 1.0, cov)
             cov = np.where(dist_out_d > 0.65, 0.0, cov)
             if self.phone_image is not None:
                 pb_d = to_bgr(self.phone_image)
@@ -9229,6 +9330,15 @@ class Compositor:
                 np.maximum(mask.astype(np.float32), 0.985),
                 mask,
             )
+            # Straight mid-side outer column is still body — keep wrap
+            # opaque there so photo-AA on the keyed side cannot grain.
+            wall_face_m = Compositor._straight_mid_wall_face(body_on)
+            if np.any(wall_face_m):
+                mask = np.where(
+                    wall_face_m,
+                    np.maximum(mask.astype(np.float32), 0.985),
+                    mask,
+                )
             dist_out_full = cv2.distanceTransform(
                 (~body_on).astype(np.uint8), cv2.DIST_L2, 5
             ).astype(np.float32)
@@ -10222,7 +10332,6 @@ class Compositor:
                     )
                 keep_c = keep_c | (tm > 127)
                 tip_src = tm
-            keep_src = keep_c.copy()
             keep_c = (
                 cv2.dilate(
                     keep_c.astype(np.uint8) * 255,
@@ -10249,22 +10358,6 @@ class Compositor:
                     corner_frac=cf_c,
                 )
                 mid_c = np.clip(cw_c, 0.0, 1.0) < 0.28
-            # Dilating keep on a keyed mid-side preserved 1px wrap past the
-            # wall (vertical strips between buttons). Corners / unkeyed sides
-            # still use the halo so their AA is unchanged.
-            if tip_src is not None:
-                sides_k, _ = Compositor._sides_with_buttons(
-                    tip_src, pm_c, (h, w)
-                )
-                xx_k = np.arange(w, dtype=np.int32)[None, :]
-                if "left" in sides_k:
-                    keep_c = np.where(
-                        mid_c & (xx_k < (w // 2)), keep_src, keep_c
-                    )
-                if "right" in sides_k:
-                    keep_c = np.where(
-                        mid_c & (xx_k >= (w // 2)), keep_src, keep_c
-                    )
             keep_halo = (
                 cv2.dilate(
                     keep_c.astype(np.uint8) * 255,
@@ -10573,8 +10666,12 @@ class Compositor:
         studio = Compositor._border_connected_mask(
             (lum_s >= 185.0) & (sat_s <= 28.0)
         )
-        if np.any(studio & ~tip):
-            out = np.where((studio & ~tip)[:, :, np.newaxis], plate, out)
+        # Studio card only — never the silhouette face. Left bezel AA is
+        # often border-connected to the card; pasting plate there punched
+        # pale notches while the darker right rim stayed wrap-covered.
+        studio_out = studio & ~(body > 0) & ~tip
+        if np.any(studio_out):
+            out = np.where(studio_out[:, :, np.newaxis], plate, out)
         # Refresh wrap mask after studio purge for AA / seal steps.
         gray_o = out.mean(axis=2)
         diff = np.abs(out - plate).max(axis=2)
@@ -10664,7 +10761,7 @@ class Compositor:
             & ~tip
             & ~hole_core
             & ~excl_zone
-            & ~studio
+            & ~studio_out
             & (dist_in <= 2.5)
             & (gray_o > 90.0)
             & (diff < 30.0)
@@ -10687,7 +10784,7 @@ class Compositor:
             & (dist_in <= 2.0)
             & ~tip
             & ~hole_core
-            & ~studio
+            & ~studio_out
         )
         if np.any(rim):
             crest = np.sin(np.pi * np.clip(dist_in / 2.0, 0.0, 1.0)).astype(
@@ -10697,12 +10794,31 @@ class Compositor:
             out = np.clip(out * (1.0 + crest[:, :, np.newaxis]), 0.0, 255.0)
 
         # Final authority: studio card pixels are always the phone plate.
-        if np.any(studio & ~tip):
-            out = np.where((studio & ~tip)[:, :, np.newaxis], plate, out)
+        studio_out = studio & ~(body > 0) & ~tip
+        if np.any(studio_out):
+            out = np.where(studio_out[:, :, np.newaxis], plate, out)
         # Absolute exterior kill — nothing outside the photo body/tips.
         exterior = ~(body > 0) & ~tip & (dist_out > 0.35)
         if np.any(exterior):
             out = np.where(exterior[:, :, np.newaxis], plate, out)
+        # Straight mid-side nubs are photo AA / segmentation noise, not the
+        # case edge. Pasting the plate here re-drew left-edge spikes while the
+        # right wall (clean photo AA) looked smooth. Studio-card RGB matches
+        # the workspace; validated tips are protected.
+        state_f = Compositor._silhouette_wall_state(body)
+        if state_f is not None:
+            nubs_f = Compositor._straight_wall_nub_mask(
+                state_f, (h, w), eps=0.45, protect=tip
+            )
+            kill_f = nubs_f & ~(body > 0) & ~tip
+            if np.any(kill_f):
+                if int(np.count_nonzero(studio)) >= 32:
+                    studio_rgb = np.median(plate[studio], axis=0)
+                else:
+                    studio_rgb = np.array(
+                        [255.0, 255.0, 255.0], dtype=np.float32
+                    )
+                out = np.where(kill_f[:, :, np.newaxis], studio_rgb, out)
 
         return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
