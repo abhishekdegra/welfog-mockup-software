@@ -13,7 +13,10 @@ dist/
 
 # App runtime (regenerated locally)
 data/logs/*.log
+data/debug/
 data/debug_iter/
+data/wrap_qa/
+debug-*.log
 
 # One-off debug dumps (never commit)
 _*.png

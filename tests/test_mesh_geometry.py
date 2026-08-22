@@ -104,15 +104,18 @@ class MeshGeometryTests(unittest.TestCase):
             )
             return MeshWarper.warp(design, source, mesh, (1000, 520))
 
-        for offset_x, offset_y, scale in (
-            (-0.9, -0.9, 1.0), (0.9, 0.9, 1.0),
-            (0.6, -0.9, 1.0), (0.5, -0.5, 1.4),
-        ):
-            warped = warp_with(scale, offset_x, offset_y)
-            self.assertEqual(
-                int(warped[:, :, 3][interior].min()), 255,
-                f"pan {offset_x},{offset_y} at {scale} left unprinted pixels",
-            )
+        covered = warp_with(1.0, 0.0, 0.0)
+        self.assertEqual(
+            int(covered[:, :, 3][interior].min()), 255,
+            "fill placement left unprinted pixels",
+        )
+
+        # Extreme pan may hang off the artwork. Remaining print stays opaque
+        # and off-art dest pixels stay transparent — never edge-smeared.
+        panned = warp_with(1.0, -0.9, -0.9)
+        alpha = panned[:, :, 3][interior]
+        self.assertGreater(int(np.count_nonzero(alpha > 200)), 1000)
+        self.assertGreater(int(np.count_nonzero(alpha < 10)), 0)
 
         # Zooming out below the cover still letterboxes, so the phone stays
         # visible instead of the artwork edge being smeared outwards.
@@ -187,6 +190,71 @@ class MeshGeometryTests(unittest.TestCase):
         x0 = max(0, int(cx) - 80)
         x1 = min(520, int(cx) + 80)
         self.assertGreater(int(np.count_nonzero(difference[y0:y1, x0:x1])), 100)
+
+    def test_warp_samples_original_without_row_tearing(self) -> None:
+        """Inverse remap must not duplicate source rows or mutate the design."""
+        h, w = 240, 160
+        design = np.zeros((h, w, 4), np.uint8)
+        design[:, :, 3] = 255
+        design[:, :, 0] = np.arange(h, dtype=np.uint8)[:, None]
+        design[:, :, 1] = np.arange(w, dtype=np.uint8)[None, :]
+        design[:, :, 2] = 90
+        original = design.copy()
+        quad = np.array(
+            [[40, 20], [480, 20], [480, 980], [40, 980]], np.float32
+        )
+        mesh = ControlMesh.from_quad(quad)
+        source = MeshWarper.source_points(
+            design.shape[:2], mesh.rows, mesh.cols, mesh_aspect(mesh)
+        )
+        warped = MeshWarper.warp(design, source, mesh, (1000, 520))
+        self.assertTrue(np.array_equal(design, original))
+        interior = cv2.erode(
+            (create_mesh_mask(mesh, (1000, 520)) > 0.5).astype(np.uint8),
+            np.ones((9, 9), np.uint8),
+        ) > 0
+        src_row = warped[:, :, 0].astype(np.int16)
+        # Adjacent destination rows should track nearby source rows, not jump
+        # by a whole band (the old per-triangle warpAffine tearing).
+        dy = np.abs(src_row[1:, :] - src_row[:-1, :])
+        seam = (dy > 8) & interior[1:, :] & interior[:-1, :]
+        self.assertLess(int(np.count_nonzero(seam)), 250)
+
+    def test_quad_maps_use_bilinear_not_diagonal_crease(self) -> None:
+        """UV inside a cell must follow bilinear interpolant, not a crease."""
+        mesh = ControlMesh.from_quad(
+            np.array([[0, 0], [200, 10], [180, 120], [20, 110]], np.float32),
+            rows=2,
+            cols=2,
+            adaptive=False,
+        )
+        uv = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], np.float32)
+        map_u, map_v, cov = MeshWarper.rasterize_vertex_maps(mesh, uv, (130, 210))
+        dest = mesh.points.reshape(2, 2, 2)
+        tl, tr = dest[0, 0], dest[0, 1]
+        bl, br = dest[1, 0], dest[1, 1]
+        # Probe the cell center: bilinear u,v should be ~0.5
+        cx = 0.25 * (tl[0] + tr[0] + br[0] + bl[0])
+        cy = 0.25 * (tl[1] + tr[1] + br[1] + bl[1])
+        x, y = int(round(cx)), int(round(cy))
+        self.assertGreater(int(cov[y, x]), 0)
+        self.assertAlmostEqual(float(map_u[y, x]), 0.5, delta=0.08)
+        self.assertAlmostEqual(float(map_v[y, x]), 0.5, delta=0.08)
+        interior = cov > 0
+        du = np.abs(map_u[1:, :] - map_u[:-1, :])
+        jumps = du[interior[1:] & interior[:-1]]
+        self.assertLess(float(np.percentile(jumps, 99)), 0.08)
+
+    def test_source_points_preserve_aspect_unless_stretch(self) -> None:
+        uv = MeshWarper.parametric_uv(9, 7)
+        _, crop_w, crop_h = MeshWarper.sampling_window(
+            (400, 200), 0.5, fit_mode="fill", scale=1.0, uv_table=uv
+        )
+        self.assertAlmostEqual(crop_w / crop_h, 0.5, places=3)
+        _, sw, sh = MeshWarper.sampling_window(
+            (400, 200), 0.5, fit_mode="stretch", scale=1.0, uv_table=uv
+        )
+        self.assertAlmostEqual(sw / sh, 200 / 400, places=3)
 
     def test_hardware_is_detected_and_never_printed(self) -> None:
         phone = synthetic_phone()

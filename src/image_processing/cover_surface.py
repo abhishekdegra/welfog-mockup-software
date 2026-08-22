@@ -730,14 +730,6 @@ class CoverSurfaceEngine:
         if bgr.shape[:2] != (h, w):
             bgr = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
         m = (mask > 127).astype(np.uint8) * 255
-        pad = max(5, int(round(min(h, w) * 0.028)))
-        grown = cv2.dilate(
-            m,
-            cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)
-            ),
-            iterations=1,
-        )
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
         # Sample true studio from the four corners only (away from the phone).
         corner = max(2, int(round(min(h, w) * 0.06)))
@@ -756,32 +748,28 @@ class CoverSurfaceEngine:
         core_dist = dist[m > 0]
         thr = float(max(2.5, np.percentile(core_dist, 5) * 0.32))
         device = (dist >= thr).astype(np.uint8) * 255
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        # Soft shadows + silver rim — keep near-white metal (not pure card).
-        not_card = (gray < 254).astype(np.uint8) * 255
-        device = cv2.bitwise_or(device, not_card)
+        # High-contrast dark phones are already at the visible rim — a 1.2%
+        # dilate swallowed the gray AA halo / studio card as "device".
+        core_med = float(np.median(core_dist)) if core_dist.size else 0.0
+        if core_med >= 25.0:
+            pad = max(1, int(round(min(h, w) * 0.003)))
+        else:
+            pad = max(3, int(round(min(h, w) * 0.012)))
+        grown = cv2.dilate(
+            m,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)
+            ),
+            iterations=1,
+        )
+        # Grow only toward pixels that differ from studio. Never hull.
         ring = cv2.bitwise_and(grown, device)
         out = cv2.bitwise_or(m, ring)
-        # Absorb soft contact-shadow halo that marks the true outer rim.
-        halo = cv2.bitwise_and(not_card, grown)
-        out = cv2.bitwise_or(out, halo)
-        contours, _ = cv2.findContours(
-            out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if contours:
-            outer = max(contours, key=cv2.contourArea)
-            hull = cv2.convexHull(outer)
-            hull_m = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(hull_m, [hull], -1, 255, -1)
-            hull_m = cv2.bitwise_and(hull_m, grown)
-            hull_m = cv2.bitwise_and(hull_m, device)
-            if float(np.count_nonzero(hull_m)) >= float(np.count_nonzero(m)) * 0.9:
-                out = cv2.bitwise_or(out, hull_m)
         out = cv2.morphologyEx(
             out,
             cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
-            iterations=2,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1,
         )
         contours, _ = cv2.findContours(
             out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -796,31 +784,11 @@ class CoverSurfaceEngine:
             return m
         if float(np.count_nonzero(filled)) > float(h * w) * 0.82:
             return m
-        # If a soft content silhouette (phone + contact shadow) is only a few
-        # pixels larger, absorb it so wrap reaches the visible outer rim.
-        content = (gray < 254).astype(np.uint8) * 255
-        content = cv2.morphologyEx(
-            content,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-            iterations=1,
-        )
-        c_contours, _ = cv2.findContours(
-            content, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if c_contours:
-            c_outer = max(c_contours, key=cv2.contourArea)
-            c_fill = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(c_fill, [c_outer], -1, 255, -1)
-            c_a = float(np.count_nonzero(c_fill))
-            f_a = float(np.count_nonzero(filled))
-            c_over = float(np.count_nonzero((c_fill > 0) & (filled > 0)))
-            if (
-                c_a <= float(h * w) * 0.78
-                and c_a <= f_a * 1.12
-                and c_over >= f_a * 0.90
-            ):
-                filled = cv2.bitwise_or(filled, c_fill)
+        # Grow never paints the studio card / AABB corner wedges.
+        device = CoverSurfaceEngine._device_pixels_from_photo(bgr)
+        filled = cv2.bitwise_and(filled, device)
+        if np.count_nonzero(filled) < np.count_nonzero(m) * 0.90:
+            return cv2.bitwise_and(m, device)
         return filled
 
     @staticmethod
@@ -858,16 +826,16 @@ class CoverSurfaceEngine:
         best_a = primary_a
         frame = float(h * w)
         for cand in candidates:
-            # Solid outer body via convex hull (camera bites shouldn't shrink).
+            # Outer contour fill only — convex hull squared photo corners
+            # and painted wrap into the white wedges at the AABB corners.
             contours, _ = cv2.findContours(
                 cand, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             if not contours:
                 continue
             outer = max(contours, key=cv2.contourArea)
-            hull = cv2.convexHull(outer)
             filled = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(filled, [hull], -1, 255, -1)
+            cv2.drawContours(filled, [outer], -1, 255, -1)
             area = float(np.count_nonzero(filled))
             if area < frame * 0.08 or area > frame * 0.85:
                 continue
@@ -1017,11 +985,14 @@ class CoverSurfaceEngine:
             return None
 
         photo = CoverSurfaceEngine._fuller_phone_candidate(img, photo)
-        photo = CoverSurfaceEngine.seal_phone_body(photo, phone_bgr=img)
+        photo = CoverSurfaceEngine.seal_phone_body(
+            photo,
+            phone_bgr=img,
+            manufacture_smooth=False,
+            hull_gaps=False,
+        )
         if photo is None or np.count_nonzero(photo) < 64:
             return None
-        photo = CoverSurfaceEngine._expand_mask_to_visible_rim(img, photo)
-        # Second gentle nudge — silver bezels often sit 1–2 px past GrabCut.
         photo = CoverSurfaceEngine._expand_mask_to_visible_rim(img, photo)
         if photo is None or np.count_nonzero(photo) < 64:
             return None
@@ -1050,7 +1021,10 @@ class CoverSurfaceEngine:
                         )
                         if guided is not None and np.count_nonzero(guided) >= 64:
                             guided = CoverSurfaceEngine.seal_phone_body(
-                                guided, phone_bgr=img
+                                guided,
+                                phone_bgr=img,
+                                manufacture_smooth=False,
+                                hull_gaps=False,
                             )
                             guided = CoverSurfaceEngine._expand_mask_to_visible_rim(
                                 img, guided
@@ -1069,11 +1043,11 @@ class CoverSurfaceEngine:
             iterations=1,
         )
         device = CoverSurfaceEngine._device_pixels_from_photo(img)
-        # Soft studio reject — keep specular silver (gray can be 248–254).
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        keep = cv2.bitwise_or(device, (gray < 254).astype(np.uint8) * 255)
-        # Always keep original photo core so we never shrink.
-        out = cv2.bitwise_or(photo, cv2.bitwise_and(grown, keep))
+        # Grow only onto real device pixels. gray<254 kept near-white studio
+        # in the rim ring and looked like over-wrap on the card.
+        out = cv2.bitwise_or(photo, cv2.bitwise_and(grown, device))
+        # Never keep studio-card pixels in the wrap silhouette.
+        out = cv2.bitwise_and(out, device)
         # Fill holes only inside the outer contour.
         contours, _ = cv2.findContours(
             out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -1082,6 +1056,7 @@ class CoverSurfaceEngine:
             outer = max(contours, key=cv2.contourArea)
             filled = np.zeros((h, w), dtype=np.uint8)
             cv2.drawContours(filled, [outer], -1, 255, -1)
+            filled = cv2.bitwise_and(filled, device)
             if float(np.count_nonzero(filled)) <= float(h * w) * 0.82:
                 out = filled
         return out
@@ -1334,25 +1309,47 @@ class CoverSurfaceEngine:
         return smooth
 
     @staticmethod
-    def _device_pixels_from_photo(img_bgr: np.ndarray) -> np.ndarray:
+    def _device_pixels_from_photo(
+        img_bgr: np.ndarray, *, rim_edges: bool = True
+    ) -> np.ndarray:
         """
-        Binary mask of non-studio pixels (reject pure empty white card).
+        Binary mask of non-studio pixels (reject the backdrop card).
 
-        Light / silver phones stay included — only near-white, near-gray card
-        with no local structure is treated as studio.
+        Threshold is taken from the image-corner card, so light-grey studios
+        are excluded while silver / white phones (not corner-connected) stay.
+        Interior specular on the device is not border-connected to the card.
+
+        ``rim_edges`` (default True) unions Canny edges so grow-to-rim can
+        land on the outline. Wrap clipping must pass ``rim_edges=False`` —
+        otherwise AA/studio edge pixels are treated as printable surface and
+        artwork bleeds past the physical phone.
         """
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        sat = np.max(img_bgr, axis=2).astype(np.int16) - np.min(
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        sat = np.max(img_bgr, axis=2).astype(np.float32) - np.min(
             img_bgr, axis=2
-        ).astype(np.int16)
-        # Specular silver often sits at 240–252; keep it as device.
-        bright_card = (gray >= 252) & (sat <= 6)
-        soft_card = (gray >= 248) & (sat <= 4)
-        device = np.ones(gray.shape, dtype=np.uint8) * 255
-        device[bright_card | soft_card] = 0
-        # Recover faint edge structure that still belongs to the phone body.
-        edges = cv2.Canny(gray, 20, 60)
-        device = cv2.max(device, (edges > 0).astype(np.uint8) * 255)
+        ).astype(np.float32)
+        h, w = gray.shape[:2]
+        band = max(2, int(round(min(h, w) * 0.04)))
+        corners = np.concatenate(
+            [
+                gray[:band, :band].reshape(-1),
+                gray[:band, -band:].reshape(-1),
+                gray[-band:, :band].reshape(-1),
+                gray[-band:, -band:].reshape(-1),
+            ]
+        )
+        studio_ref = float(np.median(corners))
+        # Card = as bright as the corners (within ~5%) or near-white.
+        thr = min(247.0, max(232.0, studio_ref - 12.0))
+        card = ((gray >= thr) & (sat <= 12.0)) | (
+            (gray >= 252.0) & (sat <= 8.0)
+        )
+        device = np.ones((h, w), dtype=np.uint8) * 255
+        device[card] = 0
+        if rim_edges:
+            # Keep the true rim edge so grow-to-rim can land on the outline.
+            edges = cv2.Canny(gray.astype(np.uint8), 20, 60)
+            device = cv2.max(device, (edges > 0).astype(np.uint8) * 255)
         return device
 
     @staticmethod
@@ -1402,6 +1399,9 @@ class CoverSurfaceEngine:
     def seal_phone_body(
         mask: Optional[np.ndarray],
         phone_bgr: Optional[np.ndarray] = None,
+        *,
+        manufacture_smooth: bool = True,
+        hull_gaps: bool = True,
     ) -> Optional[np.ndarray]:
         """
         Force a solid wrap face — no open camera bites / diagonal bald patches.
@@ -1424,7 +1424,7 @@ class CoverSurfaceEngine:
 
         x, y, bw, bh = cv2.boundingRect(m)
         fill = float(np.count_nonzero(m)) / float(max(bw * bh, 1))
-        if fill < 0.93:
+        if hull_gaps and fill < 0.93:
             close_px = max(9, int(round(min(bw, bh) * 0.045)))
             sealed = cv2.morphologyEx(
                 m,
@@ -1474,7 +1474,18 @@ class CoverSurfaceEngine:
             grown = cv2.bitwise_and(
                 grown, CoverSurfaceEngine._device_pixels_from_photo(img)
             )
-        return CoverSurfaceEngine._manufacture_smooth_cover(grown)
+        if manufacture_smooth:
+            return CoverSurfaceEngine._manufacture_smooth_cover(grown)
+        contours, _ = cv2.findContours(
+            grown, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if contours:
+            outer = max(contours, key=cv2.contourArea)
+            filled = np.zeros((h, w), np.uint8)
+            cv2.drawContours(filled, [outer], -1, 255, -1)
+            if float(np.count_nonzero(filled)) <= float(h * w) * 0.82:
+                return filled
+        return grown
 
     @staticmethod
     def complete_phone_silhouette(

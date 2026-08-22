@@ -2068,7 +2068,7 @@ class HardwareRegionDetector:
             y_min = float(quad[:, 1].min())
             y_max = float(quad[:, 1].max())
             height = max(y_max - y_min, 1.0)
-            max_bh = height * 0.16
+            max_bh = height * 0.38
             near_strict = cv2.dilate(
                 strict,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
@@ -2176,13 +2176,13 @@ class HardwareRegionDetector:
             edge_dist = min(cx - x_min, x_max - cx)
             if edge_dist > width * 0.085:
                 continue
-            if bw > width * 0.12 or bh > height * 0.20:
+            if bw > width * 0.12 or bh > height * 0.38:
                 continue
             # Camera module lives on the upper face, not the outer bezel.
             if t < 0.20 and edge_dist > width * 0.06:
                 continue
             # Long thin wall slabs are ghosts, not buttons.
-            if bh > height * 0.20 and bw < width * 0.045:
+            if bh > height * 0.38 and bw < width * 0.045:
                 continue
             aspect = max(bw, bh) / max(min(bw, bh), 1e-3)
             if aspect < 1.05 and max(bw, bh) > width * 0.12:
@@ -3273,19 +3273,33 @@ class HardwareRegionDetector:
             phone = to_bgr(phone_image)
             gray = cv2.cvtColor(phone, cv2.COLOR_BGR2GRAY)
 
-        # 1) Dynamic: each user selection → photo silhouette when irregular.
-        snapped = HardwareRegionDetector._snap_parts_to_photo(parts, gray)
-        if snapped:
-            return [c.reshape(-1, 1, 2) for c in snapped]
-
-        # 2) Lens Hough only when the result still hugs the user boxes.
+        # 1) Lens Hough first. Snap-to-silhouette used to win with the
+        # cluster AABB and paint a rectangular hole around discrete lenses.
         rebuilt = HardwareRegionDetector._rebuild_camera_from_lenses(
             parts, gray
         )
-        if rebuilt and HardwareRegionDetector._rebuilt_agrees_with_user(
-            parts, rebuilt
-        ):
-            return [c.reshape(-1, 1, 2) for c in rebuilt]
+        if rebuilt:
+            # Smaller-than-seed is always OK (tight rings / island).
+            # Larger is rejected so Hough cannot balloon past the detect box.
+            if HardwareRegionDetector._rebuilt_agrees_with_user(parts, rebuilt):
+                return [c.reshape(-1, 1, 2) for c in rebuilt]
+            r = np.vstack(
+                [np.asarray(p, np.float32).reshape(-1, 2) for p in rebuilt]
+            )
+            u = np.vstack(
+                [np.asarray(p, np.float32).reshape(-1, 2) for p in parts]
+            )
+            rw = float(r[:, 0].max() - r[:, 0].min())
+            rh = float(r[:, 1].max() - r[:, 1].min())
+            uw = float(u[:, 0].max() - u[:, 0].min())
+            uh = float(u[:, 1].max() - u[:, 1].min())
+            if rw * rh <= uw * uh * 1.02 and len(rebuilt) >= 1:
+                return [c.reshape(-1, 1, 2) for c in rebuilt]
+
+        # 2) Dynamic: each user selection → photo silhouette when irregular.
+        snapped = HardwareRegionDetector._snap_parts_to_photo(parts, gray)
+        if snapped:
+            return [c.reshape(-1, 1, 2) for c in snapped]
 
         # 3) Per-contour circle/stadium polish (flash / simple pills).
         finished: List[np.ndarray] = []
@@ -3403,6 +3417,65 @@ class HardwareRegionDetector:
         return out if len(out) == len(parts) else []
 
     @staticmethod
+    def _lenses_sit_on_cover_face(
+        gray: np.ndarray,
+        lenses: List[Tuple[float, float, float]],
+        bx1: float,
+        by1: float,
+        bx2: float,
+        by2: float,
+    ) -> bool:
+        """
+        True when lenses are discrete rings on the cover face.
+
+        A raised island plate is a different colour between the lenses;
+        a flat back (separate cutouts) matches the surrounding cover.
+        """
+        if gray is None or len(lenses) < 2:
+            return False
+        h, w = gray.shape[:2]
+        lens_m = np.zeros((h, w), dtype=np.uint8)
+        for cx, cy, radius in lenses:
+            rr = max(2, int(round(float(radius) * 0.82)))
+            cv2.circle(
+                lens_m,
+                (int(round(cx)), int(round(cy))),
+                rr,
+                255,
+                -1,
+            )
+        x0 = int(np.clip(np.floor(bx1), 0, w - 1))
+        y0 = int(np.clip(np.floor(by1), 0, h - 1))
+        x1 = int(np.clip(np.ceil(bx2), 0, w))
+        y1 = int(np.clip(np.ceil(by2), 0, h))
+        cluster = np.zeros((h, w), dtype=np.uint8)
+        cluster[y0:y1, x0:x1] = 255
+        gap = cv2.bitwise_and(cluster, cv2.bitwise_not(lens_m))
+        pad = max(4, int(round(min(bx2 - bx1, by2 - by1) * 0.08)))
+        ring = cv2.dilate(
+            cluster,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)
+            ),
+            iterations=1,
+        )
+        outside = cv2.bitwise_and(ring, cv2.bitwise_not(cluster))
+        gpix = gap > 0
+        opix = outside > 0
+        lpix = lens_m > 0
+        if (
+            int(np.count_nonzero(gpix)) < 24
+            or int(np.count_nonzero(opix)) < 24
+            or int(np.count_nonzero(lpix)) < 16
+        ):
+            return False
+        med_gap = float(np.median(gray[gpix]))
+        med_body = float(np.median(gray[opix]))
+        med_lens = float(np.median(gray[lpix]))
+        # Gap looks like the cover, not like the dark glass / island plate.
+        return abs(med_gap - med_body) + 6.0 < abs(med_gap - med_lens)
+
+    @staticmethod
     def _rebuild_camera_from_lenses(
         parts: List[np.ndarray],
         gray: Optional[np.ndarray],
@@ -3431,7 +3504,7 @@ class HardwareRegionDetector:
         blur = cv2.GaussianBlur(roi, (0, 0), 1.15)
         # Lens radii relative to the user cutout — works across phone models.
         r_min = max(4, int(min(bw, bh) * 0.08))
-        r_max = max(r_min + 2, int(min(bw, bh) * 0.55))
+        r_max = max(r_min + 2, int(min(bw, bh) * 0.28))
         min_dist = max(6, int(min(bw, bh) * 0.16))
         circles = cv2.HoughCircles(
             blur,
@@ -3475,7 +3548,17 @@ class HardwareRegionDetector:
         # Deduplicate near-duplicates.
         found.sort(key=lambda c: -c[2])
         unique: List[Tuple[float, float, float]] = []
+        max_r = 0.32 * min(bw, bh)
         for cx, cy, radius in found:
+            if radius > max_r:
+                continue
+            ix = int(np.clip(round(cx), 0, width - 1))
+            iy = int(np.clip(round(cy), 0, height - 1))
+            # Phone-corner fillets look circular to Hough. Real lenses are
+            # dark; a bright circle in the cluster's top-left is the rim.
+            near_tl = (cx - bx1) < 0.22 * bw and (cy - by1) < 0.22 * bh
+            if near_tl and float(gray[iy, ix]) >= 130.0:
+                continue
             if any(
                 (cx - ux) ** 2 + (cy - uy) ** 2 < (0.45 * max(radius, ur)) ** 2
                 for ux, uy, ur in unique
@@ -3507,6 +3590,17 @@ class HardwareRegionDetector:
                     cx, cy, radius * 1.06, samples=48
                 )
             )
+        elif HardwareRegionDetector._lenses_sit_on_cover_face(
+            gray, lenses, bx1, by1, bx2, by2
+        ):
+            # Discrete rings on a flat back (S23-style) — punch each lens,
+            # never a rectangular cluster hole.
+            for cx, cy, radius in lenses:
+                out.append(
+                    HardwareRegionDetector._sample_circle(
+                        cx, cy, radius * 1.08, samples=48
+                    )
+                )
         else:
             xs = [c[0] for c in lenses]
             ys = [c[1] for c in lenses]
@@ -4041,20 +4135,60 @@ class HardwareRegionDetector:
         ).astype(np.uint8)
 
     @staticmethod
+    def _densify_closed_polyline(
+        pts: np.ndarray, *, max_edge: float = 1.25
+    ) -> np.ndarray:
+        """Insert verts so long edges cannot facet curved cutouts."""
+        src = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        if src.shape[0] < 3:
+            return src
+        out: List[np.ndarray] = []
+        n = int(src.shape[0])
+        step = float(max(0.55, max_edge))
+        for i in range(n):
+            a = src[i]
+            b = src[(i + 1) % n]
+            out.append(a)
+            dist = float(np.linalg.norm(b - a))
+            if dist <= step:
+                continue
+            segs = int(np.ceil(dist / step))
+            for k in range(1, segs):
+                t = float(k) / float(segs)
+                out.append(a * (1.0 - t) + b * t)
+        return np.asarray(out, dtype=np.float32)
+
+    @staticmethod
     def _fill_polygon_aa(
         mask: np.ndarray,
         poly: np.ndarray,
         *,
-        scale: int = 6,
+        scale: int = 12,
     ) -> None:
         """
-        Supersampled polygon fill — keeps manual edits' shape but kills jaggies.
+        Supersampled polygon fill — exact path, sub-pixel AA, no expand.
         """
         pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
         if len(pts) < 3 or mask.size == 0:
             return
+        pts = HardwareRegionDetector._densify_closed_polyline(pts, max_edge=1.15)
         h, w = mask.shape[:2]
-        s = max(4, min(int(scale), 12))
+        try:
+            from .mesh import _fill_closed_polyline_aa
+
+            cov = _fill_closed_polyline_aa(
+                pts, (h, w), scale=max(8, min(int(scale), 16)), expand_px=0.0
+            )
+            if cov is not None and float(np.max(cov)) > 0.05:
+                patch = np.clip(cov * 255.0, 0.0, 255.0).astype(np.float32)
+                existing = mask.astype(np.float32)
+                mask[:] = np.clip(
+                    np.maximum(existing, patch), 0.0, 255.0
+                ).astype(np.uint8)
+                return
+        except Exception:
+            pass
+        s = max(8, min(int(scale), 16))
         x0 = float(pts[:, 0].min())
         y0 = float(pts[:, 1].min())
         x1 = float(pts[:, 0].max())
@@ -4070,12 +4204,32 @@ class HardwareRegionDetector:
         rh = iy1 - iy0
         big = np.zeros((rh * s, rw * s), dtype=np.uint8)
         local = (pts - np.array([ix0, iy0], dtype=np.float32)) * float(s)
-        # Sub-pixel verts — rounding to int before fill facets curved arcs.
         local_i = np.round(local).astype(np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(big, [local_i], 255)
         small = cv2.resize(big, (rw, rh), interpolation=cv2.INTER_AREA)
-        existing = mask[iy0:iy1, ix0:ix1]
-        mask[iy0:iy1, ix0:ix1] = np.maximum(existing, small)
+        existing = mask[iy0:iy1, ix0:ix1].astype(np.float32)
+        mask[iy0:iy1, ix0:ix1] = np.clip(
+            np.maximum(existing, small.astype(np.float32)), 0.0, 255.0
+        ).astype(np.uint8)
+
+    @staticmethod
+    def _contour_matches_aabb(
+        pts: np.ndarray, *, tol_frac: float = 0.04
+    ) -> bool:
+        """True when verts sit on an axis-aligned box (safe for SDF AABB paint)."""
+        p = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        if p.shape[0] < 4:
+            return True
+        x1 = float(p[:, 0].min())
+        y1 = float(p[:, 1].min())
+        x2 = float(p[:, 0].max())
+        y2 = float(p[:, 1].max())
+        bw = max(x2 - x1, 1.0)
+        bh = max(y2 - y1, 1.0)
+        tol = float(max(0.75, tol_frac * min(bw, bh)))
+        on_v = (np.abs(p[:, 0] - x1) <= tol) | (np.abs(p[:, 0] - x2) <= tol)
+        on_h = (np.abs(p[:, 1] - y1) <= tol) | (np.abs(p[:, 1] - y2) <= tol)
+        return bool(np.mean(on_v | on_h) >= 0.92)
 
     @staticmethod
     def paint_cutout_mask(
@@ -4102,11 +4256,21 @@ class HardwareRegionDetector:
         if len(pts) < 3:
             return
         if force_contour or (geom == "contour") or not analytical:
-            HardwareRegionDetector._fill_polygon_aa(mask, pts)
+            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=12)
+            return
+        # Rotated / non-AABB contours must stay path-true (never axis box).
+        if geom in (
+            "rectangle",
+            "square",
+            "rounded_square",
+            "rounded_rect",
+            "stadium",
+        ) and not HardwareRegionDetector._contour_matches_aabb(pts):
+            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=12)
             return
         tight = None if expand_override is None else float(max(0.0, expand_override))
-        # Wider soft rim so flash/camera/stadium export edges stay curved.
-        edge_aa = 3.15 if tight is not None and tight <= 1.5 else 2.85
+        # Soft sub-pixel AA — scales gently with hole size for clean zoom.
+        edge_aa = 1.85 if tight is not None and tight <= 0.5 else 2.05
 
         kind = geom
         frozen = params
@@ -4114,10 +4278,10 @@ class HardwareRegionDetector:
             kind, frozen = HardwareRegionDetector._classify_cutout(pts)
         if kind == "free":
             # Photo silhouette that isn't a clean stadium — keep the contour.
-            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=6)
+            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=12)
             return
 
-        # Editor rectangle / square → mild-rounded AABB hole (halka corners).
+        # Editor rectangle / square → mild-rounded AABB hole (exact box).
         if kind in ("rectangle", "square", "rounded_square"):
             x1 = float(pts[:, 0].min())
             y1 = float(pts[:, 1].min())
@@ -4138,7 +4302,7 @@ class HardwareRegionDetector:
                 else:
                     # Rectangle: slight round to match camera-module plates.
                     corner = float(np.clip(short * 0.16, 2.5, short * 0.22))
-            expand = 2.25 if tight is None else tight
+            expand = 0.0 if tight is None else tight
             HardwareRegionDetector._paint_rounded_rect_aa(
                 mask,
                 x1,
@@ -4146,7 +4310,7 @@ class HardwareRegionDetector:
                 x2,
                 y2,
                 corner,
-                aa=max(edge_aa, 3.0),
+                aa=edge_aa,
                 expand_px=expand,
             )
             return
@@ -4172,11 +4336,11 @@ class HardwareRegionDetector:
             if radius >= 0.5:
                 HardwareRegionDetector._paint_circle_aa(
                     mask, float(cx), float(cy), float(radius),
-                    aa=max(edge_aa, 3.35),
-                    expand_px=1.5 if tight is None else tight,
+                    aa=max(edge_aa, 1.85),
+                    expand_px=0.0 if tight is None else tight,
                 )
                 return
-            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=6)
+            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=12)
             return
         if kind in ("stadium", "rounded_rect"):
             if frozen is not None and len(frozen) >= 5:
@@ -4193,13 +4357,6 @@ class HardwareRegionDetector:
                 x2 = float(pts[:, 0].max())
                 y2 = float(pts[:, 1].max())
                 short = min(x2 - x1, y2 - y1)
-                corner = float(
-                    np.clip(
-                        short * (0.48 if kind == "stadium" else 0.16),
-                        2.0,
-                        short * (0.5 - 0.5 if kind == "stadium" else 0.22),
-                    )
-                )
                 if kind != "stadium":
                     corner = float(np.clip(short * 0.16, 2.5, short * 0.22))
                 else:
@@ -4216,19 +4373,14 @@ class HardwareRegionDetector:
                     corner = float(
                         np.clip(short * 0.48, 2.0, max(2.0, short * 0.5 - 0.5))
                     )
-                # Tall volume rockers: tight wrap. Compact side FP/power: hole.
-                if near_side:
-                    expand = 1.25 if aspect >= 2.2 else 2.35
-                else:
-                    expand = (
-                        1.15 if (aspect >= 1.8 and short < 40) else 1.05
-                    )
+                # Camera/flash holes: exact path. Side buttons may still expand.
+                expand = 0.0 if tight is None else tight
+                if tight is None and near_side:
+                    expand = 0.0
             else:
                 if corner <= 0:
                     corner = float(np.clip(short * 0.16, 2.5, short * 0.22))
-                # Camera / module boxes need enough expand so wrap cannot
-                # bleed onto the plate inside the user's selection.
-                expand = 2.35 if tight is None else tight
+                expand = 0.0 if tight is None else tight
             if tight is not None:
                 expand = tight
             HardwareRegionDetector._paint_rounded_rect_aa(
@@ -4238,7 +4390,7 @@ class HardwareRegionDetector:
                 x2,
                 y2,
                 corner,
-                aa=max(edge_aa, 3.0),
+                aa=edge_aa,
                 expand_px=expand,
             )
             return
@@ -4249,7 +4401,7 @@ class HardwareRegionDetector:
         y2 = float(pts[:, 1].max())
         short = min(x2 - x1, y2 - y1)
         if short < 2.0:
-            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=6)
+            HardwareRegionDetector._fill_polygon_aa(mask, pts, scale=12)
             return
         long_side = max(x2 - x1, y2 - y1)
         aspect = long_side / max(short, 1.0)
@@ -4258,10 +4410,10 @@ class HardwareRegionDetector:
         skinny = short <= max(14.0, long_side * 0.38)
         if near_side and skinny and aspect >= 2.0:
             corner = float(np.clip(short * 0.48, 3.0, short * 0.5 - 0.5))
-            expand = 1.25 if tight is None else tight
+            expand = 0.0 if tight is None else tight
         else:
             corner = float(np.clip(short * 0.16, 2.5, short * 0.22))
-            expand = 2.25 if tight is None else tight
+            expand = 0.0 if tight is None else tight
         if tight is not None:
             expand = tight
         HardwareRegionDetector._paint_rounded_rect_aa(
@@ -4271,7 +4423,7 @@ class HardwareRegionDetector:
             x2,
             y2,
             corner,
-            aa=max(edge_aa, 3.0),
+            aa=edge_aa,
             expand_px=expand,
         )
 
@@ -4289,6 +4441,7 @@ class HardwareRegionDetector:
         expand = spec.resolved_expand()
         geom = spec.geom or None
         params = tuple(spec.params) if spec.params else None
+        tag = str(getattr(spec, "shape_tag", "") or "").lower().strip()
         # Locked editor shapes must never be stolen by flash/disk heuristics.
         locked_box = geom in (
             "stadium",
@@ -4296,7 +4449,7 @@ class HardwareRegionDetector:
             "rectangle",
             "square",
             "rounded_square",
-        ) or str(getattr(spec, "shape_tag", "") or "").lower() in (
+        ) or tag in (
             "capsule",
             "button",
             "pill_h",
@@ -4306,15 +4459,72 @@ class HardwareRegionDetector:
             "rounded_square",
             "square",
             "oval",
+        )
+        # Exact-path tools: always paint the editable polyline.
+        exact_path = geom == "contour" or tag in (
             "squircle",
             "superellipse",
+            "polygon",
+            "triangle",
+            "custom_path",
+            "free",
+            "diamond",
         )
+        if exact_path:
+            HardwareRegionDetector.paint_cutout_mask(
+                mask,
+                pts,
+                analytical=False,
+                expand_override=0.0 if expand is None else float(max(0.0, expand)),
+                force_contour=True,
+            )
+            return
+        # Explicit circle tool OR flash disks only. Camera modules must never
+        # be forced to a disk from AABB / looks_like_true_disk heuristics.
         force_disk = (not locked_box) and (
-            spec.kind == "flash"
-            or geom == "circle"
-            or HardwareRegionDetector._looks_like_true_disk(pts)
+            tag == "circle"
+            or (spec.kind == "flash" and (geom == "circle" or tag in ("", "circle")))
         )
-        if force_disk and geom != "contour":
+        if tag == "circle":
+            # Always paint the tool circle from AABB (or frozen cx,cy,r).
+            x1 = float(pts[:, 0].min())
+            y1 = float(pts[:, 1].min())
+            x2 = float(pts[:, 0].max())
+            y2 = float(pts[:, 1].max())
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            radius = 0.5 * min(x2 - x1, y2 - y1)
+            if params and len(params) >= 3 and len(params) < 5:
+                p0, p1, p2 = float(params[0]), float(params[1]), float(params[2])
+                if p2 > 0.5:
+                    cx, cy, radius = p0, p1, p2
+            if radius >= 0.5:
+                HardwareRegionDetector._paint_circle_aa(
+                    mask,
+                    float(cx),
+                    float(cy),
+                    float(radius),
+                    aa=1.85,
+                    expand_px=float(expand) if expand is not None and expand >= 0 else 0.0,
+                )
+                return
+        if (
+            not force_disk
+            and spec.kind in ("camera", "other")
+            and geom == "circle"
+            and tag not in ("circle",)
+        ):
+            # Demote frozen camera circles (legacy / mis-classify) to the
+            # selection AABB rounded-rect so the user shape stays a module hole.
+            x1 = float(pts[:, 0].min())
+            y1 = float(pts[:, 1].min())
+            x2 = float(pts[:, 0].max())
+            y2 = float(pts[:, 1].max())
+            short = min(x2 - x1, y2 - y1)
+            corner = float(np.clip(short * 0.16, 3.0, short * 0.22))
+            geom = "rounded_rect"
+            params = (x1, y1, x2, y2, corner)
+        if force_disk and geom != "contour" and tag != "circle":
             cx, cy, radius = HardwareRegionDetector._circle_params_from_pts(pts)
             if params and len(params) >= 3 and len(params) < 5:
                 # Trust frozen circle params when they are (cx,cy,r).
@@ -4327,8 +4537,8 @@ class HardwareRegionDetector:
                     float(cx),
                     float(cy),
                     float(radius),
-                    aa=3.35,
-                    expand_px=float(expand) if expand is not None and expand >= 0 else 1.15,
+                    aa=1.85,
+                    expand_px=float(expand) if expand is not None and expand >= 0 else 0.0,
                 )
                 return
             geom = "circle"
@@ -4530,7 +4740,7 @@ class HardwareRegionDetector:
         pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
         w = max(float(width), 1.0)
         h = max(float(height), 1.0)
-        expand = 1.15 if kind in ("camera", "flash") else (
+        expand = 0.0 if kind in ("camera", "flash") else (
             2.05 if kind == "button" else -1.0
         )
 
@@ -4558,82 +4768,70 @@ class HardwareRegionDetector:
                 contour=norm,
                 geom="circle",
                 params=[float(cx), float(cy), float(radius)],
-                expand_px=1.2,
+                expand_px=0.0,
                 authoritative=True,
             )
 
-        # Always prefer photo silhouette for camera islands. User AABBs often
-        # classify as "circle"/"stadium" even on Redmi D-modules — the photo
-        # outline is the only dynamic source of truth.
+        # Camera / module islands: NEVER freeze a selection box as a circle.
+        # Min-enclosing-circle of a Redmi AABB painted a giant gray disk over
+        # the whole module and ate the surrounding wrap. User shape tags are
+        # applied earlier; this path is auto / untagged only.
         if kind in ("camera", "other") and gray is not None:
-            sil = HardwareRegionDetector.extract_photo_silhouette(gray, pts)
-            if sil is not None and sil.shape[0] >= 8:
-                g2, p2 = HardwareRegionDetector._classify_cutout(sil)
-                sil_area = float(cv2.contourArea(sil.reshape(-1, 1, 2)))
-                sx = float(sil[:, 0].max() - sil[:, 0].min())
-                sy = float(sil[:, 1].max() - sil[:, 1].min())
-                rect_fill = sil_area / max(sx * sy, 1.0)
-
-                # D / L / freeform islands fill their AABB poorly — keep contour
-                # before any circle/stadium promotion can steal them.
-                if rect_fill < 0.82 or g2 == "free":
-                    step = max(1, len(sil) // 72)
-                    approx = sil[::step]
-                    if approx.shape[0] < 16:
-                        approx = sil
-                    norm = [[float(x / w), float(y / h)] for x, y in approx]
-                    return CutoutSpec(
-                        kind=kind if kind != "other" else "camera",
-                        contour=norm,
-                        geom="contour",
-                        params=[],
-                        expand_px=2.25,
-                        authoritative=True,
-                    )
-
-                if g2 == "circle" and p2 and rect_fill >= 0.72:
+            if HardwareRegionDetector._looks_like_true_disk(pts):
+                cx, cy, radius = HardwareRegionDetector._circle_params_from_pts(
+                    pts
+                )
+                # Only keep true small flash/lens disks — never module AABBs.
+                short_img = float(min(width, height))
+                if radius > 0.5 and radius <= short_img * 0.055:
                     edit = HardwareRegionDetector._sample_circle(
-                        float(p2[0]), float(p2[1]), float(p2[2]), samples=64
+                        float(cx), float(cy), float(radius), samples=48
                     )
-                    edit2 = np.asarray(edit, dtype=np.float32).reshape(-1, 2)
+                    edit_arr = np.asarray(edit, dtype=np.float32).reshape(-1, 2)
                     norm = [
-                        [float(x / w), float(y / h)] for x, y in edit2
+                        [float(x / w), float(y / h)] for x, y in edit_arr
                     ]
                     return CutoutSpec(
                         kind=kind if kind != "other" else "camera",
                         contour=norm,
                         geom="circle",
-                        params=[float(x) for x in p2],
-                        expand_px=2.25,
+                        params=[float(cx), float(cy), float(radius)],
+                        expand_px=0.0,
                         authoritative=True,
                     )
-                if (
-                    g2 in ("stadium", "rounded_rect")
-                    and len(p2) >= 5
-                    and rect_fill >= 0.84
-                ):
-                    edit = HardwareRegionDetector._sample_rounded_rect(
-                        float(p2[0]),
-                        float(p2[1]),
-                        float(p2[2]),
-                        float(p2[3]),
-                        float(p2[4]),
-                        samples_per_corner=16,
-                    )
-                    if edit is not None:
-                        edit2 = np.asarray(edit, dtype=np.float32).reshape(-1, 2)
-                        norm = [
-                            [float(x / w), float(y / h)] for x, y in edit2
-                        ]
-                        return CutoutSpec(
-                            kind=kind if kind != "other" else "camera",
-                            contour=norm,
-                            geom=g2,
-                            params=[float(x) for x in p2],
-                            expand_px=2.25,
-                            authoritative=True,
-                        )
-                # Fallback dynamic contour.
+                # Large "disk" on a camera selection → rounded module hole.
+                x1 = float(pts[:, 0].min())
+                y1 = float(pts[:, 1].min())
+                x2 = float(pts[:, 0].max())
+                y2 = float(pts[:, 1].max())
+                short = min(x2 - x1, y2 - y1)
+                corner = float(np.clip(short * 0.16, 3.0, short * 0.22))
+                edit = HardwareRegionDetector._sample_rounded_rect(
+                    x1, y1, x2, y2, corner, samples_per_corner=14
+                )
+                edit_arr = (
+                    np.asarray(edit, dtype=np.float32).reshape(-1, 2)
+                    if edit is not None
+                    else pts
+                )
+                norm = [
+                    [float(x / w), float(y / h)] for x, y in edit_arr
+                ]
+                return CutoutSpec(
+                    kind=kind if kind != "other" else "camera",
+                    contour=norm,
+                    geom="rounded_rect",
+                    params=[x1, y1, x2, y2, corner],
+                    expand_px=0.0,
+                    authoritative=True,
+                    shape_tag="rounded_rect",
+                )
+            sil = HardwareRegionDetector.extract_photo_silhouette(gray, pts)
+            if sil is not None and sil.shape[0] >= 8:
+                # Detected camera islands must keep the photo contour. A mild
+                # AABB rounded-rect (straight vertical/horizontal stop) left a
+                # silver gap around Samsung-style pills. User rectangle tools
+                # never reach this branch (tagged_geom is applied first).
                 step = max(1, len(sil) // 72)
                 approx = sil[::step]
                 if approx.shape[0] < 16:
@@ -4644,7 +4842,7 @@ class HardwareRegionDetector:
                     contour=norm,
                     geom="contour",
                     params=[],
-                    expand_px=2.25,
+                    expand_px=0.0,
                     authoritative=True,
                 )
 
@@ -4689,6 +4887,12 @@ class HardwareRegionDetector:
             geom = "contour"
             params = ()
             edit_pts = use
+        elif kind == "camera" and geom in ("rounded_rect", "rectangle", "square"):
+            # Auto camera without a photo silhouette still must not become an
+            # AABB hole (straight stop + silver gap around the island).
+            geom = "contour"
+            params = ()
+            edit_pts = use
         elif geom == "circle" and params:
             edit_pts = HardwareRegionDetector._sample_circle(
                 float(params[0]), float(params[1]), float(params[2]), samples=64
@@ -4726,7 +4930,7 @@ class HardwareRegionDetector:
                         float(p2[0]), float(p2[1]), float(p2[2]), samples=72
                     )
 
-        expand = 2.25 if kind in ("camera", "flash") else -1.0
+        expand = 0.0 if kind in ("camera", "flash") else -1.0
         if kind == "button":
             bw = float(pts[:, 0].max() - pts[:, 0].min())
             bh = float(pts[:, 1].max() - pts[:, 1].min())

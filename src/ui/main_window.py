@@ -245,6 +245,11 @@ class MainWindow(QMainWindow):
         self.design_pan_timer.setInterval(16)
         self.design_pan_timer.timeout.connect(self._flush_design_pan)
 
+        self.placement_idle_timer = QTimer(self)
+        self.placement_idle_timer.setSingleShot(True)
+        self.placement_idle_timer.setInterval(80)
+        self.placement_idle_timer.timeout.connect(self._end_live_placement)
+
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setInterval(max(15, int(cfg.autosave_interval_sec)) * 1000)
         self.autosave_timer.timeout.connect(self._autosave_session)
@@ -1356,6 +1361,19 @@ class MainWindow(QMainWindow):
             self.progress_bar.setVisible(True)
         self.render_timer.start()
 
+    def _begin_live_placement(self) -> None:
+        """Zero debounce so pan/zoom samples the original artwork every move."""
+        self._design_pan_gesture = True
+        self.render_timer.setInterval(0)
+        self.placement_idle_timer.stop()
+
+    def _end_live_placement(self) -> None:
+        """Restore normal debounce after the pointer stops moving."""
+        if self.design_pan_timer.isActive():
+            return
+        self._design_pan_gesture = False
+        self.render_timer.setInterval(self.RENDER_DEBOUNCE_MS)
+
     def _start_render(self) -> None:
         """Hand the current state to the render thread."""
         if not self.compositor.is_ready:
@@ -1363,11 +1381,7 @@ class MainWindow(QMainWindow):
             return
 
         self._render_token += 1
-        # Lighter preview while dragging Move Design → smoother feel.
-        max_size = self.PREVIEW_MAX
-        if self._design_pan_gesture:
-            max_size = max(520, int(self.PREVIEW_MAX * 0.55))
-        self.render_thread.request(max_size, self._render_token)
+        self.render_thread.request(self.PREVIEW_MAX, self._render_token)
 
     def _on_rendered(self, image, token: int, elapsed_ms: float) -> None:
         """Display a finished render, ignoring superseded ones."""
@@ -1387,6 +1401,10 @@ class MainWindow(QMainWindow):
             if self.compositor.phone_image is not None:
                 self.canvas.set_image(self.compositor.phone_image)
         elif not self.compare_btn.isChecked():
+            if self.region_btn.isChecked():
+                self.region_btn.setChecked(False)
+            else:
+                self.canvas.set_show_cover(False)
             self.canvas.set_image(image)
 
         self._update_size_label(self.compositor.phone_image)
@@ -1597,8 +1615,18 @@ class MainWindow(QMainWindow):
             pixel.append(pts)
         # Never wipe compositor cutouts with an empty canvas by accident.
         if pixel:
+            # Pass per-cutout tool tags — without them paint reclassifies
+            # camera AABBs into giant circles and ignores the user's shape.
+            tags = list(self.canvas.exclusion_shapes())
+            while len(tags) < len(pixel):
+                tags.append(str(self.canvas.cutout_shape() or "rounded_rect"))
             self.compositor.set_hardware_exclusions(
-                pixel, snap_geometry=False, allow_clear=False
+                pixel,
+                snap_geometry=False,
+                allow_clear=False,
+                shape_tags=tags[: len(pixel)],
+                persist=False,
+                refit_design=False,
             )
         elif not self.compositor.hardware_contours:
             self.compositor.set_hardware_exclusions(
@@ -1606,10 +1634,29 @@ class MainWindow(QMainWindow):
             )
 
     def _on_cutout_shape_changed(self, _index: int = 0) -> None:
-        """User-selected cutout tool only — never auto-switches shape."""
-        shape = self.cutout_shape_combo.currentData()
-        self.canvas.set_cutout_shape(str(shape or "circle"))
-        self.status_message(f"Cutout tool: {self.cutout_shape_combo.currentText()}")
+        """Apply the combo shape to the active cutout and keep it locked."""
+        shape = str(self.cutout_shape_combo.currentData() or "rounded_rect")
+        self.canvas.set_cutout_shape(shape)
+        # Keep corner % in sync so Rounded Rect / Squircle rebuild matches UI.
+        try:
+            self.canvas._cutout_corner_frac = (
+                float(self.cutout_corner_spin.value()) / 100.0
+            )
+            self.canvas._cutout_rotation_deg = float(self.cutout_rot_spin.value())
+        except Exception:
+            pass
+        # Existing red selection must switch to this tool immediately —
+        # otherwise only new Shift+clicks used the combo and render kept
+        # the old (often mis-classified) hole.
+        if self.canvas.apply_selected_cutout_shape(shape):
+            self.status_message(
+                f"Cutout shape: {self.cutout_shape_combo.currentText()}"
+            )
+        else:
+            self.status_message(
+                f"Cutout tool: {self.cutout_shape_combo.currentText()} "
+                "(Shift+click to add)"
+            )
 
     def _apply_cutout_edit(self) -> None:
         """Apply corner radius + rotation to the active cutout (non-destructive)."""
@@ -1858,7 +1905,9 @@ class MainWindow(QMainWindow):
         if self.compositor.design_image is None:
             self.status_message("Load a design first")
             return
-        if not self._design_pan_gesture:
+        was_live = self._design_pan_gesture
+        self._begin_live_placement()
+        if not was_live:
             self._push_history("zoom design", coalesce_key="design-zoom")
         scale = float(self.compositor.settings.get("design_scale", 100.0))
         scale = float(np.clip(scale * float(factor), 25.0, 400.0))
@@ -1869,6 +1918,7 @@ class MainWindow(QMainWindow):
         self._syncing = False
         self._mark_dirty()
         self.request_render()
+        self.placement_idle_timer.start()
         self.status_message(f"Design zoom {scale:.0f}%")
 
     def _on_design_zoom_delta(self, factor: float) -> None:
@@ -1880,10 +1930,9 @@ class MainWindow(QMainWindow):
         if self.compositor.design_image is None:
             return
         if not self._design_pan_gesture:
-            self._design_pan_gesture = True
-            self._design_pan_pending = (0.0, 0.0)
             self._push_history("move design", coalesce_key="design-pan")
-            self.render_timer.setInterval(0)
+            self._begin_live_placement()
+            self._design_pan_pending = (0.0, 0.0)
 
         px, py = self._design_pan_pending
         self._design_pan_pending = (px + float(dx), py + float(dy))
@@ -1906,12 +1955,11 @@ class MainWindow(QMainWindow):
         self.request_render()
 
     def _on_design_pan_finished(self) -> None:
-        """Sync sliders and restore normal render debounce after a pan drag."""
+        """Sync sliders after a pan drag without a second catch-up render."""
         if self.design_pan_timer.isActive():
             self.design_pan_timer.stop()
             self._flush_design_pan()
-        self._design_pan_gesture = False
-        self.render_timer.setInterval(self.RENDER_DEBOUNCE_MS)
+        self._end_live_placement()
         ox = float(self.compositor.settings.get("offset_x", 0.0))
         oy = float(self.compositor.settings.get("offset_y", 0.0))
         scale = float(self.compositor.settings.get("design_scale", 100.0))
@@ -1923,7 +1971,6 @@ class MainWindow(QMainWindow):
         if "design_scale" in self.sliders:
             self.sliders["design_scale"].set_value(scale)
         self._syncing = False
-        self.request_render()
         self.status_message(
             f"Design · offset {ox:.0f}, {oy:.0f} · zoom {scale:.0f}%"
         )

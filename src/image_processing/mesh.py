@@ -1517,23 +1517,59 @@ class MeshWarper:
     EDGE_TOLERANCE = 2
 
     @staticmethod
-    def source_points(
-        design_shape: Tuple[int, int],
+    def parametric_uv(
         rows: int,
         cols: int,
+        curved_uv: Optional[object] = None,
+    ) -> np.ndarray:
+        """
+        Per-vertex UV in the unit square (optionally curved-rim remapped).
+
+        Independent of artwork pixels — pan/zoom/rotation are applied later.
+        """
+        uv_table = None
+        if curved_uv is not None:
+            try:
+                from .curved_uv import CurvedUVParams, remap_grid
+                params = curved_uv
+                if not isinstance(params, CurvedUVParams):
+                    params = CurvedUVParams(
+                        rim_uv=float(getattr(params, "rim_uv", 0.055)),
+                        bevel_strength=float(
+                            getattr(params, "bevel_strength", 0.92)
+                        ),
+                        corner_radii=getattr(params, "corner_radii", None),
+                        enabled=bool(getattr(params, "enabled", True)),
+                    )
+                if params.enabled:
+                    uv_table = remap_grid(rows, cols, params, adaptive=True)
+            except Exception:
+                uv_table = None
+        if uv_table is not None:
+            return np.asarray(uv_table, dtype=np.float32).reshape(-1, 2)
+        u_s = adaptive_axis_samples(cols)
+        v_s = adaptive_axis_samples(rows)
+        uu, vv = np.meshgrid(u_s, v_s)
+        return np.stack(
+            [uu.ravel().astype(np.float32), vv.ravel().astype(np.float32)],
+            axis=1,
+        )
+
+    @staticmethod
+    def sampling_window(
+        design_shape: Tuple[int, int],
         target_aspect: float,
         fit_mode: str = "fill",
         scale: float = 1.0,
         offset_x: float = 0.0,
         offset_y: float = 0.0,
         rotation: float = 0.0,
-        curved_uv: Optional[object] = None,
-    ) -> np.ndarray:
+        uv_table: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, float, float]:
         """
-        Regular source grid after fit, crop, pan, scale, and rotation.
+        Artwork crop window: (center, crop_w, crop_h).
 
-        Optional ``curved_uv`` (CurvedUVParams) remaps parametric UV so the
-        bevel rim foreshortens like a moulded cover instead of a flat sticker.
+        Aspect is preserved unless ``fit_mode == "stretch"``.
         """
         design_h, design_w = design_shape[:2]
         design_aspect = design_w / max(float(design_h), 1e-6)
@@ -1560,44 +1596,14 @@ class MeshWarper:
         crop_w /= scale
         crop_h /= scale
 
-        # Phase 2 + 5: optional curved UV table (rows*cols, 2) using the same
-        # adaptive axis samples as the destination mesh so foreshortening
-        # aligns with corner-dense triangles.
-        uv_table = None
-        if curved_uv is not None:
-            try:
-                from .curved_uv import CurvedUVParams, remap_grid
-                params = curved_uv
-                if not isinstance(params, CurvedUVParams):
-                    params = CurvedUVParams(
-                        rim_uv=float(getattr(params, "rim_uv", 0.055)),
-                        bevel_strength=float(
-                            getattr(params, "bevel_strength", 0.92)
-                        ),
-                        corner_radii=getattr(params, "corner_radii", None),
-                        enabled=bool(getattr(params, "enabled", True)),
-                    )
-                if params.enabled:
-                    uv_table = remap_grid(
-                        rows, cols, params, adaptive=True
-                    )
-            except Exception:
-                uv_table = None
-
-        # CSS object-fit: cover — when curved UV pushes samples past the unit
-        # square, shrink the crop (zoom) so every dest vert still reads artwork.
-        # Extent comes from the live remap table, not a fixed bleed constant.
         if (
             uv_table is not None
             and fit_mode in ("fill", "fit")
             and fit_mode != "stretch"
         ):
-            u_ext = float(
-                max(np.max(np.abs(uv_table[:, 0] - 0.5)), 0.5)
-            )
-            v_ext = float(
-                max(np.max(np.abs(uv_table[:, 1] - 0.5)), 0.5)
-            )
+            uv = np.asarray(uv_table, dtype=np.float32).reshape(-1, 2)
+            u_ext = float(max(np.max(np.abs(uv[:, 0] - 0.5)), 0.5))
+            v_ext = float(max(np.max(np.abs(uv[:, 1] - 0.5)), 0.5))
             cover = max(u_ext, v_ext) / 0.5
             if cover > 1.0:
                 crop_w /= cover
@@ -1610,38 +1616,134 @@ class MeshWarper:
             ],
             dtype=np.float32,
         )
-        # Soft clamp: keep most of the crop on artwork, but allow enough travel
-        # so Move Design / offset sliders actually move the print (hard clamp
-        # used to lock the window when cover-fit made crop ≈ design).
         center = MeshWarper._clamp_window(
             center, crop_w, crop_h, design_w, design_h, rotation,
             soft=True,
         )
+        return center, float(crop_w), float(crop_h)
 
-        if uv_table is None:
-            u_s = adaptive_axis_samples(cols)
-            v_s = adaptive_axis_samples(rows)
-            points = []
-            for row in range(rows):
-                v = float(v_s[row])
-                for col in range(cols):
-                    u = float(u_s[col])
-                    points.append(
-                        [
-                            center[0] + (u - 0.5) * crop_w,
-                            center[1] + (v - 0.5) * crop_h,
-                        ]
-                    )
-            points = np.asarray(points, dtype=np.float32)
-        else:
-            points = np.zeros((rows * cols, 2), dtype=np.float32)
-            for idx in range(rows * cols):
-                u = float(uv_table[idx, 0])
-                v = float(uv_table[idx, 1])
-                points[idx, 0] = center[0] + (u - 0.5) * crop_w
-                points[idx, 1] = center[1] + (v - 0.5) * crop_h
+    @staticmethod
+    def apply_sampling_window(
+        map_u: np.ndarray,
+        map_v: np.ndarray,
+        coverage: np.ndarray,
+        center: np.ndarray,
+        crop_w: float,
+        crop_h: float,
+        rotation: float = 0.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert cached dest→UV maps into dest→artwork pixel maps."""
+        valid = coverage > 0
+        cx = float(center[0])
+        cy = float(center[1])
+        map_x = np.full(map_u.shape, -1.0, dtype=np.float32)
+        map_y = np.full(map_v.shape, -1.0, dtype=np.float32)
+        if not np.any(valid):
+            return map_x, map_y
+        xs = cx + (map_u.astype(np.float32) - 0.5) * float(crop_w)
+        ys = cy + (map_v.astype(np.float32) - 0.5) * float(crop_h)
+        if abs(float(rotation)) > 1e-6:
+            theta = np.deg2rad(-float(rotation))
+            cos_t = float(np.cos(theta))
+            sin_t = float(np.sin(theta))
+            dx = xs - cx
+            dy = ys - cy
+            xs = dx * cos_t - dy * sin_t + cx
+            ys = dx * sin_t + dy * cos_t + cy
+        map_x = np.where(valid, xs, map_x).astype(np.float32)
+        map_y = np.where(valid, ys, map_y).astype(np.float32)
+        return map_x, map_y
 
-        if abs(rotation) > 1e-6:
+    @staticmethod
+    def seal_maps_to_mask(
+        map_x: np.ndarray,
+        map_y: np.ndarray,
+        coverage: np.ndarray,
+        target_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Extend dest→source maps to the full printable silhouette.
+
+        Mesh triangles leave pinholes and miss rounded corners; those gaps
+        used to show a hardcoded navy wrap or the phone body.
+        """
+        h, w = map_x.shape[:2]
+        target = target_mask
+        if target.shape[:2] != (h, w):
+            target = cv2.resize(
+                target.astype(np.uint8),
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        if target.dtype != np.uint8:
+            target = (np.clip(target, 0, 255)).astype(np.uint8)
+        body = (target > 127).astype(np.uint8)
+        if int(np.count_nonzero(body)) < 64:
+            return map_x, map_y, coverage
+        cov = (coverage > 0).astype(np.uint8)
+        need = (body > 0) & (cov == 0)
+        mx = map_x.copy()
+        my = map_y.copy()
+        if np.any(need) and int(np.count_nonzero(cov)) > 32:
+            wgt = cov.astype(np.float32)
+            for _ in range(10):
+                den = cv2.GaussianBlur(wgt, (0, 0), 1.35)
+                nx = cv2.GaussianBlur(mx * wgt, (0, 0), 1.35) / np.maximum(
+                    den, 1e-4
+                )
+                ny = cv2.GaussianBlur(my * wgt, (0, 0), 1.35) / np.maximum(
+                    den, 1e-4
+                )
+                fill = need & (den > 0.08)
+                if not np.any(fill):
+                    break
+                mx = np.where(fill, nx, mx)
+                my = np.where(fill, ny, my)
+                wgt = np.where(fill, 1.0, wgt)
+                need = (body > 0) & (wgt < 0.5)
+        sealed = (body > 0).astype(np.uint8) * 255
+        # Fill holes on the silhouette, but never keep mesh coverage that
+        # sits outside the real phone body (AABB / selection over-wrap).
+        coverage = np.maximum(coverage.astype(np.uint8), sealed)
+        coverage = np.where(body > 0, coverage, 0).astype(np.uint8)
+        mx = np.where(body > 0, mx, 0.0)
+        my = np.where(body > 0, my, 0.0)
+        return mx.astype(np.float32), my.astype(np.float32), coverage
+
+    @staticmethod
+    def source_points(
+        design_shape: Tuple[int, int],
+        rows: int,
+        cols: int,
+        target_aspect: float,
+        fit_mode: str = "fill",
+        scale: float = 1.0,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+        rotation: float = 0.0,
+        curved_uv: Optional[object] = None,
+    ) -> np.ndarray:
+        """
+        Regular source grid after fit, crop, pan, scale, and rotation.
+
+        Optional ``curved_uv`` (CurvedUVParams) remaps parametric UV so the
+        bevel rim foreshortens like a moulded cover instead of a flat sticker.
+        """
+        uv_table = MeshWarper.parametric_uv(rows, cols, curved_uv)
+        center, crop_w, crop_h = MeshWarper.sampling_window(
+            design_shape,
+            target_aspect,
+            fit_mode=fit_mode,
+            scale=scale,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            rotation=rotation,
+            uv_table=uv_table,
+        )
+        points = np.empty_like(uv_table, dtype=np.float32)
+        points[:, 0] = center[0] + (uv_table[:, 0] - 0.5) * crop_w
+        points[:, 1] = center[1] + (uv_table[:, 1] - 0.5) * crop_h
+        if abs(float(rotation)) > 1e-6:
             theta = np.deg2rad(-float(rotation))
             matrix = np.array(
                 [
@@ -1651,7 +1753,6 @@ class MeshWarper:
                 dtype=np.float32,
             )
             points = (points - center) @ matrix.T + center
-
         return points.astype(np.float32)
 
     @staticmethod
@@ -1702,149 +1803,242 @@ class MeshWarper:
         return clamped
 
     @staticmethod
+    def rasterize_vertex_maps(
+        destination_mesh: ControlMesh,
+        vertex_values: np.ndarray,
+        output_shape: Tuple[int, int],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Inverse-map destination pixels onto a per-vertex 2D field.
+
+        Every cell uses the same diagonal (TL–BR). The edit cage stays
+        21×15; vertices are bilinear-densified only for rasterization so
+        photographs are not sheared into horizontal saw-teeth.
+        """
+        output_h, output_w = map(int, output_shape)
+        map_x = np.full((output_h, output_w), -1.0, dtype=np.float32)
+        map_y = np.full((output_h, output_w), -1.0, dtype=np.float32)
+        coverage = np.zeros((output_h, output_w), dtype=np.uint8)
+        values = np.asarray(vertex_values, dtype=np.float32).reshape(-1, 2)
+        dest = np.asarray(destination_mesh.points, dtype=np.float32).reshape(-1, 2)
+        if values.shape[0] != dest.shape[0]:
+            raise ValueError("vertex_values must match destination mesh vertices")
+        rows = int(destination_mesh.rows)
+        cols = int(destination_mesh.cols)
+        factor = 4
+        if rows >= 2 and cols >= 2 and factor > 1:
+            src_p = dest.reshape(rows, cols, 2)
+            src_v = values.reshape(rows, cols, 2)
+            nr = (rows - 1) * factor + 1
+            nc = (cols - 1) * factor + 1
+            dense_p = np.empty((nr, nc, 2), dtype=np.float32)
+            dense_v = np.empty((nr, nc, 2), dtype=np.float32)
+            for k in range(2):
+                dense_p[:, :, k] = cv2.resize(
+                    src_p[:, :, k], (nc, nr), interpolation=cv2.INTER_LINEAR
+                )
+                dense_v[:, :, k] = cv2.resize(
+                    src_v[:, :, k], (nc, nr), interpolation=cv2.INTER_LINEAR
+                )
+            dest = dense_p.reshape(-1, 2)
+            values = dense_v.reshape(-1, 2)
+            rows, cols = nr, nc
+        def _idx(row: int, col: int) -> int:
+            return row * cols + col
+        for row in range(rows - 1):
+            for col in range(cols - 1):
+                tl = _idx(row, col)
+                tr = _idx(row, col + 1)
+                bl = _idx(row + 1, col)
+                br = _idx(row + 1, col + 1)
+                MeshWarper._fill_triangle_maps(
+                    map_x, map_y, coverage, dest[[tl, tr, br]], values[[tl, tr, br]]
+                )
+                MeshWarper._fill_triangle_maps(
+                    map_x, map_y, coverage, dest[[tl, br, bl]], values[[tl, br, bl]]
+                )
+        # Close 1–2px gaps between triangles (white cuts through the print).
+        cov_bin = (coverage > 0).astype(np.uint8)
+        if int(np.count_nonzero(cov_bin)) > 64:
+            closed = cv2.morphologyEx(
+                cov_bin, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+            )
+            need = (closed > 0) & (cov_bin == 0)
+            if np.any(need):
+                wgt = cov_bin.astype(np.float32)
+                den = cv2.GaussianBlur(wgt, (0, 0), 1.15)
+                nx = cv2.GaussianBlur(map_x * wgt, (0, 0), 1.15) / np.maximum(
+                    den, 1e-4
+                )
+                ny = cv2.GaussianBlur(map_y * wgt, (0, 0), 1.15) / np.maximum(
+                    den, 1e-4
+                )
+                map_x = np.where(need, nx, map_x)
+                map_y = np.where(need, ny, map_y)
+                coverage = np.where(need, np.uint8(255), coverage)
+        return map_x, map_y, coverage
+
+    @staticmethod
+    def _fill_triangle_maps(
+        map_x: np.ndarray,
+        map_y: np.ndarray,
+        coverage: np.ndarray,
+        dest_triangle: np.ndarray,
+        src_triangle: np.ndarray,
+    ) -> None:
+        dest_tri = np.asarray(dest_triangle, dtype=np.float32).reshape(3, 2)
+        src_tri = np.asarray(src_triangle, dtype=np.float32).reshape(3, 2)
+        a = dest_tri[0]
+        v0x = dest_tri[1, 0] - a[0]
+        v0y = dest_tri[1, 1] - a[1]
+        v1x = dest_tri[2, 0] - a[0]
+        v1y = dest_tri[2, 1] - a[1]
+        den = v0x * v1y - v1x * v0y
+        if abs(float(den)) < 1e-8:
+            return
+        h, w = map_x.shape[:2]
+        x, y, bw, bh = cv2.boundingRect(dest_tri)
+        x0, y0 = max(int(x) - 1, 0), max(int(y) - 1, 0)
+        x1, y1 = min(int(x + bw) + 1, w), min(int(y + bh) + 1, h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        local = np.round(dest_tri - np.array([x0, y0], dtype=np.float32)).astype(
+            np.int32
+        )
+        mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, local, 1)
+        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+        if int(np.count_nonzero(mask)) == 0:
+            return
+        yy, xx = np.nonzero(mask)
+        px = xx.astype(np.float32) + float(x0)
+        py = yy.astype(np.float32) + float(y0)
+        v2x = px - a[0]
+        v2y = py - a[1]
+        u = (v2x * v1y - v1x * v2y) / den
+        v = (v0x * v2y - v2x * v0y) / den
+        wt = 1.0 - u - v
+        inside = (u >= -1e-4) & (v >= -1e-4) & (wt >= -1e-4)
+        if not np.any(inside):
+            return
+        sx = wt * src_tri[0, 0] + u * src_tri[1, 0] + v * src_tri[2, 0]
+        sy = wt * src_tri[0, 1] + u * src_tri[1, 1] + v * src_tri[2, 1]
+        gy = yy[inside] + y0
+        gx = xx[inside] + x0
+        map_x[gy, gx] = sx[inside]
+        map_y[gy, gx] = sy[inside]
+        coverage[gy, gx] = 255
+
+    @staticmethod
+    def remap_design(
+        design_image: np.ndarray,
+        map_x: np.ndarray,
+        map_y: np.ndarray,
+        coverage: np.ndarray,
+        *,
+        mirror: bool = False,
+        interpolation: int = cv2.INTER_LINEAR,
+    ) -> np.ndarray:
+        """Sample the original artwork once through dest→source maps."""
+        design = to_bgra(design_image)
+        mx = map_x.astype(np.float32, copy=True)
+        my = map_y.astype(np.float32, copy=True)
+        if mirror:
+            design = cv2.flip(design, 1)
+        dh, dw = design.shape[:2]
+        out_h, out_w = mx.shape[:2]
+        interp = int(interpolation)
+        covered = (
+            coverage > 0 if coverage is not None
+            else np.ones(mx.shape, dtype=bool)
+        )
+        if interp == int(cv2.INTER_LINEAR):
+            interp = int(cv2.INTER_LANCZOS4)
+        elif interp == int(cv2.INTER_CUBIC):
+            interp = int(cv2.INTER_LANCZOS4)
+        x_hi = float(max(dw, 1)) - 1.001
+        y_hi = float(max(dh, 1)) - 1.001
+        if np.any(covered):
+            # Soft edge pull: only recover UV that barely left the artwork.
+            # Hard clamp of the whole rim to the last texel caused the
+            # stretched "sheet" band at the phone perimeter.
+            mx_c = np.clip(mx, 0.0, x_hi)
+            my_c = np.clip(my, 0.0, y_hi)
+            near = (
+                (np.abs(mx - mx_c) <= 1.25)
+                & (np.abs(my - my_c) <= 1.25)
+            )
+            mx = np.where(covered & near, mx_c, mx)
+            my = np.where(covered & near, my_c, my)
+        warped = cv2.remap(
+            design,
+            mx,
+            my,
+            interpolation=interp,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+        if coverage is not None:
+            a = warped[:, :, 3]
+            # Fill empty covered samples from neighbours — never invent a
+            # solid black rim by forcing alpha on empty UV.
+            need = covered & (a < 8)
+            good = covered & (a >= 8)
+            if np.any(need) and np.any(good):
+                ink = good.astype(np.float32)
+                for _ in range(6):
+                    den = cv2.GaussianBlur(ink, (0, 0), 1.1)
+                    fill_a = cv2.GaussianBlur(
+                        a.astype(np.float32) * ink, (0, 0), 1.1
+                    ) / np.maximum(den, 1e-4)
+                    fill = need & (den > 0.08)
+                    if not np.any(fill):
+                        break
+                    for c in range(3):
+                        ch = warped[:, :, c].astype(np.float32)
+                        num = cv2.GaussianBlur(ch * ink, (0, 0), 1.1)
+                        warped[:, :, c] = np.where(
+                            fill, num / np.maximum(den, 1e-4), ch
+                        ).astype(np.uint8)
+                    a = np.where(fill, np.clip(fill_a, 8, 255), a).astype(
+                        np.uint8
+                    )
+                    ink = np.where(fill, 1.0, ink)
+                    need = covered & (a < 8)
+            warped[:, :, 3] = np.where(covered, a, np.uint8(0)).astype(np.uint8)
+        return warped
+
+    @staticmethod
     def warp(
         design_image: np.ndarray,
         source_points: np.ndarray,
         destination_mesh: ControlMesh,
         output_shape: Tuple[int, int],
         mirror: bool = False,
+        interpolation: int = cv2.INTER_LINEAR,
     ) -> Optional[np.ndarray]:
-        """Warp each source triangle independently into its destination."""
+        """
+        Warp the original artwork onto the destination mesh.
+
+        Inverse-maps destination pixels to source coordinates, then runs a
+        single remap from the immutable design bitmap (never from a previous
+        warped frame).
+        """
         if design_image is None or design_image.ndim < 2:
             return None
-
-        design = to_bgra(design_image)
-        if mirror:
-            design = cv2.flip(design, 1)
-
-        output_h, output_w = map(int, output_shape)
-        destination = np.zeros((output_h, output_w, 4), dtype=np.uint8)
-        source_points = np.asarray(source_points, dtype=np.float32)
-
-        for triangle in destination_mesh.triangles():
-            MeshWarper._warp_triangle(
-                design,
-                destination,
-                source_points[triangle],
-                destination_mesh.points[triangle],
-            )
-        return destination
-
-    @staticmethod
-    def _warp_triangle(
-        source: np.ndarray,
-        destination: np.ndarray,
-        source_triangle: np.ndarray,
-        destination_triangle: np.ndarray,
-    ) -> None:
-        """Affine-warp one triangle and alpha-compose it into the output."""
-        source_rect = cv2.boundingRect(source_triangle.astype(np.float32))
-        destination_rect = cv2.boundingRect(
-            destination_triangle.astype(np.float32)
+        map_x, map_y, coverage = MeshWarper.rasterize_vertex_maps(
+            destination_mesh,
+            source_points,
+            output_shape,
         )
-        sx, sy, sw, sh = source_rect
-        dx, dy, dw, dh = destination_rect
-
-        if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
-            return
-
-        # Clamp destination ROI to the output while preserving triangle offsets.
-        out_h, out_w = destination.shape[:2]
-        x0, y0 = max(dx, 0), max(dy, 0)
-        x1, y1 = min(dx + dw, out_w), min(dy + dh, out_h)
-        if x1 <= x0 or y1 <= y0:
-            return
-
-        source_local = source_triangle - np.array([sx, sy], dtype=np.float32)
-        destination_local = destination_triangle - np.array(
-            [dx, dy], dtype=np.float32
+        return MeshWarper.remap_design(
+            design_image,
+            map_x,
+            map_y,
+            coverage,
+            mirror=mirror,
+            interpolation=interpolation,
         )
-
-        # BORDER_TRANSPARENT is not reliable for affine BGRA on all OpenCV
-        # builds, so warp an explicitly padded source crop and mask afterwards.
-        source_crop = MeshWarper._source_patch(source, sx, sy, sw, sh)
-        if source_crop is None:
-            return
-
-        transform = cv2.getAffineTransform(source_local, destination_local)
-        # Bilinear sampling on the triangle's own outline reaches just past the
-        # crop. Replicating keeps alpha at full strength there; a constant zero
-        # border would instead darken a hairline along every triangle edge.
-        warped = cv2.warpAffine(
-            source_crop,
-            transform,
-            (dw, dh),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-
-        # Soft triangle coverage from LINE_AA — do NOT promote every partial
-        # pixel to 255. That binary threshold was the main stair-step on
-        # rounded outer corners (internal seams still use max-alpha compose).
-        triangle_mask = np.zeros((dh, dw), dtype=np.uint8)
-        cv2.fillConvexPoly(
-            triangle_mask,
-            np.round(destination_local).astype(np.int32),
-            255,
-            lineType=cv2.LINE_AA,
-        )
-        warped[:, :, 3] = np.minimum(warped[:, :, 3], triangle_mask)
-
-        crop_x0, crop_y0 = x0 - dx, y0 - dy
-        crop_x1, crop_y1 = crop_x0 + (x1 - x0), crop_y0 + (y1 - y0)
-        patch = warped[crop_y0:crop_y1, crop_x0:crop_x1]
-        target = destination[y0:y1, x0:x1]
-
-        # Keep straight (not premultiplied) colour because the compositor
-        # applies alpha later. Prefer the triangle with greater coverage on
-        # antialiased shared edges to prevent dark seams.
-        take = patch[:, :, 3] > target[:, :, 3]
-        target[:, :, :3][take] = patch[:, :, :3][take]
-        target[:, :, 3] = np.maximum(target[:, :, 3], patch[:, :, 3])
-
-    @staticmethod
-    def _source_patch(
-        source: np.ndarray, x: int, y: int, w: int, h: int
-    ) -> Optional[np.ndarray]:
-        """
-        Read a source rectangle, extending edge pixels where it leaves the image.
-
-        Sub-pixel triangle bounds routinely reach a pixel or two outside the
-        artwork, which would punch transparent notches into an otherwise solid
-        print. Replication is capped at that tolerance: a window reaching much
-        further is genuinely outside the artwork, as in fit mode or a deliberate
-        zoom-out, and the cover has to stay visible there.
-        """
-        height, width = source.shape[:2]
-        x0 = int(np.clip(x, 0, width - 1))
-        y0 = int(np.clip(y, 0, height - 1))
-        x1 = int(np.clip(x + w, x0 + 1, width))
-        y1 = int(np.clip(y + h, y0 + 1, height))
-
-        patch = source[y0:y1, x0:x1]
-        pads = [
-            max(0, min(h, y0 - y)),
-            0,
-            max(0, min(w, x0 - x)),
-            0,
-        ]
-        pads[1] = max(0, h - pads[0] - (y1 - y0))
-        pads[3] = max(0, w - pads[2] - (x1 - x0))
-        if not any(pads):
-            return patch
-
-        replicated = [min(pad, MeshWarper.EDGE_TOLERANCE) for pad in pads]
-        if any(replicated):
-            patch = cv2.copyMakeBorder(
-                patch, *replicated, borderType=cv2.BORDER_REPLICATE
-            )
-        blank = [pad - done for pad, done in zip(pads, replicated)]
-        if any(blank):
-            patch = cv2.copyMakeBorder(
-                patch, *blank, borderType=cv2.BORDER_CONSTANT,
-                value=(0, 0, 0, 0),
-            )
-        return patch
 
 
 def mesh_aspect(mesh: ControlMesh) -> float:
@@ -1962,6 +2156,35 @@ def _sample_rounded_quad_perimeter(
     return np.asarray(cleaned, dtype=np.float32)
 
 
+def _along_edge_maps(
+    shape: Tuple[int, int],
+    *,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    corner_frac: float = 0.22,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    along_lr ≈ 1 near left/right sides, along_tb ≈ 1 near top/bottom.
+
+    Corner pockets are where both are high. Mid-sides are where only one is.
+    ``corner_frac`` is measured from this silhouette (not a phone model).
+    """
+    height, width = map(int, shape)
+    bw = max(float(x1 - x0), 1.0)
+    bh = max(float(y1 - y0), 1.0)
+    band = float(np.clip(corner_frac, 0.08, 0.40))
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    u = np.clip((xx - float(x0)) / bw, 0.0, 1.0)
+    v = np.clip((yy - float(y0)) / bh, 0.0, 1.0)
+    near_lr = np.minimum(u, 1.0 - u)
+    near_tb = np.minimum(v, 1.0 - v)
+    along_lr = np.clip(1.0 - near_lr / band, 0.0, 1.0)
+    along_tb = np.clip(1.0 - near_tb / band, 0.0, 1.0)
+    return along_lr.astype(np.float32), along_tb.astype(np.float32)
+
+
 def _corner_proximity_map(
     shape: Tuple[int, int],
     *,
@@ -1976,18 +2199,9 @@ def _corner_proximity_map(
 
     Used so AA / blur softens curves without making L/R vertical borders cloudy.
     """
-    height, width = map(int, shape)
-    bw = max(float(x1 - x0), 1.0)
-    bh = max(float(y1 - y0), 1.0)
-    band = float(np.clip(corner_frac, 0.08, 0.40))
-    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    u = np.clip((xx - float(x0)) / bw, 0.0, 1.0)
-    v = np.clip((yy - float(y0)) / bh, 0.0, 1.0)
-    near_lr = np.minimum(u, 1.0 - u)
-    near_tb = np.minimum(v, 1.0 - v)
-    # High only when BOTH axes are near an edge (true corner pockets).
-    along_lr = np.clip(1.0 - near_lr / band, 0.0, 1.0)
-    along_tb = np.clip(1.0 - near_tb / band, 0.0, 1.0)
+    along_lr, along_tb = _along_edge_maps(
+        shape, x0=x0, y0=y0, x1=x1, y1=y1, corner_frac=corner_frac
+    )
     return (along_lr * along_tb).astype(np.float32)
 
 

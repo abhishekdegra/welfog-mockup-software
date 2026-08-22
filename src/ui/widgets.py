@@ -411,6 +411,40 @@ class PreviewCanvas(QWidget):
         """Current cutout creation shape."""
         return self._cutout_shape
 
+    def apply_selected_cutout_shape(self, shape: str) -> bool:
+        """
+        Rebuild the hovered / last cutout as the user-chosen tool shape.
+
+        Keeps the same AABB (position + size); only the hole outline changes.
+        """
+        if not self._exclusion_contours:
+            return False
+        allowed = {
+            "circle", "square", "triangle", "free", "capsule", "button",
+            "rounded_square", "rounded_rect", "rectangle", "oval",
+            "pill_h", "pill_v", "squircle", "superellipse", "polygon",
+            "custom_path",
+        }
+        tag = str(shape or "").lower().strip()
+        if tag not in allowed:
+            tag = "rounded_rect"
+        c_idx = int(self._hover_exclusion[0])
+        if not (0 <= c_idx < len(self._exclusion_contours)):
+            c_idx = len(self._exclusion_contours) - 1
+        while len(self._exclusion_shapes) < len(self._exclusion_contours):
+            self._exclusion_shapes.append(self._cutout_shape)
+        self._cutout_shape = tag
+        self._exclusion_shapes[c_idx] = tag
+        self._exclusion_contours[c_idx] = self._normalize_exclusion_contour(
+            self._exclusion_contours[c_idx],
+            shape_tag=tag,
+            corner_frac=float(getattr(self, "_cutout_corner_frac", 0.16)),
+            rotation_deg=float(getattr(self, "_cutout_rotation_deg", 0.0)),
+        )
+        self.exclusionContoursChanged.emit(self.exclusion_contours())
+        self.update()
+        return True
+
     def set_erase_mode(self, enabled: bool) -> None:
         """Paint-to-erase wrap mode (adds exclusion under the brush)."""
         self._erase_mode = bool(enabled)
@@ -796,10 +830,7 @@ class PreviewCanvas(QWidget):
             for index in boundary[1:]:
                 peri.lineTo(self._norm_to_widget(self._mesh[index]))
             peri.closeSubpath()
-            fill = QColor(accent)
-            # Slightly lighter while dragging so cutouts stay readable.
-            fill.setAlpha(18 if dragging_mesh else (28 if self._edit_cover else 14))
-            painter.setBrush(QBrush(fill))
+            painter.setBrush(Qt.NoBrush)
             painter.setPen(
                 QPen(accent, 1.8 if self._edit_cover else 1.3, Qt.SolidLine)
             )
@@ -810,9 +841,7 @@ class PreviewCanvas(QWidget):
             for point in points[1:]:
                 path.lineTo(point)
             path.closeSubpath()
-            fill = QColor(accent)
-            fill.setAlpha(20 if dragging_mesh else (32 if self._edit_cover else 16))
-            painter.setBrush(QBrush(fill))
+            painter.setBrush(Qt.NoBrush)
             painter.setPen(
                 QPen(accent, 2.0 if self._edit_cover else 1.4, Qt.SolidLine)
             )

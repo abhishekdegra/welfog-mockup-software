@@ -200,6 +200,24 @@ class MaterialRenderingEngine:
         # Soft phone luminance only — sharp MagSafe rings / logos must not
         # imprint onto opaque printed artwork as fake reflections.
         phone_lum_raw = luminance(phone)
+        # Black camera plates must not bleed into wrap shading — that
+        # printed a dark jagged halo around the island.
+        if exclusion is not None and float(np.max(exclusion)) > 0.05:
+            excl = np.clip(exclusion.astype(np.float32), 0.0, 1.0)
+            if float(np.max(excl)) > 1.05:
+                excl = excl / 255.0
+            if excl.shape[:2] != phone_lum_raw.shape[:2]:
+                excl = cv2.resize(
+                    excl,
+                    (phone_lum_raw.shape[1], phone_lum_raw.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            body = (excl < 0.35).astype(np.float32)
+            if float(np.max(body)) > 0.05:
+                den = cv2.GaussianBlur(body, (0, 0), 8.0)
+                num = cv2.GaussianBlur(phone_lum_raw * body, (0, 0), 8.0)
+                filled = num / np.maximum(den, 1e-4)
+                phone_lum_raw = np.where(excl > 0.20, filled, phone_lum_raw)
         soft_sigma = max(6.0, min(phone.shape[:2]) * 0.035)
         phone_lum = cv2.GaussianBlur(phone_lum_raw, (0, 0), soft_sigma)
 
@@ -556,38 +574,38 @@ class MaterialRenderingEngine:
         h, w = coverage.shape[:2]
         short = float(min(h, w))
 
-        hole = (module > 0.45).astype(np.uint8)
+        # Soft coverage is the shape authority (circle / pill / path AA).
+        # Binary threshold only seeds the ROI — distance uses float module.
+        hole = (module > 0.50).astype(np.uint8)
         outside = (1 - hole).astype(np.uint8)
         if int(np.count_nonzero(hole)) < 16 or int(np.count_nonzero(outside)) < 16:
             return result, new_mask
 
         ys, xs = np.where(hole > 0)
         cut_short = float(min(xs.max() - xs.min() + 1, ys.max() - ys.min() + 1))
+        # Subtle manufactured lip — proportional to cutout, never a thick blob.
         ridge_w = float(
-            np.clip(max(4.5, cut_short * 0.075, short * 0.008), 4.5, short * 0.026)
+            np.clip(max(3.2, cut_short * 0.065, short * 0.0065), 3.2, short * 0.020)
         )
         dist_out = MaterialRenderingEngine._subpixel_outside_distance(
             module, (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
             margin=int(np.ceil(ridge_w * 3.0)) + 4,
         )
-        # The field is locally linear, so a light blur removes the remaining
-        # rasterisation steps without moving the lip — sharp speculars would
-        # otherwise amplify them into sparkle along the corner arcs.
-        dist_out = cv2.GaussianBlur(dist_out, (0, 0), max(0.7, ridge_w * 0.16))
+        # Light blur removes raster steps without moving the lip.
+        dist_out = cv2.GaussianBlur(dist_out, (0, 0), max(0.55, ridge_w * 0.12))
 
         # Rounded lip profile: 0 at hole edge → peak mid → 0 into flat wrap.
         t = np.clip(dist_out / ridge_w, 0.0, 1.0)
         ridge = np.sin(np.pi * t).astype(np.float32)
+        # Soft module keeps AA fringe out of the ridge (no white chips).
         ridge = ridge * (1.0 - np.clip(module, 0.0, 1.0)) * new_mask
-        ridge = cv2.GaussianBlur(ridge, (0, 0), max(0.40, ridge_w * 0.06))
+        ridge = cv2.GaussianBlur(ridge, (0, 0), max(0.35, ridge_w * 0.05))
         if float(np.max(ridge)) < 0.02:
             return result, new_mask
 
         # Normals from the sub-pixel distance profile, so curved corners get
-        # the exact same clean shading as the straight edges. Lip height is a
-        # fraction of its width, which is what makes the slope read as moulded
-        # plastic instead of a flat print.
-        amp = 0.92
+        # the exact same clean shading as the straight edges.
+        amp = 1.18
         slope = (np.pi * amp) * np.cos(np.pi * t)
         slope = slope * (t > 0.0).astype(np.float32) * (t < 1.0).astype(np.float32)
         dgx = cv2.Sobel(dist_out, cv2.CV_32F, 1, 0, ksize=3) * 0.25
@@ -596,9 +614,7 @@ class MaterialRenderingEngine:
         ux, uy = dgx / dnorm, dgy / dnorm
         gx = -slope * ux
         gy = -slope * uy
-        # Band-limit the normal field before lighting it: an unfiltered 1px lip
-        # aliases into a beaded highlight wherever the border curves.
-        n_sigma = max(0.9, ridge_w * 0.20)
+        n_sigma = max(0.70, ridge_w * 0.14)
         gx = cv2.GaussianBlur(gx, (0, 0), n_sigma)
         gy = cv2.GaussianBlur(gy, (0, 0), n_sigma)
         gnorm = np.sqrt(gx * gx + gy * gy + 1.0)
@@ -609,50 +625,44 @@ class MaterialRenderingEngine:
         dx, dy = lighting.direction
         length = max(float(np.hypot(dx, dy)), 1e-6)
         lx, ly = -dx / length, -dy / length
-        # Elevated key light: a flat wrap and the lip crest both face the
-        # camera, so shading has to come from the z component too.
-        l_up = 0.80 + 0.06 * lighting.softness
+        l_up = 0.76 + 0.06 * lighting.softness
         l_side = float(np.sqrt(max(1.0 - l_up * l_up, 1e-4)))
         Lx, Ly, Lz = lx * l_side, ly * l_side, l_up
 
-        gate = np.clip(ridge * 1.6, 0.0, 1.0)
+        # Studio profile can be muted by zeroed sliders — keep a floor so the
+        # moulded lip still reads on dark artwork.
+        hi = float(max(0.85, getattr(lighting, "highlight_scale", 1.0) or 1.0))
+        gate = np.clip(ridge * 1.95, 0.0, 1.0)
         diffuse = np.clip(nx * Lx + ny * Ly + nz * Lz, 0.0, 1.0)
         lit = np.clip((diffuse - Lz) / max(1.0 - Lz, 1e-3), 0.0, 1.0)
         dim = np.clip((Lz - diffuse) / max(Lz, 1e-3), 0.0, 1.0)
 
-        sheen = lit * gate * (0.78 * lighting.highlight_scale)
-        sheen = cv2.GaussianBlur(sheen, (0, 0), max(0.5, ridge_w * 0.10))
+        sheen = lit * gate * (0.95 * hi)
+        sheen = cv2.GaussianBlur(sheen, (0, 0), max(0.40, ridge_w * 0.08))
         result = MaterialRenderingEngine._soft_specular_lift(
-            result, sheen, preserve_chroma=True, white_mix=0.05
+            result, sheen, preserve_chroma=True, white_mix=0.035
         )
 
-        # Glossy band: Blinn specular against a head-on viewer. Real gloss is
-        # near-white, so this screens instead of scaling chroma — otherwise the
-        # bump disappears on dark artwork.
         hx, hy, hz = Lx, Ly, Lz + 1.0
         hn = max(float(np.sqrt(hx * hx + hy * hy + hz * hz)), 1e-6)
         hx, hy, hz = hx / hn, hy / hn, hz / hn
-        # Keep the band clearly wider than a pixel: a sub-pixel specular beads
-        # into dashes along rounded corners while staying solid on flat edges.
-        power = 7.0 + 11.0 * (1.0 - lighting.softness)
+        power = 7.5 + 9.0 * (1.0 - lighting.softness)
         ndh = np.clip(nx * hx + ny * hy + nz * hz, 0.0, 1.0)
         base_spec = float(hz) ** power
         spec = np.clip(
             (ndh ** power - base_spec) / max(1.0 - base_spec, 1e-4), 0.0, 1.0
         )
         gloss = spec * gate
-        gloss = cv2.GaussianBlur(gloss, (0, 0), max(1.0, ridge_w * 0.22))
-        gloss = np.clip(gloss * (0.95 * lighting.highlight_scale), 0.0, 1.0)
+        gloss = cv2.GaussianBlur(gloss, (0, 0), max(0.75, ridge_w * 0.16))
+        gloss = np.clip(gloss * (1.15 * hi), 0.0, 1.0)
         if float(np.max(gloss)) > 1e-4:
             result = MaterialRenderingEngine._soft_specular_lift(
                 result, gloss, preserve_chroma=False
             )
 
         wrap_only = (1.0 - np.clip(module, 0.0, 1.0)) * new_mask
-        shade = cv2.GaussianBlur(dim * gate, (0, 0), max(0.55, ridge_w * 0.10))
-        # No dark crevice hugging the hole edge — that read as a jagged inner
-        # lip on camera/button cutouts. Keep only a light outer drop shadow.
-        ao = np.clip(shade * 0.28, 0.0, 0.32)
+        shade = cv2.GaussianBlur(dim * gate, (0, 0), max(0.50, ridge_w * 0.09))
+        ao = np.clip(shade * 0.22, 0.0, 0.26)
         result = np.clip(result * (1.0 - ao[:, :, np.newaxis]), 0.0, 1.0)
 
         outer_shadow = np.clip(
@@ -661,12 +671,12 @@ class MaterialRenderingEngine:
         outer_shadow = (1.0 - outer_shadow) * np.clip(
             dist_out / max(ridge_w * 0.55, 1.0), 0.0, 1.0
         )
-        outer_shadow = outer_shadow * wrap_only * 0.26
+        outer_shadow = outer_shadow * wrap_only * 0.22
         outer_shadow = cv2.GaussianBlur(
-            outer_shadow, (0, 0), max(0.8, ridge_w * 0.12)
+            outer_shadow, (0, 0), max(0.7, ridge_w * 0.11)
         )
-        shift_x = int(round(-lx * ridge_w * 0.25))
-        shift_y = int(round(-ly * ridge_w * 0.25))
+        shift_x = int(round(-lx * ridge_w * 0.22))
+        shift_y = int(round(-ly * ridge_w * 0.22))
         if shift_x or shift_y:
             matrix = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
             outer_shadow = cv2.warpAffine(
@@ -1030,9 +1040,9 @@ class MaterialRenderingEngine:
         dist_out = MaterialRenderingEngine._subpixel_outside_distance(
             excl, bbox, margin=int(max(10, short * 0.014))
         )
-        fade = float(np.clip(max(6.0, short * 0.008), 6.0, short * 0.022))
+        fade = float(np.clip(max(10.0, short * 0.022), 10.0, short * 0.040))
         near = np.clip(dist_out / fade, 0.0, 1.0)
-        gate = np.clip(0.12 + 0.88 * near, 0.12, 1.0).astype(np.float32)
+        gate = np.clip(near * near, 0.0, 1.0).astype(np.float32)
         return gate
 
     @staticmethod
@@ -1071,8 +1081,8 @@ class MaterialRenderingEngine:
         if kind in ("silicon", "matte"):
             rng = np.random.RandomState(3)
             noise = rng.rand(height, width).astype(np.float32)
-            soft = cv2.GaussianBlur(noise, (0, 0), max(1.5, width * 0.008))
-            return np.clip(0.92 + 0.14 * soft, 0.82, 1.15).astype(np.float32)
+            soft = cv2.GaussianBlur(noise, (0, 0), max(3.5, width * 0.018))
+            return np.clip(0.97 + 0.05 * soft, 0.94, 1.04).astype(np.float32)
 
         return None
 

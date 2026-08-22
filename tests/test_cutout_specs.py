@@ -211,6 +211,26 @@ def test_camera_rectangle_box_is_mild_rounded_not_stadium():
     assert mask[48, 48] >= 128
 
 
+def test_auto_camera_freeze_keeps_photo_contour_not_aabb():
+    """Detected camera islands paint the photo pill, not a rectangle hole."""
+    h, w = 240, 180
+    gray = np.full((h, w), 200, np.uint8)
+    cv2.ellipse(gray, (70, 90), (28, 55), 0, 0, 360, 40, -1)
+    seed = np.array(
+        [[42, 35], [98, 35], [98, 145], [42, 145]], dtype=np.float32
+    )
+    spec = HardwareRegionDetector.freeze_cutout_spec(
+        seed, kind="camera", gray=gray, width=w, height=h
+    )
+    assert spec.geom == "contour"
+    assert float(spec.expand_px) == 0.0
+    mask = np.zeros((h, w), dtype=np.uint8)
+    HardwareRegionDetector.paint_from_cutout_spec(mask, spec, w, h)
+    # Seed AABB corners sit outside a vertical pill — must stay unpunched.
+    assert int(mask[35, 42]) < 80
+    assert int(mask[90, 70]) >= 180
+
+
 def test_build_cutout_specs_authoritative():
     cover = np.array(
         [[10, 10], [200, 10], [200, 400], [10, 400]], dtype=np.float32
@@ -325,3 +345,47 @@ def test_freeze_irregular_island_uses_contour(monkeypatch):
     )
     assert spec.geom == "contour"
     assert len(spec.contour) >= 16
+
+
+def test_squircle_tag_paints_exact_contour_not_aabb():
+    """Squircle / diamond stay path-true — never morph into a rounded box."""
+    h, w = 220, 180
+    quad = np.array([[20, 20], [160, 20], [160, 200], [20, 200]], dtype=np.float32)
+    poly = HardwareRegionDetector.make_shape_polygon(
+        "squircle", (0.5, 0.4), 0.12, aspect=1.0
+    )
+    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2).copy()
+    pts[:, 0] *= w
+    pts[:, 1] *= h
+    specs = build_cutout_specs(
+        [pts],
+        quad,
+        w,
+        h,
+        authoritative=False,
+        shape_tags=["squircle"],
+    )
+    assert specs and specs[0].geom == "contour"
+    assert specs[0].shape_tag == "squircle"
+    mask = np.zeros((h, w), dtype=np.uint8)
+    HardwareRegionDetector.paint_from_cutout_spec(mask, specs[0], w, h)
+    assert int(np.count_nonzero(mask > 128)) > 80
+    # Soft AA band exists (not a binary stamp).
+    soft = (mask > 20) & (mask < 230)
+    assert int(np.count_nonzero(soft)) >= 8
+
+
+def test_circle_paint_has_zero_expand_and_soft_rim():
+    mask = np.zeros((160, 160), dtype=np.uint8)
+    HardwareRegionDetector.paint_cutout_mask(
+        mask,
+        np.array([[50, 50], [110, 50], [110, 110], [50, 110]], dtype=np.float32),
+        geom="circle",
+        params=(80.0, 80.0, 28.0),
+        expand_override=0.0,
+    )
+    # Exact radius: a pixel clearly outside r=28 must stay empty.
+    assert mask[80, 80 + 32] < 40
+    assert mask[80, 80] >= 250
+    soft = (mask > 20) & (mask < 230)
+    assert int(np.count_nonzero(soft)) >= 12

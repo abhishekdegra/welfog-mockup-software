@@ -306,7 +306,7 @@ class ProjectStore:
                             "Wrap finalize after project load failed: %s", exc
                         )
                     try:
-                        compositor.heal_realistic_wrap(include_hardware=True)
+                        compositor.heal_realistic_wrap(include_hardware=False)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Wrap heal after project load failed: %s", exc)
             except Exception as exc:  # noqa: BLE001

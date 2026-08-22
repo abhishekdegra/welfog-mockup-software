@@ -36,9 +36,10 @@ from .curved_uv import (
 
 logger = logging.getLogger("mockup.compositor")
 
-# Outward grow for camera/lens openings. Side-bezel buttons need a fat punch,
-# camera islands must hug the real hardware or the cutout looks oversized.
-CAMERA_HOLE_EXPAND_PX = 2.25
+# Camera punch follows the painted detection/SDF contour. A positive expand
+# opened a halo around the island (gap + jagged fringe). Buttons are never
+# punched through this constant — they have their own mask.
+CAMERA_HOLE_EXPAND_PX = 0.0
 
 
 DEFAULT_SETTINGS: Dict[str, float] = {
@@ -195,6 +196,9 @@ class Compositor:
         self._side_button_validated_mask: Optional[np.ndarray] = None
         self._side_button_stem_bridge_mask: Optional[np.ndarray] = None
         self._scaled_phone_cache: "OrderedDict[int, Tuple[np.ndarray, float]]" = OrderedDict()
+        self._uv_field_cache: Optional[
+            Tuple[tuple, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = None
 
         # Seed default material + lighting floats onto settings.
         self.settings.update(material_settings(self.material_name))
@@ -243,7 +247,7 @@ class Compositor:
 
     def set_design_image(self, image: np.ndarray) -> None:
         """Set the design image, stored as BGRA so transparency survives."""
-        self.design_image = to_bgra(image)
+        self.design_image = np.ascontiguousarray(to_bgra(image).copy())
         if self.control_mesh is not None:
             self.auto_fit_design()
         self.invalidate()
@@ -554,6 +558,7 @@ class Compositor:
         self._side_button_validated_mask = None
         self._side_button_stem_bridge_mask = None
         self._product_body_corner = None
+        self._uv_field_cache = None
 
     @staticmethod
     def _stem_bridge_between_tips_and_body(
@@ -702,22 +707,479 @@ class Compositor:
         phone_h: float,
         *,
         side: str = "left",
+        inset_frac: float = 0.18,
+        outward: bool = False,
     ) -> float:
         """Stable mid-body wall coordinate (ignores corner arcs and buttons)."""
-        y_lo = y_min + int(round(phone_h * 0.18))
-        y_hi = y_max - int(round(phone_h * 0.18))
+        inset = float(np.clip(inset_frac, 0.10, 0.32))
+        y_lo = y_min + int(round(phone_h * inset))
+        y_hi = y_max - int(round(phone_h * inset))
         band = edge[y_lo : y_hi + 1]
         valid = ~np.isnan(band)
         if not np.any(valid):
             return float(np.nanmedian(edge))
-        med = float(np.nanmedian(band[valid]))
-        stable = valid & (np.abs(band - med) <= 1.25)
-        if int(np.count_nonzero(stable)) >= 12:
-            ref = band[stable]
-        else:
-            ref = band[valid]
-        pct = 82.0 if side == "left" else 18.0
-        return float(np.nanpercentile(ref, pct))
+        vals = band[valid].astype(np.float32)
+        # Detection and body coverage both use the inward percentile.
+        # Tips are already stripped before the body wall is measured, so
+        # the inward lock is the true case edge. Outward lock was keeping
+        # leftover AA / nubs and wrapping past the rim.
+        if side == "left":
+            pct = 18.0 if outward else 82.0
+            p_in = float(np.nanpercentile(vals, pct))
+            keep = vals <= (p_in + 1.0) if outward else vals >= (p_in - 1.0)
+            if int(np.count_nonzero(keep)) >= 12:
+                return float(np.nanpercentile(vals[keep], pct))
+            return p_in
+        pct = 82.0 if outward else 18.0
+        p_in = float(np.nanpercentile(vals, pct))
+        keep = vals >= (p_in - 1.0) if outward else vals <= (p_in + 1.0)
+        if int(np.count_nonzero(keep)) >= 12:
+            return float(np.nanpercentile(vals[keep], pct))
+        return p_in
+
+    @staticmethod
+    def _horizontal_wall_reference(
+        edge: np.ndarray,
+        x_min: int,
+        x_max: int,
+        phone_w: float,
+        *,
+        side: str = "top",
+        inset_frac: float = 0.18,
+    ) -> float:
+        """Stable mid-body top/bottom wall (ignores corner arcs and speckles)."""
+        inset = float(np.clip(inset_frac, 0.10, 0.32))
+        x_lo = x_min + int(round(phone_w * inset))
+        x_hi = x_max - int(round(phone_w * inset))
+        band = edge[x_lo : x_hi + 1]
+        valid = ~np.isnan(band)
+        if not np.any(valid):
+            return float(np.nanmedian(edge))
+        vals = band[valid].astype(np.float32)
+        # Top: outward is smaller y → inward percentile 82.
+        # Bottom: outward is larger y → inward percentile 18.
+        if side == "top":
+            p_in = float(np.nanpercentile(vals, 82.0))
+            keep = vals >= (p_in - 1.0)
+            if int(np.count_nonzero(keep)) >= 12:
+                return float(np.nanpercentile(vals[keep], 82.0))
+            return p_in
+        p_in = float(np.nanpercentile(vals, 18.0))
+        keep = vals <= (p_in + 1.0)
+        if int(np.count_nonzero(keep)) >= 12:
+            return float(np.nanpercentile(vals[keep], 18.0))
+        return p_in
+
+    @staticmethod
+    def _capped_smooth_1d(
+        arr: np.ndarray, window: int = 5, cap: float = 0.70
+    ) -> np.ndarray:
+        """Ease 1px kinks in an edge profile without growing the silhouette."""
+        a = arr.astype(np.float32).copy()
+        valid = np.isfinite(a)
+        if int(np.count_nonzero(valid)) < max(int(window), 5):
+            return a
+        filled = Compositor._fill_1d_edge_profile(a)
+        k = int(window) | 1
+        pad = k // 2
+        kernel = np.ones(k, dtype=np.float32) / float(k)
+        sm = np.convolve(np.pad(filled, pad, mode="edge"), kernel, mode="valid")
+        delta = sm.astype(np.float32) - filled
+        mag = np.abs(delta)
+        scale = np.minimum(1.0, float(cap) / np.maximum(mag, 1e-6))
+        out = filled + delta * scale
+        out[~valid] = np.nan
+        return out.astype(np.float32)
+
+    @staticmethod
+    def _profile_straightness(
+        edge: np.ndarray, lo: int, hi: int
+    ) -> float:
+        """
+        1 if this mid-band is a straight wall, 0 if curved / tapered / tilted.
+
+        Measured from the photo silhouette — not a phone-model constant.
+        """
+        n = int(edge.shape[0])
+        if n < 8:
+            return 0.0
+        lo_i = int(np.clip(lo, 0, n - 1))
+        hi_i = int(np.clip(hi, lo_i, n - 1))
+        band = edge[lo_i : hi_i + 1]
+        valid = np.isfinite(band)
+        if int(np.count_nonzero(valid)) < 12:
+            return 0.0
+        vals = band[valid].astype(np.float32)
+        med = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - med)))
+        # ~1px raster stairs stay straight; a curve/taper over the mid-band
+        # raises MAD. 0.30px → 1.0, 1.35px → 0.0.
+        return float(np.clip((1.35 - mad) / 1.05, 0.0, 1.0))
+
+    @staticmethod
+    def _corner_frac_from_edges(
+        edge_l: np.ndarray,
+        edge_r: np.ndarray,
+        edge_t: np.ndarray,
+        edge_b: np.ndarray,
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        wall_l: float,
+        wall_r: float,
+        wall_t: float,
+        wall_b: float,
+    ) -> float:
+        """Corner pocket as a fraction of this silhouette (any size/radius)."""
+        ph = float(max(y1 - y0, 1))
+        pw = float(max(x1 - x0, 1))
+
+        def _depart_frac(
+            edge: np.ndarray,
+            start: int,
+            stop: int,
+            step: int,
+            wall: float,
+            span: float,
+        ) -> float:
+            y = int(start)
+            last = int(stop)
+            run = 0
+            while (step > 0 and y <= last) or (step < 0 and y >= last):
+                if 0 <= y < edge.shape[0] and np.isfinite(edge[y]):
+                    if abs(float(edge[y]) - float(wall)) > 1.25:
+                        run += 1
+                    elif run >= 2:
+                        break
+                y += step
+            return float(np.clip(run / max(span, 1.0), 0.0, 0.40))
+
+        fracs = [
+            _depart_frac(edge_l, y0, y1, 1, wall_l, ph),
+            _depart_frac(edge_l, y1, y0, -1, wall_l, ph),
+            _depart_frac(edge_r, y0, y1, 1, wall_r, ph),
+            _depart_frac(edge_r, y1, y0, -1, wall_r, ph),
+            _depart_frac(edge_t, x0, x1, 1, wall_t, pw),
+            _depart_frac(edge_t, x1, x0, -1, wall_t, pw),
+            _depart_frac(edge_b, x0, x1, 1, wall_b, pw),
+            _depart_frac(edge_b, x1, x0, -1, wall_b, pw),
+        ]
+        med = float(np.median(np.asarray(fracs, dtype=np.float32)))
+        return float(np.clip(med * 1.25, 0.10, 0.34))
+
+    @staticmethod
+    def _silhouette_wall_state(
+        phone_bin: np.ndarray,
+    ) -> Optional[dict]:
+        """
+        Per-silhouette L/R/T/B walls + straightness + corner fraction.
+
+        All values come from this mask. No phone-model constants.
+        """
+        on = phone_bin.astype(bool)
+        if int(np.count_nonzero(on)) < 64:
+            return None
+        h, w = on.shape[:2]
+        ys, xs = np.where(on)
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        ph = float(max(y1 - y0 + 1, 1))
+        pw = float(max(x1 - x0 + 1, 1))
+        edge_l = np.full(h, np.nan, dtype=np.float32)
+        edge_r = np.full(h, np.nan, dtype=np.float32)
+        for y in range(h):
+            row = np.where(on[y])[0]
+            if len(row):
+                edge_l[y] = float(row.min())
+                edge_r[y] = float(row.max())
+        el = Compositor._fill_1d_edge_profile(edge_l)
+        er = Compositor._fill_1d_edge_profile(edge_r)
+        wall_l = Compositor._straight_wall_reference(
+            el, y0, y1, ph, side="left"
+        )
+        wall_r = Compositor._straight_wall_reference(
+            er, y0, y1, ph, side="right"
+        )
+        edge_t = np.full(w, np.nan, dtype=np.float32)
+        edge_b = np.full(w, np.nan, dtype=np.float32)
+        for x in range(w):
+            col = np.where(on[:, x])[0]
+            if len(col):
+                edge_t[x] = float(col.min())
+                edge_b[x] = float(col.max())
+        et = Compositor._fill_1d_edge_profile(edge_t)
+        eb = Compositor._fill_1d_edge_profile(edge_b)
+        wall_t = Compositor._horizontal_wall_reference(
+            et, x0, x1, pw, side="top"
+        )
+        wall_b = Compositor._horizontal_wall_reference(
+            eb, x0, x1, pw, side="bottom"
+        )
+        vals = (wall_l, wall_r, wall_t, wall_b)
+        if not all(np.isfinite(v) for v in vals):
+            return None
+        if (wall_r - wall_l) < 8.0 or (wall_b - wall_t) < 8.0:
+            return None
+        cf = Compositor._corner_frac_from_edges(
+            el, er, et, eb, y0, y1, x0, x1,
+            wall_l, wall_r, wall_t, wall_b,
+        )
+        inset = float(np.clip(max(0.14, cf * 0.95), 0.14, 0.30))
+        if abs(inset - 0.18) > 0.02:
+            wall_l = Compositor._straight_wall_reference(
+                el, y0, y1, ph, side="left", inset_frac=inset
+            )
+            wall_r = Compositor._straight_wall_reference(
+                er, y0, y1, ph, side="right", inset_frac=inset
+            )
+            wall_t = Compositor._horizontal_wall_reference(
+                et, x0, x1, pw, side="top", inset_frac=inset
+            )
+            wall_b = Compositor._horizontal_wall_reference(
+                eb, x0, x1, pw, side="bottom", inset_frac=inset
+            )
+        y_lo = y0 + int(round(ph * inset))
+        y_hi = y1 - int(round(ph * inset))
+        x_lo = x0 + int(round(pw * inset))
+        x_hi = x1 - int(round(pw * inset))
+        return {
+            "l": float(wall_l),
+            "r": float(wall_r),
+            "t": float(wall_t),
+            "b": float(wall_b),
+            "s_l": Compositor._profile_straightness(el, y_lo, y_hi),
+            "s_r": Compositor._profile_straightness(er, y_lo, y_hi),
+            "s_t": Compositor._profile_straightness(et, x_lo, x_hi),
+            "s_b": Compositor._profile_straightness(eb, x_lo, x_hi),
+            "corner_frac": float(cf),
+            "x0": float(x0),
+            "y0": float(y0),
+            "x1": float(x1),
+            "y1": float(y1),
+        }
+
+    @staticmethod
+    def _four_wall_references(
+        phone_bin: np.ndarray,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Robust L/R/T/B mid-body walls (ignores corner arcs and 1px nubs)."""
+        state = Compositor._silhouette_wall_state(phone_bin)
+        if state is None:
+            return None
+        return (
+            float(state["l"]),
+            float(state["r"]),
+            float(state["t"]),
+            float(state["b"]),
+        )
+
+    @staticmethod
+    def _aa_rect_coverage(
+        h: int,
+        w: int,
+        wall_l: float,
+        wall_r: float,
+        wall_t: float,
+        wall_b: float,
+    ) -> np.ndarray:
+        """1px-AA coverage of the mid-body AABB (not used on corner arcs)."""
+        xx = np.arange(int(w), dtype=np.float32)[None, :]
+        yy = np.arange(int(h), dtype=np.float32)[:, None]
+        lr = np.minimum(
+            np.clip(xx - (float(wall_l) - 0.5), 0.0, 1.0),
+            np.clip((float(wall_r) + 0.5) - xx, 0.0, 1.0),
+        )
+        tb = np.minimum(
+            np.clip(yy - (float(wall_t) - 0.5), 0.0, 1.0),
+            np.clip((float(wall_b) + 0.5) - yy, 0.0, 1.0),
+        )
+        return np.minimum(lr, tb).astype(np.float32)
+
+    @staticmethod
+    def _mix_straight_wall_coverage(
+        cov: np.ndarray,
+        state: dict,
+        shape: Tuple[int, int],
+    ) -> np.ndarray:
+        """
+        Replace coverage with 1px-AA walls only on sides that are actually
+        straight on THIS silhouette. Curved / tapered / tilted sides keep
+        the photo contour.
+        """
+        from .mesh import _along_edge_maps
+
+        h, w = map(int, shape)
+        along_lr, along_tb = _along_edge_maps(
+            (h, w),
+            x0=float(state["x0"]),
+            y0=float(state["y0"]),
+            x1=float(state["x1"]),
+            y1=float(state["y1"]),
+            corner_frac=float(state["corner_frac"]),
+        )
+        xx = np.arange(w, dtype=np.float32)[None, :]
+        yy = np.arange(h, dtype=np.float32)[:, None]
+        mid_x = 0.5 * (float(state["l"]) + float(state["r"]))
+        mid_y = 0.5 * (float(state["t"]) + float(state["b"]))
+        s_lr = np.where(xx < mid_x, float(state["s_l"]), float(state["s_r"]))
+        s_tb = np.where(yy < mid_y, float(state["s_t"]), float(state["s_b"]))
+        mix_lr = along_lr * (1.0 - along_tb) * s_lr
+        mix_tb = along_tb * (1.0 - along_lr) * s_tb
+        mix_lr = mix_lr * mix_lr * (3.0 - 2.0 * mix_lr)
+        mix_tb = mix_tb * mix_tb * (3.0 - 2.0 * mix_tb)
+        lr_aa = np.minimum(
+            np.clip(xx - (float(state["l"]) - 0.5), 0.0, 1.0),
+            np.clip((float(state["r"]) + 0.5) - xx, 0.0, 1.0),
+        )
+        tb_aa = np.minimum(
+            np.clip(yy - (float(state["t"]) - 0.5), 0.0, 1.0),
+            np.clip((float(state["b"]) + 0.5) - yy, 0.0, 1.0),
+        )
+        out = mix_lr * lr_aa + (1.0 - mix_lr) * cov
+        out = mix_tb * tb_aa + (1.0 - mix_tb) * out
+        return out.astype(np.float32)
+
+    @staticmethod
+    def _straight_wall_nub_mask(
+        state: dict,
+        shape: Tuple[int, int],
+        *,
+        eps: float = 0.50,
+        skip_sides: Optional[set] = None,
+        protect: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """True on 1px nubs past a straight wall (never on curved sides)."""
+        from .mesh import _along_edge_maps
+
+        h, w = map(int, shape)
+        skip = skip_sides or set()
+        along_lr, along_tb = _along_edge_maps(
+            (h, w),
+            x0=float(state["x0"]),
+            y0=float(state["y0"]),
+            x1=float(state["x1"]),
+            y1=float(state["y1"]),
+            corner_frac=float(state["corner_frac"]),
+        )
+        xx = np.arange(w, dtype=np.float32)[None, :]
+        yy = np.arange(h, dtype=np.float32)[:, None]
+        mid_lr = along_lr * (1.0 - along_tb)
+        mid_tb = along_tb * (1.0 - along_lr)
+        nubs = np.zeros((h, w), dtype=bool)
+        if float(state["s_r"]) >= 0.45 and "right" not in skip:
+            nubs = nubs | (
+                (mid_lr * float(state["s_r"]) > 0.35)
+                & (xx > float(state["r"]) + float(eps))
+            )
+        if float(state["s_l"]) >= 0.45 and "left" not in skip:
+            nubs = nubs | (
+                (mid_lr * float(state["s_l"]) > 0.35)
+                & (xx < float(state["l"]) - float(eps))
+            )
+        if float(state["s_b"]) >= 0.45 and "bottom" not in skip:
+            nubs = nubs | (
+                (mid_tb * float(state["s_b"]) > 0.35)
+                & (yy > float(state["b"]) + float(eps))
+            )
+        if float(state["s_t"]) >= 0.45 and "top" not in skip:
+            nubs = nubs | (
+                (mid_tb * float(state["s_t"]) > 0.35)
+                & (yy < float(state["t"]) - float(eps))
+            )
+        if protect is not None and protect.shape[:2] == (h, w) and np.any(protect):
+            nubs = nubs & ~protect.astype(bool)
+        return nubs
+
+    @staticmethod
+    def _dilate_bool(mask: np.ndarray, px: int) -> np.ndarray:
+        """Isotropic dilate of a bool mask (any phone scale)."""
+        if mask is None or not np.any(mask) or int(px) < 1:
+            return np.zeros_like(mask, dtype=bool) if mask is not None else mask
+        k = max(3, int(px) * 2 + 1)
+        return (
+            cv2.dilate(
+                mask.astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+                iterations=1,
+            )
+            > 0
+        )
+
+    @staticmethod
+    def _sides_with_buttons(
+        tip_mask: Optional[np.ndarray],
+        body: Optional[np.ndarray],
+        shape: Tuple[int, int],
+    ) -> Tuple[set, np.ndarray]:
+        """
+        Which L/R walls have validated buttons, plus a relief-protect mask.
+
+        Device-agnostic: uses detected tip components vs the body wall.
+        """
+        h, w = map(int, shape)
+        protect = np.zeros((h, w), dtype=bool)
+        sides: set = set()
+        if tip_mask is None or np.count_nonzero(tip_mask) < 4:
+            return sides, protect
+        tips = tip_mask > 127 if tip_mask.dtype != bool else tip_mask
+        if tips.shape[:2] != (h, w):
+            tips = (
+                cv2.resize(
+                    tips.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                > 127
+            )
+        body_b = np.zeros((h, w), dtype=bool)
+        if body is not None and np.count_nonzero(body) >= 64:
+            bb = body > 127 if body.dtype != bool else body
+            if bb.shape[:2] != (h, w):
+                bb = (
+                    cv2.resize(
+                        bb.astype(np.uint8),
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    > 127
+                )
+            body_b = bb
+        protect = Compositor._dilate_bool(tips, 3)
+        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(
+            tips.astype(np.uint8) * 255, connectivity=8
+        )
+        for lab in range(1, nlab):
+            if int(stats[lab, cv2.CC_STAT_AREA]) < 4:
+                continue
+            y0 = int(stats[lab, cv2.CC_STAT_TOP])
+            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
+            y1 = min(h, y0 + bh)
+            comp = labels == lab
+            txs = np.where(comp)[1]
+            bxs = np.where(body_b[y0:y1])[1] if np.any(body_b[y0:y1]) else txs
+            if txs.size == 0:
+                continue
+            tmean = float(txs.mean())
+            bmean = float(bxs.mean()) if bxs.size else tmean
+            side = "left" if tmean <= bmean else "right"
+            sides.add(side)
+            # Geometric stem between this key and the body wall — never
+            # studio-white in later chip-kill / leak cleanup.
+            for y in range(y0, y1):
+                txs = np.where(comp[y])[0]
+                bxs = np.where(body_b[y])[0]
+                if txs.size == 0 or bxs.size == 0:
+                    continue
+                if side == "left":
+                    a, b = int(txs.max()) + 1, int(bxs.min())
+                    if a < b:
+                        protect[y, a:b] = True
+                else:
+                    a, b = int(bxs.max()) + 1, int(txs.min())
+                    if a < b:
+                        protect[y, a:b] = True
+        return sides, protect
 
     def _midwall_aabb_quad_from_mask(
         self, mask: np.ndarray
@@ -781,12 +1243,11 @@ class Compositor:
 
         raw = (raw_mask > 127).astype(np.uint8) * 255
         h, w = raw.shape[:2]
+        # Keep the printable wall continuous. Subtracting the whole button
+        # mask notched the sides (white gaps) and pulled the mid-wall inward.
+        # Buttons stay on their own overlay; only outward nubs are excluded
+        # later in `_build_product_body_mask`.
         body = raw.copy()
-        if button_mask is not None and np.count_nonzero(button_mask) >= 4:
-            body = cv2.bitwise_and(
-                body,
-                cv2.bitwise_not((button_mask > 127).astype(np.uint8) * 255),
-            )
 
         corners = order_points(np.asarray(quad, dtype=np.float32))
         y_min = int(np.floor(float(corners[:, 1].min())))
@@ -802,33 +1263,105 @@ class Compositor:
                 edge_r[y] = float(xs.max())
         el = self._fill_1d_edge_profile(edge_l)
         er = self._fill_1d_edge_profile(edge_r)
-        # Mid-sides: same stable wall used for tip detection (right edge is
-        # already flat; left must not keep tip-strip / photo jitter).
+        # Mid-sides: inward wall of the tip-stripped body (true case edge).
         wall_l = self._straight_wall_reference(
             el, y_min, y_max, phone_h, side="left"
         )
         wall_r = self._straight_wall_reference(
             er, y_min, y_max, phone_h, side="right"
         )
+        y_lo = y_min + int(round(phone_h * 0.18))
+        y_hi = y_max - int(round(phone_h * 0.18))
+        s_l = self._profile_straightness(el, y_lo, y_hi)
+        s_r = self._profile_straightness(er, y_lo, y_hi)
+        # Corner blend length follows this silhouette, not a model constant.
+        dummy_t = np.full(max(w, 1), float(y_min), dtype=np.float32)
+        dummy_b = np.full(max(w, 1), float(y_max), dtype=np.float32)
+        cf = self._corner_frac_from_edges(
+            el, er, dummy_t, dummy_b,
+            y_min, y_max, 0, max(w - 1, 0),
+            wall_l, wall_r, float(y_min), float(y_max),
+        )
+        join = float(np.clip(cf, 0.10, 0.28))
 
-        cleaned = np.zeros((h, w), dtype=np.uint8)
-        edge_pts: list = []
+        xl_arr = np.full(h, np.nan, dtype=np.float32)
+        xr_arr = np.full(h, np.nan, dtype=np.float32)
         for y in range(h):
             xs = np.where(body[y])[0]
             if len(xs) == 0:
                 continue
             xl_p = float(el[y]) if np.isfinite(el[y]) else float(xs.min())
             xr_p = float(er[y]) if np.isfinite(er[y]) else float(xs.max())
-            # Continuous mix: photo corners ↔ straight mid-wall.
-            # Smoothstep only removes the 1px join notch — it does not grow
-            # the corner radius.
+            # Continuous mix: photo corners ↔ straight mid-wall, but only when
+            # that side is actually straight on this photo.
             v = (float(y) - float(y_min)) / phone_h
             near = min(max(v, 0.0), 1.0)
             near = min(near, 1.0 - near)
-            t = float(np.clip((0.16 - near) / 0.08, 0.0, 1.0))
+            t = float(np.clip((join - near) / max(join * 0.5, 0.04), 0.0, 1.0))
             t = t * t * (3.0 - 2.0 * t)
-            xl = (1.0 - t) * float(wall_l) + t * xl_p
-            xr = (1.0 - t) * float(wall_r) + t * xr_p
+            w_l = (1.0 - t) * float(s_l)
+            w_r = (1.0 - t) * float(s_r)
+            xl_arr[y] = w_l * float(wall_l) + (1.0 - w_l) * xl_p
+            xr_arr[y] = w_r * float(wall_r) + (1.0 - w_r) * xr_p
+        xl_arr = self._capped_smooth_1d(xl_arr, window=5, cap=0.70)
+        xr_arr = self._capped_smooth_1d(xr_arr, window=5, cap=0.70)
+        # Mid-band: photo edge is authority (covers the light bezel).
+        # Tip rows: keep the inward wall so keys stay on the tip layer.
+        # Non-tip rows: only shave silhouette AA nicks that stick >1.5px
+        # past the quiet mid-edge median (never inset the whole wall).
+        tip_rows = np.zeros(h, dtype=bool)
+        if button_mask is not None and np.count_nonzero(button_mask) >= 4:
+            tips = button_mask > 127
+            tip_rows = np.any(tips, axis=1)
+            tip_rows = cv2.dilate(
+                tip_rows.astype(np.uint8).reshape(-1, 1),
+                np.ones((5, 1), np.uint8),
+                iterations=1,
+            ).reshape(-1).astype(bool)
+        quiet_l_vals = []
+        quiet_r_vals = []
+        for y in range(y_lo, y_hi + 1):
+            if tip_rows[y]:
+                continue
+            if np.isfinite(el[y]):
+                quiet_l_vals.append(float(el[y]))
+            if np.isfinite(er[y]):
+                quiet_r_vals.append(float(er[y]))
+        quiet_l = (
+            float(np.median(quiet_l_vals)) if quiet_l_vals else float(wall_l)
+        )
+        quiet_r = (
+            float(np.median(quiet_r_vals)) if quiet_r_vals else float(wall_r)
+        )
+        for y in range(y_lo, y_hi + 1):
+            if not np.isfinite(xl_arr[y]) or not np.isfinite(xr_arr[y]):
+                continue
+            xl_p = float(el[y]) if np.isfinite(el[y]) else float(xl_arr[y])
+            xr_p = float(er[y]) if np.isfinite(er[y]) else float(xr_arr[y])
+            if tip_rows[y]:
+                # Clip only outward tip nubs to the quiet photo edge.
+                # Using wall_l/wall_r (inward percentile) left a 2–4px chrome
+                # bezel gap on every tip row — white side fringe under wrap.
+                xl_arr[y] = max(xl_p, quiet_l)
+                xr_arr[y] = min(xr_p, quiet_r)
+            else:
+                # Left nick sticks outward (smaller x); right nick larger x.
+                if xl_p < quiet_l - 1.5:
+                    xl_arr[y] = quiet_l
+                else:
+                    xl_arr[y] = xl_p
+                if xr_p > quiet_r + 1.5:
+                    xr_arr[y] = quiet_r
+                else:
+                    xr_arr[y] = xr_p
+
+        cleaned = np.zeros((h, w), dtype=np.uint8)
+        edge_pts: list = []
+        for y in range(h):
+            if not np.isfinite(xl_arr[y]) or not np.isfinite(xr_arr[y]):
+                continue
+            xl = float(xl_arr[y])
+            xr = float(xr_arr[y])
             xl_i = int(np.clip(np.round(xl), 0, w - 1))
             xr_i = int(np.clip(np.round(xr), xl_i, w - 1))
             cleaned[y, xl_i : xr_i + 1] = 255
@@ -840,18 +1373,9 @@ class Compositor:
             left = np.asarray(edge_pts, dtype=np.float32)
             right = []
             for y in range(h - 1, -1, -1):
-                xs = np.where(cleaned[y])[0]
-                if len(xs) == 0:
+                if not np.isfinite(xr_arr[y]):
                     continue
-                # Match the float right edge at this row when recorded.
-                xr_p = float(er[y]) if np.isfinite(er[y]) else float(xs.max())
-                v = (float(y) - float(y_min)) / phone_h
-                near = min(max(v, 0.0), 1.0)
-                near = min(near, 1.0 - near)
-                t = float(np.clip((0.16 - near) / 0.08, 0.0, 1.0))
-                t = t * t * (3.0 - 2.0 * t)
-                xr = (1.0 - t) * float(wall_r) + t * xr_p
-                right.append((xr, float(y)))
+                right.append((float(xr_arr[y]), float(y)))
             pts = np.vstack(
                 [left, np.asarray(right, dtype=np.float32)]
             )
@@ -872,11 +1396,6 @@ class Compositor:
             iterations=1,
         )
         out = cv2.bitwise_or(out, core)
-        if button_mask is not None and np.count_nonzero(button_mask) >= 4:
-            out = cv2.bitwise_and(
-                out,
-                cv2.bitwise_not((button_mask > 127).astype(np.uint8) * 255),
-            )
         if np.count_nonzero(out) < 64:
             return cleaned
         return out
@@ -886,14 +1405,14 @@ class Compositor:
         body_mask: np.ndarray,
         quad: np.ndarray,
         *,
-        lo: float = 11.0,
-        hi: float = 15.5,
+        lo: float = 4.0,
+        hi: float = 22.0,
     ) -> float:
         """
         Pick a corner radius (%) so geometric arcs match the photo rim.
 
-        Bisector estimates often return tiny % values that produce chamfers.
         Scores AABB rounded-rects against the silhouette edge in corner bands.
+        No generic 12.5% prior — that oversized/undersized real phone corners.
         """
         from .mesh import (
             _fill_closed_polyline_aa,
@@ -934,11 +1453,8 @@ class Compositor:
             return err / max(n, 1)
 
         best_r, best_e = 12.0, 1e9
-        # Prefer slightly larger radii (smoother product look) when scores tie.
-        for r in np.linspace(lo, hi, 22):
+        for r in np.linspace(lo, hi, 28):
             e = score(float(r))
-            # Soft prior toward ~12.5% — tiny radii score well but look chamfered.
-            e = e + 0.12 * abs(float(r) - 12.5)
             if e < best_e:
                 best_e, best_r = e, float(r)
         return float(np.clip(best_r, lo, hi))
@@ -953,22 +1469,17 @@ class Compositor:
         """
         Product body from the photo silhouette.
 
-        Mid-sides stay on the cleaned photo wall. Corners keep the real
-        phone contour (contour-smoothed only) — never a generic rounded-rect.
-        Button tips stay excluded from the body.
+        Coverage follows the detected outer contour only — never a mid-side
+        wall rectangle or row-span fill (those caused bottom/side over-wrap).
+        Button tips are removed so they can wrap on their own layer.
         """
+        del corner_radius, quad
         raw = (raw_mask > 127).astype(np.uint8) * 255
-        body = self._smooth_body_wall_from_raw(raw, quad, button_mask)
-
+        body = raw.copy()
         if button_mask is not None and np.count_nonzero(button_mask) >= 4:
             tips = (button_mask > 127) & (raw > 0)
-            dist_in = cv2.distanceTransform(
-                (body > 127).astype(np.uint8), cv2.DIST_L2, 5
-            )
-            tips = tips & (dist_in <= 3.0)
             body = body.copy()
             body[tips] = 0
-
         if np.count_nonzero(body) < 64:
             return raw
         return body
@@ -1021,64 +1532,33 @@ class Compositor:
             er, y_min, y_max, phone_h, side="right"
         )
 
-        # Local prominence vs short smooth — catches 1–2 px real tips.
-        smooth_l = cv2.GaussianBlur(el.reshape(-1, 1), (0, 0), 5.0).ravel()
-        smooth_r = cv2.GaussianBlur(er.reshape(-1, 1), (0, 0), 5.0).ravel()
-        y_lo = y_min + int(round(phone_h * 0.12))
-        y_hi = y_max - int(round(phone_h * 0.08))
-        min_span = max(4, int(round(phone_h * 0.008)))
-        max_span = max(8, int(round(phone_h * 0.12)))
+        # Photo is the source of truth. Silhouette 1px AA vs an inward
+        # percentile wall is NOT a button — that invented mid-body nubs.
+        buttons = self._photo_side_button_mask(
+            raw, phone_bgr, wall_l, wall_r, y_min, y_max
+        )
+        found_any = buttons is not None and np.count_nonzero(buttons) >= 4
+        if not found_any:
+            buttons = self._silhouette_side_button_mask(
+                raw, el, er, wall_l, wall_r, y_min, y_max, phone_h
+            )
+            found_any = buttons is not None and np.count_nonzero(buttons) >= 4
+        # Fallback for flush / low-contrast keys on other phones. Skip when
+        # the photo lip already found real nubs — extra ridges invent ghosts.
+        if not found_any:
+            try:
+                from .region_detector import HardwareRegionDetector
 
-        buttons = np.zeros((h, w), dtype=np.uint8)
-        found_any = False
-
-        for side in ("left", "right"):
-            if side == "left":
-                outward = smooth_l - el
-                wall = wall_l
-                edge = el
-            else:
-                outward = er - smooth_r
-                wall = wall_r
-                edge = er
-
-            prom = outward - cv2.GaussianBlur(
-                outward.reshape(-1, 1), (0, 0), 8.0
-            ).ravel()
-
-            active = np.zeros(h, dtype=bool)
-            for y in range(y_lo, y_hi + 1):
-                # Real tip past the straight wall + local prominence.
-                past_wall = (
-                    (edge[y] < wall - 0.45)
-                    if side == "left"
-                    else (edge[y] > wall + 0.45)
+                hw = HardwareRegionDetector.detect_verified_side_hardware(
+                    phone_bgr, quad, phone_mask=raw
                 )
-                active[y] = past_wall and outward[y] >= 0.45 and prom[y] >= 0.22
-
-            i = 0
-            while i < h:
-                if not active[i]:
-                    i += 1
-                    continue
-                j = i
-                while j < h and active[j]:
-                    j += 1
-                span = j - i
-                if min_span <= span <= max_span:
-                    for y in range(max(0, i - 1), min(h, j + 1)):
-                        if side == "left":
-                            wx = int(np.ceil(wall))
-                            xs = np.where(raw[y, :wx] > 0)[0]
-                        else:
-                            wx = int(np.floor(wall))
-                            xs = np.where(raw[y, wx + 1 :] > 0)[0]
-                            if len(xs):
-                                xs = xs + wx + 1
-                        if len(xs):
-                            buttons[y, xs] = 255
-                            found_any = True
-                i = j
+                if hw is not None and np.count_nonzero(hw) >= 8:
+                    buttons = (hw > 127).astype(np.uint8) * 255
+                    found_any = True
+            except Exception:
+                pass
+        if not found_any:
+            buttons = np.zeros((h, w), dtype=np.uint8)
 
         if not found_any:
             corner = self._fit_product_corner_radius(
@@ -1115,12 +1595,19 @@ class Compositor:
             self._product_body_corner = float(corner)
             return self._build_product_body_mask(raw, None, corner, quad), None
 
-        # Photo silhouette (straight mid-sides, real corners). Tips stay
-        # on a separate mask.
+        # Photo silhouette is body authority. Tips stay on a separate mask.
         straight = self._smooth_body_wall_from_raw(raw, quad, validated)
-        corner = self._fit_product_corner_radius(straight, quad)
+        corner = self._fit_product_corner_radius(
+            straight if np.count_nonzero(straight) >= 64 else raw, quad
+        )
         self._product_body_corner = float(corner)
         body = self._build_product_body_mask(raw, validated, corner, quad)
+        if np.count_nonzero(straight) >= 64:
+            tips = validated > 127
+            # Straight wall already keeps photo bezel + nick-shave. Tips may
+            # sit outside straight — keep them only on the tip mask, not body.
+            body = cv2.bitwise_and(body, straight)
+            body[tips] = 0
         dist_in = cv2.distanceTransform(
             (body > 127).astype(np.uint8), cv2.DIST_L2, 5
         )
@@ -1135,13 +1622,8 @@ class Compositor:
         ) > 0
         stem = orphan & near_tip & (dist_in <= 2.0)
         tips = (tips | stem) & (dist_in <= 2.5) & ~cam_bin
-        # Claim each tip's full photo protrusion component (same raw blob),
-        # so fragmented/short detections still wrap the real button height.
-        tips = self._claim_full_raw_button_protrusions(
-            tips, raw, body, cam_bin
-        )
-        # Silhouette nicks are location cues. Wrap the real device contour
-        # of each key — never the studio-white overflow that caused speckles.
+        # Keep each key on its photo device contour. Do not claim raw AA
+        # fringe — that rebuilt 1px studio nicks into fake side bumps.
         snapped = self._snap_button_mask_to_device_surface(
             tips.astype(np.uint8) * 255, body, phone_bgr, raw
         )
@@ -1149,14 +1631,327 @@ class Compositor:
             validated = snapped
         else:
             validated = tips.astype(np.uint8) * 255
-        plate = self._studio_plate_pixels(phone_bgr)
-        if plate.shape[:2] == body.shape[:2]:
-            before = int(np.count_nonzero(body))
-            stripped = body.copy()
-            stripped[plate] = 0
-            if int(np.count_nonzero(stripped)) >= int(round(before * 0.97)):
-                body = stripped
         return body, validated
+
+    @staticmethod
+    def _fill_bool_gaps(flags: np.ndarray, max_gap: int = 2) -> np.ndarray:
+        """Close 1–2 row holes inside a hit run (device-agnostic)."""
+        out = flags.astype(bool).copy()
+        h = int(out.shape[0])
+        gap = max(1, int(max_gap))
+        i = 0
+        while i < h:
+            if out[i]:
+                i += 1
+                continue
+            j = i
+            while j < h and not out[j]:
+                j += 1
+            if (
+                i > 0
+                and j < h
+                and out[i - 1]
+                and out[j]
+                and (j - i) <= gap
+            ):
+                out[i:j] = True
+            i = j
+        return out
+
+    def _photo_side_button_mask(
+        self,
+        raw_mask: np.ndarray,
+        phone_bgr: np.ndarray,
+        wall_l: float,
+        wall_r: float,
+        y_min: int,
+        y_max: int,
+    ) -> Optional[np.ndarray]:
+        """
+        Localized side-button pixels from the original phone photo.
+
+        Quiet bezel rows have a stable first-device column and outer-lip
+        luminance. Physical keys shift that outer contour and/or lip
+        brightness. Silhouette AA nicks that do not change the photo rail
+        are ignored — they are not buttons.
+        """
+        raw = (raw_mask > 127).astype(np.uint8)
+        h, w = raw.shape[:2]
+        if np.count_nonzero(raw) < 64:
+            return None
+        plate = self._studio_plate_pixels(phone_bgr)
+        if plate.shape[:2] != (h, w):
+            plate = (
+                cv2.resize(
+                    plate.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                > 0
+            )
+        gray = cv2.cvtColor(to_bgr(phone_bgr), cv2.COLOR_BGR2GRAY).astype(
+            np.float32
+        )
+        phone_h = max(float(y_max - y_min + 1), 1.0)
+        y_lo = y_min + int(round(phone_h * 0.14))
+        y_hi = y_max - int(round(phone_h * 0.12))
+        y_lo = int(np.clip(y_lo, 0, max(h - 1, 0)))
+        y_hi = int(np.clip(y_hi, y_lo, max(h - 1, 0)))
+        rail_w = max(3, int(round(min(h, w) * 0.018)))
+        min_span = max(6, int(round(phone_h * 0.012)))
+        max_span = max(min_span + 4, int(round(phone_h * 0.22)))
+        out = np.zeros((h, w), dtype=np.uint8)
+
+        for side in ("left", "right"):
+            wall = float(wall_l if side == "left" else wall_r)
+            if not np.isfinite(wall):
+                continue
+            first_x = np.full(h, np.nan, dtype=np.float32)
+            lip = np.full(h, np.nan, dtype=np.float32)
+            if side == "left":
+                x_hi_s = int(np.clip(np.ceil(wall) + rail_w + 6, 1, w))
+            else:
+                x_lo_s = int(np.clip(np.floor(wall) - rail_w - 6, 0, w - 1))
+            for y in range(y_lo, y_hi + 1):
+                # Photo silhouette is the outer authority — bright keys
+                # touching the studio card are not backdrop pixels.
+                if side == "left":
+                    xs = np.where(raw[y, :x_hi_s] > 0)[0]
+                    if xs.size == 0:
+                        continue
+                    x0 = int(xs.min())
+                else:
+                    xs = np.where(raw[y, x_lo_s:] > 0)[0]
+                    if xs.size == 0:
+                        continue
+                    x0 = int(xs.max() + x_lo_s)
+                first_x[y] = float(x0)
+                lip[y] = float(gray[y, x0])
+
+            valid = np.isfinite(first_x) & np.isfinite(lip)
+            if int(np.count_nonzero(valid[y_lo : y_hi + 1])) < 12:
+                continue
+            quiet_x = float(np.nanmedian(first_x[y_lo : y_hi + 1]))
+            quiet_lip = float(np.nanmedian(lip[y_lo : y_hi + 1]))
+            if not np.isfinite(quiet_x) or not np.isfinite(quiet_lip):
+                continue
+            lip_dev = np.abs(lip - quiet_lip)
+            lip_dev[~valid] = 0.0
+            band_dev = lip_dev[y_lo : y_hi + 1]
+            lip_thr = max(
+                12.0,
+                float(np.nanpercentile(band_dev, 72)) * 0.85,
+            )
+            hit = np.zeros(h, dtype=bool)
+            for y in range(y_lo, y_hi + 1):
+                if not valid[y]:
+                    continue
+                if side == "left":
+                    outward = quiet_x - float(first_x[y])
+                else:
+                    outward = float(first_x[y]) - quiet_x
+                ld = float(lip_dev[y])
+                # Real keys: outer contour moves and/or the lip tone changes.
+                # 1px silhouette AA with an unchanged photo lip is rejected.
+                if (
+                    (outward >= 0.55 and ld >= 6.0)
+                    or ld >= max(14.0, lip_thr)
+                ):
+                    hit[y] = True
+            hit = Compositor._fill_bool_gaps(hit, max_gap=2)
+            spans = Compositor._grow_side_button_spans(
+                hit, hit, y_lo, y_hi, min_span, max_span
+            )
+            for a, b in spans:
+                for y in range(a, b):
+                    if not valid[y]:
+                        continue
+                    if side == "left":
+                        outward = quiet_x - float(first_x[y])
+                    else:
+                        outward = float(first_x[y]) - quiet_x
+                    # Span grow merges nearby keys — paint only rows that
+                    # actually protrude, not the full vertical run.
+                    if (
+                        outward < 0.55
+                        and float(lip_dev[y]) < 6.0
+                    ):
+                        continue
+                    x_out = int(first_x[y])
+                    x_end = int(round(wall))
+                    if side == "left":
+                        if x_out >= x_end:
+                            if float(lip_dev[y]) < max(6.0, lip_thr * 0.5):
+                                continue
+                            x_lo = max(0, x_end - 2)
+                            x_hi = min(w, x_end + 1)
+                            bump = raw[y, x_lo:x_hi] > 0
+                            out[y, x_lo:x_hi] = np.where(
+                                bump, 255, out[y, x_lo:x_hi]
+                            )
+                            continue
+                        bump = raw[y, x_out:x_end] > 0
+                        out[y, x_out:x_end] = np.where(
+                            bump, 255, out[y, x_out:x_end]
+                        )
+                    else:
+                        if x_end >= x_out:
+                            if float(lip_dev[y]) < max(6.0, lip_thr * 0.5):
+                                continue
+                            x_lo = max(0, x_end - 1)
+                            x_hi = min(w, x_end + 2)
+                            bump = raw[y, x_lo:x_hi] > 0
+                            out[y, x_lo:x_hi] = np.where(
+                                bump, 255, out[y, x_lo:x_hi]
+                            )
+                            continue
+                        bump = raw[y, x_end + 1 : x_out + 1] > 0
+                        out[y, x_end + 1 : x_out + 1] = np.where(
+                            bump, 255, out[y, x_end + 1 : x_out + 1]
+                        )
+
+        if np.count_nonzero(out) < 8:
+            return None
+        return out
+
+    def _silhouette_side_button_mask(
+        self,
+        raw_mask: np.ndarray,
+        el: np.ndarray,
+        er: np.ndarray,
+        wall_l: float,
+        wall_r: float,
+        y_min: int,
+        y_max: int,
+        phone_h: float,
+    ) -> Optional[np.ndarray]:
+        """
+        Fallback when the photo lip is uniform: only true silhouette bumps.
+
+        Compares against the typical (median) outer edge, never an inward
+        percentile wall. 1px AA ticks around the median are not buttons.
+        """
+        raw = (raw_mask > 127).astype(np.uint8) * 255
+        h, w = raw.shape[:2]
+        y_lo = y_min + int(round(phone_h * 0.10))
+        y_hi = y_max - int(round(phone_h * 0.14))
+        y_lo = int(np.clip(y_lo, 0, max(h - 1, 0)))
+        y_hi = int(np.clip(y_hi, y_lo, max(h - 1, 0)))
+        min_span = max(6, int(round(phone_h * 0.012)))
+        max_span = max(min_span + 4, int(round(phone_h * 0.16)))
+        out = np.zeros((h, w), dtype=np.uint8)
+        found = False
+        for side in ("left", "right"):
+            edge = el if side == "left" else er
+            wall = float(wall_l if side == "left" else wall_r)
+            band = edge[y_lo : y_hi + 1]
+            valid = ~np.isnan(band)
+            if int(np.count_nonzero(valid)) < 12:
+                continue
+            quiet = float(np.nanmedian(band[valid]))
+            hit = np.zeros(h, dtype=bool)
+            for y in range(y_lo, y_hi + 1):
+                if not np.isfinite(edge[y]):
+                    continue
+                outward = (
+                    (quiet - float(edge[y]))
+                    if side == "left"
+                    else (float(edge[y]) - quiet)
+                )
+                # Need a real bump past the typical edge, not 1px AA.
+                if outward >= 1.05:
+                    hit[y] = True
+            hit = Compositor._fill_bool_gaps(hit, max_gap=2)
+            spans = Compositor._grow_side_button_spans(
+                hit, hit, y_lo, y_hi, min_span, max_span
+            )
+            for a, b in spans:
+                for y in range(a, b):
+                    if not np.isfinite(edge[y]):
+                        continue
+                    outward = (
+                        (quiet - float(edge[y]))
+                        if side == "left"
+                        else (float(edge[y]) - quiet)
+                    )
+                    if outward < 1.05:
+                        continue
+                    if side == "left":
+                        x_out = int(np.floor(float(edge[y])))
+                        x_in = int(np.ceil(quiet))
+                        if x_out >= x_in:
+                            continue
+                        xs = np.where(raw[y, x_out : x_in + 1] > 0)[0]
+                        if len(xs):
+                            out[y, x_out + xs] = 255
+                            found = True
+                    else:
+                        x_in = int(np.floor(quiet))
+                        x_out = int(np.ceil(float(edge[y])))
+                        if x_in >= x_out:
+                            continue
+                        xs = np.where(raw[y, x_in : x_out + 1] > 0)[0]
+                        if len(xs):
+                            out[y, x_in + xs] = 255
+                            found = True
+        return out if found else None
+
+    @staticmethod
+    def _grow_side_button_spans(
+        seed: np.ndarray,
+        past_wall: np.ndarray,
+        y_lo: int,
+        y_hi: int,
+        min_span: int,
+        max_span: int,
+    ) -> List[Tuple[int, int]]:
+        """
+        Expand prominence seeds along the wall-crossing so a tall rocker
+        stays one key instead of two end-caps.
+
+        Device-agnostic: no model heights. Spans longer than ``max_span``
+        (corner fringe / whole-side overflow) are dropped.
+        """
+        h = int(seed.shape[0])
+        y_lo_i = int(np.clip(y_lo, 0, max(h - 1, 0)))
+        y_hi_i = int(np.clip(y_hi, y_lo_i, max(h - 1, 0)))
+        seeds: List[Tuple[int, int]] = []
+        i = y_lo_i
+        while i <= y_hi_i:
+            if not seed[i]:
+                i += 1
+                continue
+            j = i
+            while j <= y_hi_i and seed[j]:
+                j += 1
+            if (j - i) >= int(min_span):
+                seeds.append((i, j))
+            i = j
+        spans: List[Tuple[int, int]] = []
+        for a, b in seeds:
+            lo = a
+            hi = b
+            while lo > y_lo_i and past_wall[lo - 1]:
+                lo -= 1
+            while hi <= y_hi_i and past_wall[hi]:
+                hi += 1
+            if int(min_span) <= (hi - lo) <= int(max_span):
+                spans.append((lo, hi))
+        if not spans:
+            return []
+        spans.sort()
+        merged: List[Tuple[int, int]] = [spans[0]]
+        for a, b in spans[1:]:
+            pa, pb = merged[-1]
+            if a <= pb + 1:
+                merged[-1] = (pa, max(pb, b))
+            else:
+                merged.append((a, b))
+        return [
+            (a, b)
+            for a, b in merged
+            if int(min_span) <= (b - a) <= int(max_span)
+        ]
 
     @staticmethod
     def _claim_full_raw_button_protrusions(
@@ -1191,12 +1986,14 @@ class Compositor:
             (tip_bool.astype(np.uint8) * 255), connectivity=8
         )
         out = tip_bool.copy()
-        max_w = max(4, int(round(min(h, w) * 0.035)))
-        max_h = max(8, int(round(h * 0.32)))
+        max_w = max(4, int(round(min(h, w) * 0.045)))
+        max_h = max(8, int(round(h * 0.18)))
         for ti in range(1, n_tip):
             tip_m = lab_tip == ti
             if not np.any(tip_m):
                 continue
+            tip_ys = np.where(tip_m)[0]
+            tip_h = int(tip_ys.max() - tip_ys.min() + 1)
             labs = np.unique(lab_raw[tip_m])
             labs = labs[labs > 0]
             for rl in labs:
@@ -1207,6 +2004,9 @@ class Compositor:
                     continue
                 # Prefer thin side keys (taller than wide).
                 if bw > 1 and bh < bw:
+                    continue
+                # Do not swallow a long wall fringe into one key.
+                if bh > max(int(round(tip_h * 1.35)), tip_h + 8):
                     continue
                 out[lab_raw == rl] = True
         return out
@@ -1221,10 +2021,11 @@ class Compositor:
         """
         Map each detected button onto real device pixels.
 
-        Silhouette nicks on the studio card mark WHERE a key sits; the wrap
-        mask is the outer device contour in that span (true dark protrusions
-        if present, otherwise the key's visible side-face). Studio-white
-        pixels are never wrapped. Body wall geometry is unchanged.
+        Wrap follows the photo contour of the key (outer device lip plus
+        the visible side-face up to the body wall). Studio-white pixels are
+        never added. A short inward band on the same rows covers the side
+        face the photo actually shows — scale is a fraction of the frame,
+        not a model size.
         """
         if tip_mask is None or np.count_nonzero(tip_mask) < 4:
             return np.zeros(body.shape[:2], dtype=np.uint8)
@@ -1240,16 +2041,18 @@ class Compositor:
                 > 127
             )
         body_b = body > 127
-        raw_b = body_b.copy()
-        if raw_mask is not None and np.count_nonzero(raw_mask) >= 64:
-            raw_u = raw_mask
-            if raw_u.shape[:2] != (h, w):
-                raw_u = cv2.resize(
-                    raw_mask.astype(np.uint8),
-                    (w, h),
-                    interpolation=cv2.INTER_NEAREST,
+        raw_b = None
+        if raw_mask is not None:
+            raw_b = raw_mask > 127
+            if raw_b.shape[:2] != (h, w):
+                raw_b = (
+                    cv2.resize(
+                        (raw_mask > 127).astype(np.uint8) * 255,
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    > 127
                 )
-            raw_b = raw_u > 127
         plate = self._studio_plate_pixels(phone_bgr)
         if plate.shape[:2] != (h, w):
             plate = (
@@ -1276,33 +2079,13 @@ class Compositor:
             left = (float(x0) + 0.5 * float(bw)) < mid_x
             y1 = min(h, y0 + bh)
             for y in range(y0, y1):
-                owned = device[y] & (raw_b[y] | body_b[y])
-                xs = np.where(owned)[0]
-                if len(xs) == 0:
-                    continue
-                bxs = np.where(body_b[y] & device[y])[0]
-                if left:
-                    x_out = int(xs.min())
-                    wall = int(bxs.min()) if len(bxs) else x_out
-                    if x_out < wall:
-                        out[y, x_out:wall] = 255
-                    x_hi = min(w, wall + 2)
-                    out[y, wall:x_hi] = np.where(
-                        device[y, wall:x_hi] & body_b[y, wall:x_hi],
-                        255,
-                        out[y, wall:x_hi],
-                    )
+                seed_row = labels[y] == lab
+                if raw_b is not None:
+                    keep = seed_row & raw_b[y]
                 else:
-                    x_out = int(xs.max())
-                    wall = int(bxs.max()) if len(bxs) else x_out
-                    if x_out > wall:
-                        out[y, wall + 1 : x_out + 1] = 255
-                    x_lo = max(0, wall - 1)
-                    out[y, x_lo : wall + 1] = np.where(
-                        device[y, x_lo : wall + 1] & body_b[y, x_lo : wall + 1],
-                        255,
-                        out[y, x_lo : wall + 1],
-                    )
+                    keep = seed_row & device[y] & ~plate[y]
+                if np.any(keep):
+                    out[y, keep] = 255
         if int(np.count_nonzero(out)) < 4:
             kept = (tips & device).astype(np.uint8) * 255
             return kept if int(np.count_nonzero(kept)) >= 4 else out
@@ -1388,22 +2171,124 @@ class Compositor:
             if plate.shape[:2] == tips.shape[:2]:
                 body[tips & plate] = 0
 
-        # Drop silhouette pixels that sit on pure studio plate (bottom drip /
-        # left speckles). Keeps 1px near real device content so corner AA of
-        # the true phone rim is unchanged.
+        # Drop silhouette pixels that sit on the studio card (AABB wedges /
+        # bottom drip). Interior device pixels stay — including silver phones.
         body = self._strip_studio_overflow_mask(body, to_bgr(self.phone_image))
+        body = self._snap_wrap_mask_to_photo_rim(body, to_bgr(self.phone_image))
+        device = CoverSurfaceEngine._device_pixels_from_photo(
+            to_bgr(self.phone_image), rim_edges=False
+        )
+        if device.shape[:2] == body.shape[:2]:
+            clipped = cv2.bitwise_and(body, device)
+            if np.count_nonzero(clipped) >= 64:
+                body = clipped
 
-        # Relief shading only — body silhouette excludes button protrusions.
+        # Final authority: photo silhouette is the wrap body (tips excluded).
+        # Inward wall / device clips must not leave a silver/white rim gap.
+        body = self._clip_body_to_photo_silhouette(body, to_bgr(self.phone_image))
+        sil = CoverSurfaceEngine.detect_phone_wrap_silhouette(
+            to_bgr(self.phone_image), cover_quad=None
+        )
+        if sil is not None and np.count_nonzero(sil) >= 64:
+            if sil.shape[:2] != body.shape[:2]:
+                sil = cv2.resize(
+                    sil, (body.shape[1], body.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            tips = np.zeros(body.shape[:2], dtype=bool)
+            if self._side_button_validated_mask is not None:
+                tm = self._side_button_validated_mask
+                if tm.shape[:2] != body.shape[:2]:
+                    tm = cv2.resize(
+                        tm, (body.shape[1], body.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                tips = tm > 127
+            # Silhouette minus tip protrusions = printable body authority.
+            # Only exclude tips that sit outside the eroded sil core — never
+            # carve the left/right wall face (that left a white under-wrap strip).
+            tip_out = tips
+            if np.any(tips):
+                core = cv2.erode(
+                    (sil > 127).astype(np.uint8) * 255,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                    iterations=1,
+                )
+                tip_out = tips & (core == 0)
+            body = ((sil > 127) & ~tip_out).astype(np.uint8) * 255
+            # Silhouette detectors include a 1–2px AA/studio halo. Physical
+            # phone pixels are the printable surface — never the card.
+            # rim_edges=False: Canny AA on the studio must not become wrap.
+            device = CoverSurfaceEngine._device_pixels_from_photo(
+                to_bgr(self.phone_image), rim_edges=False
+            )
+            if device.shape[:2] == body.shape[:2]:
+                clipped = cv2.bitwise_and(body, device)
+                if np.count_nonzero(clipped) >= 64:
+                    body = clipped
+            body = self._snap_wrap_mask_to_photo_rim(
+                body, to_bgr(self.phone_image)
+            )
+            if np.count_nonzero(body) < 64:
+                body = self._clip_body_to_photo_silhouette(
+                    body, to_bgr(self.phone_image)
+                )
+
+        # GrabCut/silhouette often bites a pac-man from the camera cluster to
+        # the top edge. Restore the cover FACE after silhouette authority.
+        # Do NOT carve cutouts out of the body — holes are punched later in
+        # `_composite` so nearby phone-body pixels stay wrapped.
+        body = self._fill_camera_face_bites(
+            body, self.exclusion_mask, to_bgr(self.phone_image)
+        )
+        # Seal row gaps so the left/top rim around the island is solid body.
+        # Clip with device pixels — NOT the bitten GrabCut sil (that would
+        # delete the pixels we just restored).
+        sealed = self._seal_body_row_spans(body)
+        if np.count_nonzero(sealed) >= 64:
+            body = sealed
+        device_fill = CoverSurfaceEngine._device_pixels_from_photo(
+            to_bgr(self.phone_image), rim_edges=False
+        )
+        if device_fill.shape[:2] == body.shape[:2]:
+            clipped = cv2.bitwise_and(body, device_fill)
+            if np.count_nonzero(clipped) >= 64:
+                body = clipped
+        # Re-assert deep silhouette interior (incl. top-left face beside the
+        # camera). Outer AA may be device-clipped, but true body pixels must
+        # remain in the wrap mask — cutouts subtract later, not here.
+        if sil is not None and np.count_nonzero(sil) >= 64:
+            sil_u8 = sil
+            if sil_u8.shape[:2] != body.shape[:2]:
+                sil_u8 = cv2.resize(
+                    sil_u8, (body.shape[1], body.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            sil_bin = (sil_u8 > 127).astype(np.uint8)
+            dist_sil = cv2.distanceTransform(sil_bin, cv2.DIST_L2, 5)
+            deep = (dist_sil >= 1.5) & (sil_bin > 0)
+            if tip_out is not None and tip_out.shape[:2] == deep.shape[:2]:
+                deep = deep & ~tip_out
+            body = np.where(deep, 255, body).astype(np.uint8)
+        # Do not re-clip with a strict device mask here — that carved white
+        # under-wrap gaps along the left/bottom chrome. Silhouette + tip
+        # split above is the printable authority; studio purge is finalize.
+
         wrap_pm, relief = self._volume_button_wrap_assets(body)
         if np.count_nonzero(wrap_pm) >= 64:
             body = wrap_pm
 
+        # Buttons stay on `_side_button_validated_mask` only. Never OR
+        # synthetic capsules into the body wrap (that painted fake nubs).
+
         # Topology quad from the photo body (ROI scale only — not the silhouette).
-        quad = AdaptiveMeshBuilder._stable_quad_from_mask(body)
+        # Tight AABB ignores thin studio spikes so UV aspect matches the phone,
+        # not an oversized selection rectangle.
+        quad = AdaptiveMeshBuilder._tight_aabb_quad_from_mask(body)
+        if quad is None:
+            quad = AdaptiveMeshBuilder._stable_quad_from_mask(body)
         if quad is None:
             quad = AdaptiveMeshBuilder._aabb_quad_from_mask(body)
-        if quad is None:
-            quad = AdaptiveMeshBuilder._tight_aabb_quad_from_mask(body)
         if quad is None:
             return self._phone_wrap_mesh, self._phone_wrap_mask
 
@@ -1413,9 +2298,9 @@ class Compositor:
             cal_c, _ = AdaptiveMeshBuilder.calibrate_corner_radii_from_silhouette(
                 body, quad, corner, (corner, corner, corner, corner)
             )
-            corner = float(np.clip(0.55 * corner + 0.45 * float(cal_c), 6.0, 18.0))
+            corner = float(np.clip(0.55 * corner + 0.45 * float(cal_c), 4.0, 22.0))
         except Exception:
-            corner = float(np.clip(corner, 6.0, 18.0))
+            corner = float(np.clip(corner, 4.0, 22.0))
         radii = (corner, corner, corner, corner)
         self.corner_radius_estimate = corner
 
@@ -1454,7 +2339,7 @@ class Compositor:
         AdaptiveMeshBuilder._straighten_sides(wrap, passes=1)
         AdaptiveMeshBuilder._reinterpolate_interior(wrap)
 
-        wrap_pm = body
+        wrap_pm = body.copy()
         self._phone_wrap_mesh = wrap
         self._phone_wrap_mask = wrap_pm.copy()
         self._phone_wrap_image_id = img_id
@@ -1465,7 +2350,6 @@ class Compositor:
         self.corner_radii = CornerRadii.uniform(corner)
         self.corner_radius_estimate = corner
         self.settings["corner_radius"] = corner
-        self._debug_export_geometry_masks()
         # Edit cage tracks wrap mesh; silhouette mask remains photo truth.
         if force and wrap is not None and not self.from_template:
             self.control_mesh = wrap.copy()
@@ -1699,7 +2583,7 @@ class Compositor:
             comp = labels == label
             bw_c = int(stats[label, cv2.CC_STAT_WIDTH])
             bh_c = int(stats[label, cv2.CC_STAT_HEIGHT])
-            if bw_c > phone_w * 0.10 or bh_c > phone_h * 0.22:
+            if bw_c > phone_w * 0.12 or bh_c > phone_h * 0.38:
                 continue
             bezel_frac = float(np.count_nonzero(comp & (bezel > 127))) / float(
                 area
@@ -1715,13 +2599,13 @@ class Compositor:
             out[comp] = 255
         return out
 
-    def _debug_log_side_button_mask(
+    def _log_side_button_mask(
         self,
         mask: np.ndarray,
         *,
         space: str = "native",
     ) -> None:
-        """Temporary debug: log stats and write red overlay on the phone photo."""
+        """Log validated side-button mask stats (no debug file output)."""
         if mask is None or np.count_nonzero(mask) < 4:
             logger.info("side_button [%s]: no validated mask", space)
             return
@@ -1746,92 +2630,6 @@ class Compositor:
             num - 1,
             boxes,
         )
-        if self.phone_image is None:
-            return
-        try:
-            from pathlib import Path
-
-            vis = to_bgr(self.phone_image).copy()
-            sel = mask > 127
-            if sel.shape[:2] != vis.shape[:2]:
-                sel_u8 = (mask > 127).astype(np.uint8) * 255
-                sel_u8 = cv2.resize(
-                    sel_u8,
-                    (vis.shape[1], vis.shape[0]),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                sel = sel_u8 > 127
-            vis[sel] = (
-                vis[sel].astype(np.float32) * 0.35
-                + np.array([0.0, 0.0, 255.0], dtype=np.float32) * 0.65
-            ).astype(np.uint8)
-            out_path = Path("data/debug/side_button_mask.png")
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out_path), vis)
-            logger.info("side_button debug overlay -> %s", out_path.resolve())
-        except Exception as exc:
-            logger.debug("side_button debug overlay failed: %s", exc)
-
-    def _debug_export_geometry_masks(self) -> None:
-        """Write GREEN=body, RED=buttons, BLUE=camera debug overlay."""
-        if self.phone_image is None:
-            return
-        try:
-            from pathlib import Path
-
-            phone_bgr = to_bgr(self.phone_image)
-            h, w = phone_bgr.shape[:2]
-            vis = phone_bgr.copy()
-            body = self._phone_wrap_mask
-            btn = self._side_button_validated_mask
-            excl = self.exclusion_mask
-            cam = (
-                self._camera_block_mask((h, w), excl)
-                if excl is not None and np.count_nonzero(excl) >= 16
-                else None
-            )
-            if body is not None:
-                bm = body > 127
-                if bm.shape[:2] != (h, w):
-                    bm_u8 = cv2.resize(
-                        (body > 127).astype(np.uint8) * 255,
-                        (w, h),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    bm = bm_u8 > 127
-                vis[bm] = (
-                    vis[bm].astype(np.float32) * 0.72
-                    + np.array([0.0, 255.0, 0.0], dtype=np.float32) * 0.28
-                ).astype(np.uint8)
-                ctrs, _ = cv2.findContours(
-                    bm.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-                )
-                cv2.drawContours(vis, ctrs, -1, (0, 255, 0), 1)
-            if btn is not None and np.count_nonzero(btn) >= 4:
-                bm = btn > 127
-                if bm.shape[:2] != (h, w):
-                    bm_u8 = cv2.resize(
-                        (btn > 127).astype(np.uint8) * 255,
-                        (w, h),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    bm = bm_u8 > 127
-                vis[bm] = (
-                    vis[bm].astype(np.float32) * 0.30
-                    + np.array([0.0, 0.0, 255.0], dtype=np.float32) * 0.70
-                ).astype(np.uint8)
-            if cam is not None and np.count_nonzero(cam) >= 4:
-                cm = cam > 127
-                vis[cm] = (
-                    vis[cm].astype(np.float32) * 0.35
-                    + np.array([255.0, 0.0, 0.0], dtype=np.float32) * 0.65
-                ).astype(np.uint8)
-            out_path = Path("data/debug/geometry_debug_overlay.png")
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(out_path), vis)
-            logger.info("geometry debug overlay -> %s", out_path.resolve())
-        except Exception as exc:
-            logger.debug("geometry debug overlay failed: %s", exc)
 
     def _detect_side_buttons_from_wrap_protrusion(
         self,
@@ -1990,13 +2788,13 @@ class Compositor:
         """
         Validated side-button pixels at phone-native resolution.
 
-        Buttons are localized masks split from the raw photo silhouette; the
-        main ``_phone_wrap_mask`` is the smooth body only.
+        Photo-split masks from `_derive_clean_body_and_button_masks` are the
+        source of truth. Silhouette halo/protrusion OR was re-adding 1px AA
+        nicks as fake keys.
         """
         if self.phone_image is None:
             return None
         from .mesh import AdaptiveMeshBuilder
-        from .region_detector import HardwareRegionDetector
 
         phone = to_bgr(self.phone_image)
         h, w = phone.shape[:2]
@@ -2015,8 +2813,25 @@ class Compositor:
             (h, w), excl, pm
         ) > 127
 
+        raw_pm = self._phone_wrap_raw_mask
+        if raw_pm is not None and raw_pm.shape[:2] != (h, w):
+            raw_pm = cv2.resize(raw_pm, (w, h), interpolation=cv2.INTER_NEAREST)
+            raw_pm = (raw_pm > 127).astype(np.uint8) * 255
+        if raw_pm is not None and np.count_nonzero(raw_pm) >= 64:
+            _, split = self._derive_clean_body_and_button_masks(
+                raw_pm, phone, exclusion_mask=excl
+            )
+            if split is not None and np.count_nonzero(split) >= 4:
+                split = cv2.bitwise_and(
+                    split,
+                    cv2.bitwise_not(cam_bin.astype(np.uint8) * 255),
+                )
+                if np.count_nonzero(split) >= 4:
+                    self._side_button_validated_mask = split.copy()
+                    self._log_side_button_mask(split, space="native")
+                    return split
+
         cached = self._side_button_validated_mask
-        candidates = np.zeros((h, w), dtype=np.uint8)
         if cached is not None and np.count_nonzero(cached) >= 4:
             if cached.shape[:2] != (h, w):
                 cached = cv2.resize(
@@ -2027,47 +2842,15 @@ class Compositor:
                 cached, cv2.bitwise_not(cam_bin.astype(np.uint8) * 255)
             )
             if np.count_nonzero(cached) >= 4:
-                candidates = cv2.max(candidates, cached)
+                self._side_button_validated_mask = cached.copy()
+                self._log_side_button_mask(cached, space="native")
+                return cached
 
-        raw_pm = self._phone_wrap_raw_mask
-        if raw_pm is not None and raw_pm.shape[:2] != (h, w):
-            raw_pm = cv2.resize(raw_pm, (w, h), interpolation=cv2.INTER_NEAREST)
-            raw_pm = (raw_pm > 127).astype(np.uint8) * 255
-
-        protr = self._detect_side_buttons_from_wrap_protrusion(
-            pm, quad, phone, cam_bin, raw_mask=raw_pm
+        self._side_button_validated_mask = None
+        self._log_side_button_mask(
+            np.zeros((h, w), dtype=np.uint8), space="native(empty)"
         )
-        if protr is not None and np.count_nonzero(protr) >= 12:
-            candidates = cv2.max(candidates, protr)
-        tips = self._restore_photo_side_button_tips(pm)
-        if tips is not None and np.count_nonzero(tips) >= 8:
-            candidates = cv2.max(candidates, tips)
-        # Legacy silhouette seeds draw rounded rects — skip; protrusion is exact.
-        if np.count_nonzero(candidates) < 12:
-            raw = HardwareRegionDetector.detect_verified_side_hardware(
-                phone, quad, phone_mask=pm
-            )
-            if raw is not None and np.count_nonzero(raw) >= 8:
-                candidates = cv2.max(
-                    candidates, (raw > 127).astype(np.uint8) * 255
-                )
-
-        validated = self._validate_side_button_mask(
-            candidates, pm, quad, cam_bin
-        )
-        validated = cv2.bitwise_and(
-            validated, cv2.bitwise_not(cam_bin.astype(np.uint8) * 255)
-        )
-        limited = self._limit_side_button_blobs(validated, quad, max_per_side=3)
-        if limited is not None and np.count_nonzero(limited) >= 4:
-            validated = limited
-        if np.count_nonzero(validated) < 4:
-            self._side_button_validated_mask = None
-            self._debug_log_side_button_mask(validated, space="native(empty)")
-            return None
-        self._side_button_validated_mask = validated.copy()
-        self._debug_log_side_button_mask(validated, space="native")
-        return validated
+        return None
 
     def _build_side_button_wrap_coverage(
         self,
@@ -2112,7 +2895,7 @@ class Compositor:
         if np.count_nonzero(btn) < 4:
             return None
 
-        # Exact validated tips + 1px float AA (same composite space as body).
+        # Exact validated tips + float AA (same composite space as body).
         cov = np.zeros((ph, pw), dtype=np.float32)
         num, labels, stats, _ = cv2.connectedComponentsWithStats(
             btn, connectivity=8
@@ -2164,7 +2947,7 @@ class Compositor:
             self._side_button_validated_mask = (btn > 127).astype(np.uint8) * 255
             cov = np.where(btn > 127, cov, 0.0)
         cov = np.clip(cov, 0.0, 1.0)
-        self._debug_log_side_button_mask(
+        self._log_side_button_mask(
             self._side_button_validated_mask,
             space="validated",
         )
@@ -2216,19 +2999,6 @@ class Compositor:
             )
         if not np.any(valid):
             return design, mask, alpha
-        # Reserve only true outward protrusions (outside the body wall).
-        # Side-face overlap keeps the body wrap so keys cannot flash the
-        # original bezel if the isolated layer misses a pixel.
-        body_on = np.zeros(valid.shape, dtype=bool)
-        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
-            pm = phone_mask
-            if pm.shape[:2] != (h, w):
-                pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
-            body_on = pm > 127
-        protr = valid & ~body_on
-        if np.any(protr):
-            alpha = np.where(protr, 0.0, alpha)
-            mask = np.where(protr, 0.0, mask)
         return design, mask, alpha
 
     def _limit_side_button_blobs(
@@ -2247,6 +3017,8 @@ class Compositor:
         mid_x = 0.5 * (
             float(corners[:, 0].min()) + float(corners[:, 0].max())
         )
+        y_min = float(corners[:, 1].min())
+        phone_h = max(float(corners[:, 1].max()) - y_min, 1.0)
         out = np.zeros((h, w), dtype=np.uint8)
         for side in ("left", "right"):
             band = np.zeros((h, w), dtype=np.uint8)
@@ -2258,17 +3030,34 @@ class Compositor:
                 band, connectivity=8
             )
             scored: List[Tuple[float, int]] = []
+            heights: List[int] = []
+            meta: List[Tuple[int, int, float]] = []
             for label in range(1, num):
                 area = int(stats[label, cv2.CC_STAT_AREA])
                 if area < 4:
                     continue
                 bh = int(stats[label, cv2.CC_STAT_HEIGHT])
                 bw = int(stats[label, cv2.CC_STAT_WIDTH])
-                # Prefer taller thin bezel strips over wide corner noise.
-                score = float(bh) * 3.0 + float(area) - 0.75 * float(bw)
+                y0 = int(stats[label, cv2.CC_STAT_TOP])
+                rel = (float(y0) + 0.5 * float(bh) - y_min) / phone_h
+                # Corner AA ticks and 1–2px studio nicks are not keys.
+                if bw <= 2 and bh < max(24, int(round(phone_h * 0.045))):
+                    continue
+                if rel < 0.10 or rel > 0.86:
+                    continue
+                heights.append(bh)
+                meta.append((label, bh, rel))
+                score = float(bh) * 1.15 + float(area) - 0.75 * float(bw)
                 if bh < 3:
                     score *= 0.35
                 scored.append((score, label))
+            skip = set()
+            if len(heights) >= 2:
+                med_h = float(sorted(heights)[len(heights) // 2])
+                for label, bh, rel in meta:
+                    if bh > max(med_h * 1.85, phone_h * 0.18) and rel < 0.42:
+                        skip.add(label)
+            scored = [(s, lab) for s, lab in scored if lab not in skip]
             scored.sort(reverse=True)
             for _, label in scored[: max(1, int(max_per_side))]:
                 out[labels == label] = 255
@@ -2662,6 +3451,19 @@ class Compositor:
             return None
         return out
 
+    def _side_button_silhouette_pills(
+        self,
+        body: np.ndarray,
+        btn_pm: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Retired: synthetic capsules must never be added to the wrap silhouette.
+
+        Real button geometry comes from the photo mask only.
+        """
+        h, w = body.shape[:2]
+        return np.zeros((h, w), dtype=np.uint8)
+
     @staticmethod
     def _paint_outward_button_bumps(
         body: np.ndarray,
@@ -2670,85 +3472,9 @@ class Compositor:
         *,
         depth_px: float,
     ) -> np.ndarray:
-        """Paint stadium bumps that stick out past the body edge at each button."""
-        from .region_detector import HardwareRegionDetector
-
-        out = np.zeros_like(body)
-        h, w = body.shape[:2]
-        corners = order_points(np.asarray(quad, dtype=np.float32))
-        centroid = corners.mean(axis=0)
-        binary = (buttons > 127).astype(np.uint8) * 255
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(
-            binary, connectivity=8
-        )
-        for label in range(1, num):
-            ys, xs = np.where(labels == label)
-            if len(xs) < 8:
-                continue
-            cx = float(xs.mean())
-            cy = float(ys.mean())
-            y1 = int(max(0, ys.min() - 2))
-            y2 = int(min(h - 1, ys.max() + 2))
-            # Side: closer vertical edge.
-            left_dist = abs(cx - float(corners[:, 0].min()))
-            right_dist = abs(float(corners[:, 0].max()) - cx)
-            side = "left" if left_dist <= right_dist else "right"
-            if side == "left":
-                a, b = corners[0], corners[3]
-            else:
-                a, b = corners[1], corners[2]
-            edge = b - a
-            length = float(np.linalg.norm(edge))
-            if length < 20:
-                continue
-            tangent = edge / length
-            normal = np.array([-tangent[1], tangent[0]], dtype=np.float32)
-            mid = (a + b) * 0.5
-            if float(np.dot(normal, mid - centroid)) < 0:
-                normal = -normal
-            # Body edge x at this band.
-            edge_xs = []
-            for y in range(y1, y2 + 1):
-                row = body[y] > 127
-                if not row.any():
-                    continue
-                edge_xs.append(
-                    int(np.where(row)[0].min())
-                    if side == "left"
-                    else int(np.where(row)[0].max())
-                )
-            if not edge_xs:
-                continue
-            edge_x = float(np.median(edge_xs))
-            # Match blob height tightly — no tall pillow inflation.
-            half_h = max(3.5, 0.5 * float(ys.max() - ys.min() + 1) * 1.02)
-            # Thin tip: mostly outward hairline, little inward face pad.
-            inward = depth_px * 0.45
-            outward = depth_px * 0.90
-            if side == "left":
-                x1 = edge_x - outward
-                x2 = edge_x + inward
-            else:
-                x1 = edge_x - inward
-                x2 = edge_x + outward
-            yi1 = float(cy - half_h)
-            yi2 = float(cy + half_h)
-            short = min(x2 - x1, yi2 - yi1)
-            # Soft capsule ends — still thin overall.
-            corner = float(np.clip(short * 0.45, 1.5, max(2.0, short * 0.48)))
-            HardwareRegionDetector._rounded_rectangle(
-                out,
-                int(np.clip(round(x1), 0, w - 1)),
-                int(np.clip(round(yi1), 0, h - 1)),
-                int(np.clip(round(x2), 0, w - 1)),
-                int(np.clip(round(yi2), 0, h - 1)),
-                max(1, int(round(corner))),
-            )
-        # Soften painted tips so wrap AA follows capsules, not pixel boxes.
-        if np.count_nonzero(out) > 0:
-            out = cv2.GaussianBlur(out, (0, 0), sigmaX=0.9)
-            out = (out > 80).astype(np.uint8) * 255
-        return out
+        """Retired: never paint stadium bumps onto the wrap silhouette."""
+        del buttons, quad, depth_px
+        return np.zeros_like(body)
 
     def _sync_printable_from_phone_wrap(self) -> None:
         """Printable face = detected phone rim (not the editable cage size)."""
@@ -2951,15 +3677,26 @@ class Compositor:
                 corner_frac=corner_frac,
             )
         else:
-            # Manual drag — provisional specs, paint from live verts + tags.
+            # Manual drag — paint the live verts + editor tag. Do not pass
+            # the photo: extract_photo_silhouette overwrites the bump the
+            # user just placed (white islands snap to a smaller contour and
+            # wrap bleeds onto the camera plate).
             specs = build_cutout_specs(
                 contours,
                 cover_quad,
                 width,
                 height,
+                phone_gray=None,
                 authoritative=False,
                 shape_tags=effective_tags,
                 corner_frac=corner_frac,
+            )
+
+        # Collapse mis-classified camera disks into one module-shaped hole.
+        # Preserves explicit user shape tags (circle / pill / custom path…).
+        if specs:
+            specs = self._sanitize_camera_cutout_specs(
+                specs, width, height, corner_frac=corner_frac
             )
 
         if specs:
@@ -3005,21 +3742,8 @@ class Compositor:
             )
             return
 
-        # Soften the AA fringe only. Never binary-dilate hard cores — that
-        # turns SDF circles/stadiums into stair-stepped octagons (flash/camera).
-        if np.count_nonzero(mask):
-            soft = max(3, int(round(min(height, width) * 0.0012)) | 1)
-            blurred = cv2.GaussianBlur(mask.astype(np.float32), (soft, soft), 0)
-            mask_f = np.maximum(mask.astype(np.float32), blurred)
-            # Distance-soft expand (~1.2px) keeps curves round while clearing
-            # bezel ridges — unlike MORPH_ELLIPSE dilate which facets arcs.
-            core = (mask_f >= 232).astype(np.uint8)
-            if np.count_nonzero(core):
-                dist = cv2.distanceTransform(1 - core, cv2.DIST_L2, 5)
-                grow = np.clip(1.0 - dist / 1.35, 0.0, 1.0) * 255.0
-                mask_f = np.maximum(mask_f, grow)
-            mask = np.clip(mask_f, 0.0, 255.0).astype(np.uint8)
-
+        # Soften the AA fringe only. Never binary-dilate or distance-grow —
+        # that turns SDF circles/stadiums into stair-stepped / oversized holes.
         self.exclusion_mask = mask
         self.hardware_contours = cleaned
         # Live cutout edits: punch holes into the existing solid gate — do not
@@ -3774,10 +4498,15 @@ class Compositor:
                 continue
             if cy > upper_limit or id(contour) not in cam_ids:
                 continue
-            if max(bw, bh) >= 36.0:
-                tags[i] = "rounded_rect"
-            elif (tags[i] or "").lower() in ("", "circle"):
-                tags[i] = self._infer_heal_shape_tag(pts)
+            locked = (tags[i] or "").lower().strip()
+            if locked in (
+                "rectangle", "rounded_rect", "capsule", "pill_v", "pill_h",
+                "circle", "square", "rounded_square",
+            ):
+                continue
+            # Auto islands stay contour-true. Forcing rounded_rect painted a
+            # straight-edged AABB hole with a silver gap around the module.
+            tags[i] = ""
         self.cutout_shape_tags = tags
 
     def _infer_heal_shape_tag(self, contour: np.ndarray) -> str:
@@ -3794,9 +4523,9 @@ class Compositor:
             return "rounded_rect"
         if aspect < 1.25 and max(bw, bh) < 28.0:
             return "circle"
-        if aspect >= 1.85:
+        if aspect >= 1.45:
             return "capsule"
-        return "rectangle"
+        return "rounded_rect"
 
     def _retain_plausible_cutouts(self) -> None:
         """
@@ -3830,7 +4559,8 @@ class Compositor:
             tag = tags_in[idx] if idx < len(tags_in) else ""
             if id(contour) in cam_ids:
                 kept.append(pts)
-                tags_out.append(tag or self._infer_heal_shape_tag(pts))
+                # Keep auto cameras contour-true; do not invent a rectangle tag.
+                tags_out.append(tag or "")
                 continue
             cx = float(pts[:, 0].mean())
             cy = float(pts[:, 1].mean())
@@ -3966,6 +4696,315 @@ class Compositor:
             persist=False,
             refit_design=False,
         )
+
+    def _sanitize_camera_cutout_specs(
+        self,
+        specs: List,
+        width: int,
+        height: int,
+        *,
+        corner_frac: float = 0.16,
+    ) -> List:
+        """
+        Keep user-locked cutout shapes; demote spurious camera circles.
+
+        Empty-tag camera disks (min-enclosing circle of a module AABB) used to
+        paint a giant circular hole over the island and bald the wrap. Collapse
+        those into one rounded-rect matching the photo module / union AABB.
+        Explicit shape tags (circle, pill, squircle, …) are never rewritten.
+        """
+        from .device_template import CutoutSpec
+
+        if not specs:
+            return specs
+        short_img = float(min(width, height))
+        locked_tags = {
+            "circle",
+            "rectangle",
+            "rounded_rect",
+            "rounded_square",
+            "square",
+            "pill_h",
+            "pill_v",
+            "capsule",
+            "button",
+            "oval",
+            "ellipse",
+            "squircle",
+            "superellipse",
+            "polygon",
+            "triangle",
+            "custom_path",
+            "free",
+            "diamond",
+        }
+        keep: List = []
+        bad_cams: List = []
+        for spec in specs:
+            tag = str(getattr(spec, "shape_tag", "") or "").lower().strip()
+            kind = str(getattr(spec, "kind", "") or "")
+            geom = str(getattr(spec, "geom", "") or "")
+            if tag in locked_tags or bool(tag):
+                # Any explicit user tool tag is final — never rewrite.
+                keep.append(spec)
+                continue
+            if kind == "flash" and geom == "circle":
+                params = list(getattr(spec, "params", []) or [])
+                r = float(params[2]) if len(params) >= 3 else 0.0
+                cx = float(params[0]) if len(params) >= 1 else 0.0
+                cy = float(params[1]) if len(params) >= 2 else 1e9
+                # Keep only compact top-of-phone flash disks. Oversized /
+                # rim-touching disks punched the top-left body beside the
+                # camera island (looked like a bald L around the module).
+                if not (0.5 < r <= short_img * 0.045 and cy <= height * 0.22):
+                    continue
+                pm = getattr(self.cover_engine, "last_phone_mask", None)
+                if pm is None:
+                    pm = self._phone_wrap_mask
+                if pm is not None and np.count_nonzero(pm) >= 64:
+                    pm_u8 = pm
+                    if pm_u8.shape[:2] != (int(height), int(width)):
+                        pm_u8 = cv2.resize(
+                            pm_u8, (int(width), int(height)),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    ys_pm, xs_pm = np.where(pm_u8 > 127)
+                    if xs_pm.size >= 16:
+                        inset = float(max(3.0, 0.012 * short_img))
+                        if (
+                            (cx - r) < float(xs_pm.min()) + inset
+                            or (cy - r) < float(ys_pm.min()) + inset
+                        ):
+                            continue
+                keep.append(spec)
+                continue
+            if kind in ("camera", "other") and geom == "circle":
+                bad_cams.append(spec)
+                continue
+            if (
+                kind in ("camera", "other")
+                and geom in ("rounded_rect", "rectangle", "square")
+                and not tag
+            ):
+                params = list(getattr(spec, "params", []) or [])
+                if len(params) >= 4:
+                    bw = abs(float(params[2]) - float(params[0]))
+                    bh = abs(float(params[3]) - float(params[1]))
+                    if max(bw, bh) > short_img * 0.34:
+                        bad_cams.append(spec)
+                        continue
+            keep.append(spec)
+
+        if not bad_cams:
+            return keep
+
+        # Rebuild ONE module hole from top-left lens/flash disks when possible.
+        # Never trust union-AABB of the giant mis-classified circles (that ate
+        # the whole top of the phone), and don't use a failed mid-body module
+        # detect as the cutout.
+        lens_boxes: List[Tuple[float, float, float, float]] = []
+        for spec in list(keep) + list(bad_cams):
+            geom = str(getattr(spec, "geom", "") or "")
+            params = list(getattr(spec, "params", []) or [])
+            if geom == "circle" and len(params) >= 3:
+                cx, cy, r = float(params[0]), float(params[1]), float(params[2])
+                if r <= short_img * 0.08 and cy <= height * 0.28 and cx <= width * 0.55:
+                    lens_boxes.append((cx - r, cy - r, cx + r, cy + r))
+            elif geom in ("rounded_rect", "rectangle") and len(params) >= 4:
+                x1, y1, x2, y2 = [float(params[i]) for i in range(4)]
+                bw, bh = x2 - x1, y2 - y1
+                if (
+                    max(bw, bh) <= short_img * 0.28
+                    and y1 <= height * 0.28
+                    and x1 <= width * 0.55
+                ):
+                    lens_boxes.append((x1, y1, x2, y2))
+
+        if lens_boxes:
+            # Keep only the top-left cluster (drop mid-body false flashes).
+            lens_boxes.sort(key=lambda b: (b[1], b[0]))
+            seed = lens_boxes[0]
+            cy0 = 0.5 * (seed[1] + seed[3])
+            cx0 = 0.5 * (seed[0] + seed[2])
+            clustered = []
+            for b in lens_boxes:
+                cy = 0.5 * (b[1] + b[3])
+                cx = 0.5 * (b[0] + b[2])
+                if (
+                    abs(cy - cy0) <= short_img * 0.16
+                    and abs(cx - cx0) <= short_img * 0.20
+                ):
+                    clustered.append(b)
+            lens_boxes = clustered or [seed]
+            x1 = min(b[0] for b in lens_boxes)
+            y1 = min(b[1] for b in lens_boxes)
+            x2 = max(b[2] for b in lens_boxes)
+            y2 = max(b[3] for b in lens_boxes)
+            # Prefer the photo module island when available — padded flash
+            # AABBs used to expand into the top-left phone rim and bald it.
+            module = self._find_camera_module_quad()
+            if module is not None:
+                pts = np.asarray(module, dtype=np.float32).reshape(-1, 2)
+                mx1 = float(pts[:, 0].min())
+                my1 = float(pts[:, 1].min())
+                mx2 = float(pts[:, 0].max())
+                my2 = float(pts[:, 1].max())
+                if my1 <= height * 0.40 and (mx2 - mx1) <= short_img * 0.42:
+                    x1, y1, x2, y2 = mx1, my1, mx2, my2
+            else:
+                # Tight AA pad only — never invent a top/left margin wipe.
+                pad = float(max(2.0, min(6.0, 0.012 * short_img)))
+                x1 = max(0.0, x1 - pad)
+                y1 = max(0.0, y1 - pad)
+                x2 = min(float(width - 1), x2 + pad)
+                y2 = min(float(height - 1), y2 + pad)
+        else:
+            module = self._find_camera_module_quad()
+            if module is None:
+                # Drop the giant disks; keep flashes / locked shapes only.
+                return keep
+            pts = np.asarray(module, dtype=np.float32).reshape(-1, 2)
+            x1 = float(pts[:, 0].min())
+            y1 = float(pts[:, 1].min())
+            x2 = float(pts[:, 0].max())
+            y2 = float(pts[:, 1].max())
+            # Reject mid-body false modules.
+            if y1 > height * 0.40:
+                return keep
+
+        # Clip auto module hole to the phone face interior so it cannot
+        # erase the top-left body rim around the island.
+        pm = getattr(self.cover_engine, "last_phone_mask", None)
+        if pm is None:
+            pm = self._phone_wrap_mask
+        if pm is not None and np.count_nonzero(pm) >= 64:
+            pm_u8 = pm
+            if pm_u8.shape[:2] != (int(height), int(width)):
+                pm_u8 = cv2.resize(
+                    pm_u8, (int(width), int(height)),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            ys_pm, xs_pm = np.where(pm_u8 > 127)
+            if xs_pm.size >= 16:
+                # Keep at least a few body pixels between hole and rim.
+                inset = float(max(2.0, 0.01 * short_img))
+                x1 = max(x1, float(xs_pm.min()) + inset)
+                y1 = max(y1, float(ys_pm.min()) + inset)
+                x2 = min(x2, float(xs_pm.max()) - inset)
+                y2 = min(y2, float(ys_pm.max()) - inset)
+                if x2 <= x1 + 4.0 or y2 <= y1 + 4.0:
+                    return keep
+
+        # Hard cap — cutout is a hole in the wrap, not a face wipe.
+        max_side = short_img * 0.34
+        if (x2 - x1) > max_side or (y2 - y1) > max_side:
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            bw = min(x2 - x1, max_side)
+            bh = min(y2 - y1, max_side)
+            x1, x2 = cx - 0.5 * bw, cx + 0.5 * bw
+            y1, y2 = cy - 0.5 * bh, cy + 0.5 * bh
+
+        short = min(x2 - x1, y2 - y1)
+        mild = float(np.clip(corner_frac if corner_frac > 0 else 0.16, 0.08, 0.28))
+        corner = float(np.clip(short * mild, 3.0, short * 0.22))
+        from .region_detector import HardwareRegionDetector
+
+        sampled = HardwareRegionDetector._sample_rounded_rect(
+            x1, y1, x2, y2, corner, samples_per_corner=14
+        )
+        edit = (
+            np.asarray(sampled, dtype=np.float32).reshape(-1, 2)
+            if sampled is not None
+            else np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        )
+        w = max(float(width), 1.0)
+        h = max(float(height), 1.0)
+        norm = [[float(x / w), float(y / h)] for x, y in edit]
+        # Drop other untagged camera rects that were also oversized.
+        keep = [
+            s
+            for s in keep
+            if not (
+                str(getattr(s, "kind", "")) in ("camera", "other")
+                and not str(getattr(s, "shape_tag", "") or "").strip()
+                and str(getattr(s, "geom", "")) in ("rounded_rect", "rectangle", "circle")
+            )
+        ]
+        keep.append(
+            CutoutSpec(
+                kind="camera",
+                contour=norm,
+                geom="rounded_rect",
+                params=[x1, y1, x2, y2, corner],
+                expand_px=0.0,
+                authoritative=True,
+                shape_tag="rounded_rect",
+            )
+        )
+        return keep
+
+    def _ensure_sanitized_camera_exclusions(self) -> None:
+        """Rebuild exclusion mask when legacy untagged camera disks remain."""
+        specs = list(self.cutout_specs or [])
+        if not specs or self.phone_image is None:
+            return
+        # If every cutout already has a user tool tag, leave them alone.
+        if all(
+            str(getattr(s, "shape_tag", "") or "").strip() for s in specs
+        ):
+            return
+        short_img = float(min(self.phone_image.shape[:2]))
+        needs = False
+        for spec in specs:
+            tag = str(getattr(spec, "shape_tag", "") or "").lower().strip()
+            kind = str(getattr(spec, "kind", "") or "")
+            geom = str(getattr(spec, "geom", "") or "")
+            if tag:
+                continue
+            if kind in ("camera", "other") and geom == "circle":
+                needs = True
+                break
+            params = list(getattr(spec, "params", []) or [])
+            if geom == "circle" and len(params) >= 3 and float(params[2]) > short_img * 0.06:
+                needs = True
+                break
+            if (
+                kind in ("camera", "other")
+                and geom in ("rounded_rect", "rectangle")
+                and len(params) >= 4
+                and max(
+                    abs(float(params[2]) - float(params[0])),
+                    abs(float(params[3]) - float(params[1])),
+                )
+                > short_img * 0.34
+            ):
+                needs = True
+                break
+        if not needs:
+            return
+        self._cutout_sanitize_nonce = getattr(self, "_cutout_sanitize_nonce", 0) + 1
+        h, w = self.phone_image.shape[:2]
+        contours = []
+        for spec in specs:
+            pts = spec.pixel_contour(w, h)
+            if pts.shape[0] >= 3:
+                contours.append(pts)
+        if not contours:
+            return
+        tags = [
+            str(getattr(s, "shape_tag", "") or "") for s in specs
+        ]
+        self.set_hardware_exclusions(
+            contours,
+            cutout_specs=None,
+            shape_tags=tags,
+            snap_geometry=False,
+            allow_clear=False,
+            persist=False,
+            refit_design=False,
+        )
+        self.invalidate(clear_scaled=False)
 
     def _find_camera_module_quad(self) -> Optional[np.ndarray]:
         """
@@ -4115,10 +5154,14 @@ class Compositor:
         if photo_cam:
             # Keep module-sized photo islands (drop tiny lens disks).
             modules: List[Tuple[float, np.ndarray]] = []
+            phone_w = float(self.phone_image.shape[1])
+            min_module = max(24.0, phone_w * 0.07)
             for p in photo_cam:
                 pts = np.asarray(p, dtype=np.float32).reshape(-1, 2)
                 bw = float(pts[:, 0].ptp())
                 bh = float(pts[:, 1].ptp())
+                if min(bw, bh) < min_module:
+                    continue
                 if min(bw, bh) < 36.0 and max(bw, bh) < 55.0:
                     continue
                 modules.append((bw * bh, pts))
@@ -4904,15 +5947,47 @@ class Compositor:
         self.exclusion_mask = surface.exclusion_mask
         self.printable_mask = surface.printable_mask
         self.hardware_contours = surface.hardware_contours
+        # Split a cluster AABB into the real lens rings when the photo has
+        # discrete cameras (not a raised island plate).
+        try:
+            from .device_template import classify_cutout_kind
+            from .region_detector import HardwareRegionDetector
+
+            if self.phone_image is not None and self.hardware_contours:
+                cover_quad = (
+                    self.control_mesh.corner_points()
+                    if self.control_mesh is not None
+                    else surface.mesh.corner_points()
+                )
+                cam: List[np.ndarray] = []
+                other: List[np.ndarray] = []
+                for contour in self.hardware_contours:
+                    pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
+                    kind = classify_cutout_kind(pts, cover_quad)
+                    if kind in ("camera", "flash"):
+                        cam.append(pts)
+                    else:
+                        other.append(pts)
+                if cam:
+                    rebuilt = HardwareRegionDetector.rebuild_camera_cutouts(
+                        cam, self.phone_image
+                    )
+                    if rebuilt:
+                        self.hardware_contours = list(other) + [
+                            np.asarray(c, dtype=np.float32).reshape(-1, 2)
+                            for c in rebuilt
+                        ]
+        except Exception:
+            pass
         # Phase 3: freeze typed cutouts from detected contours so export paint
         # uses the same authoritative holes as Perfect Finish.
         try:
             from .device_template import build_cutout_specs
-            if self.phone_image is not None and surface.hardware_contours:
+            if self.phone_image is not None and self.hardware_contours:
                 h, w = self.phone_image.shape[:2]
                 gray = cv2.cvtColor(to_bgr(self.phone_image), cv2.COLOR_BGR2GRAY)
                 self.cutout_specs = build_cutout_specs(
-                    surface.hardware_contours,
+                    self.hardware_contours,
                     self.control_mesh.corner_points()
                     if self.control_mesh is not None
                     else surface.mesh.corner_points(),
@@ -4929,6 +6004,10 @@ class Compositor:
                     )
                     if np.count_nonzero(rebuilt):
                         self.exclusion_mask = rebuilt
+                    self.cutout_shape_tags = [
+                        str(getattr(s, "shape_tag", "") or "")
+                        for s in self.cutout_specs
+                    ]
             else:
                 self.cutout_specs = []
         except Exception:
@@ -5262,6 +6341,7 @@ class Compositor:
         self._result_cache.clear()
         if clear_scaled:
             self._scaled_phone_cache.clear()
+            self._uv_field_cache = None
             self._invalidate_phone_wrap_cache()
 
     @property
@@ -5288,6 +6368,7 @@ class Compositor:
 
         # Warp destination = detected phone rim. Edit cage size is ignored so
         # wrap is never under/over the device for any phone photo.
+        self._ensure_sanitized_camera_exclusions()
         wrap_mesh, wrap_mask = self._ensure_phone_wrap_geometry()
         if wrap_mesh is None:
             wrap_mesh = self.control_mesh
@@ -5309,12 +6390,21 @@ class Compositor:
         if abs(inset) > 1e-6:
             mesh = mesh.inset(inset)
 
-        exclusion = self._scaled_mask(self.exclusion_mask, phone.shape[:2])
+        exclusion = self._exclusion_mask_for_render(phone.shape[:2])
         printable = self._scaled_mask(self.printable_mask, phone.shape[:2])
         # Scale phone wrap mask into printable if needed for clip fidelity.
         if printable is None and wrap_mask is not None:
             printable = self._scaled_mask(wrap_mask, phone.shape[:2])
-        result = self._composite(phone, mesh, exclusion, printable)
+        interpolation = cv2.INTER_LANCZOS4
+        settings_snapshot = dict(self.settings)
+        result = self._composite(
+            phone,
+            mesh,
+            exclusion,
+            printable,
+            interpolation=interpolation,
+            settings=settings_snapshot,
+        )
         self._store_limited_cache(
             self._result_cache, cache_key, result,
             get_config().result_cache_size,
@@ -5362,15 +6452,33 @@ class Compositor:
 
         phone = self.phone_image
         scale = 1.0
-
-        if max_size:
-            h, w = phone.shape[:2]
-            longest = max(h, w)
-            if longest > max_size:
-                scale = max_size / float(longest)
-                phone = cv2.resize(phone, (max(1, int(round(w * scale))),
-                                           max(1, int(round(h * scale)))),
-                                   interpolation=cv2.INTER_AREA)
+        h, w = phone.shape[:2]
+        longest = max(h, w)
+        target = int(max_size) if max_size else 0
+        # Tiny studio screenshots (e.g. 549px) must not stay native: a 4000px
+        # photo would be remapped onto ~300px then blown up in the viewer.
+        if target <= 0 and self.design_image is not None:
+            art_long = int(max(self.design_image.shape[:2]))
+            if art_long > longest * 1.8 and longest < 1200:
+                target = int(get_config().preview_max or 1400)
+        if target > 0 and longest > 0:
+            if self.design_image is not None:
+                art_long = int(max(self.design_image.shape[:2]))
+                # Don't upsample a modest design onto a huge dest — that
+                # fattens the print. Still enlarge tiny phones for huge art.
+                if art_long <= int(longest * 1.35):
+                    target = longest
+                else:
+                    target = min(
+                        int(target),
+                        max(longest, min(art_long, int(target))),
+                    )
+        if target > 0 and longest > 0 and abs(target - longest) > 1:
+            scale = float(target) / float(longest)
+            nw = max(1, int(round(w * scale)))
+            nh = max(1, int(round(h * scale)))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            phone = cv2.resize(phone, (nw, nh), interpolation=interp)
 
         self._store_limited_cache(
             self._scaled_phone_cache, key, (phone, scale),
@@ -5397,9 +6505,14 @@ class Compositor:
         height, width = shape
         if mask.shape == (height, width):
             return mask
-        return cv2.resize(
-            mask, (width, height), interpolation=cv2.INTER_AREA
+        src_h, src_w = mask.shape[:2]
+        # INTER_AREA on upsample behaves like nearest and stairs the rim.
+        interp = (
+            cv2.INTER_LINEAR
+            if (height > src_h or width > src_w)
+            else cv2.INTER_AREA
         )
+        return cv2.resize(mask, (width, height), interpolation=interp)
 
     @staticmethod
     def _strip_studio_overflow_mask(
@@ -5420,39 +6533,306 @@ class Compositor:
             phone = phone / 255.0
         lum = phone.mean(axis=2)
         sat = phone.max(axis=2) - phone.min(axis=2)
-        studio = (lum >= 0.92) & (sat <= 0.10)
-        device = ~studio
-        if not np.any(device):
-            return binary
-        near = cv2.dilate(
-            device.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-            iterations=1,
+        h, w = lum.shape[:2]
+        band = max(2, int(round(min(h, w) * 0.04)))
+        corner_lum = np.concatenate(
+            [
+                lum[:band, :band].reshape(-1),
+                lum[:band, -band:].reshape(-1),
+                lum[-band:, :band].reshape(-1),
+                lum[-band:, -band:].reshape(-1),
+            ]
         )
-        overflow = (binary > 0) & studio & (near == 0)
+        studio_ref = float(np.median(corner_lum))
+        # Drop-shadow / AABB wedges under a round phone are still
+        # border-connected to the card, just slightly darker than pure white.
+        # Silver phone interiors are not border-connected (darker rim).
+        near_card = (
+            (lum >= studio_ref - 0.20)
+            & (lum >= 0.72)
+            & (sat <= 0.16)
+        )
+        near_card = near_card | ((lum >= 0.88) & (sat <= 0.12))
+        studio = Compositor._border_connected_mask(near_card)
+        overflow = (binary > 0) & studio
         if np.any(overflow):
+            # Never eat the eroded interior of a white/silver phone.
+            core = cv2.erode(
+                binary,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                iterations=1,
+            )
+            overflow = overflow & (core == 0)
             binary = binary.copy()
             binary[overflow] = 0
         return binary
 
     @staticmethod
+    def _snap_wrap_mask_to_photo_rim(
+        mask: np.ndarray,
+        phone_bgr: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Clip square AABB / drop-shadow wedges to the photo's high-gradient rim.
+
+        Coverage stays on the device; only low-gradient studio-like pixels in
+        the outer band are removed. No blur, no generic rounded-rect.
+        """
+        binary = (mask > 127).astype(np.uint8) * 255
+        if np.count_nonzero(binary) < 64 or phone_bgr is None:
+            return binary
+        gray = cv2.cvtColor(phone_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        h, w = binary.shape[:2]
+        dist_in = cv2.distanceTransform(
+            (binary > 0).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        core = dist_in > 6.0
+        if int(np.count_nonzero(core)) < 64:
+            return binary
+        core_lum = float(np.median(gray[core]))
+        band = max(4, int(round(min(h, w) * 0.012)))
+        studio_ref = float(
+            np.median(
+                np.concatenate(
+                    [
+                        gray[:band, :band].reshape(-1),
+                        gray[:band, -band:].reshape(-1),
+                        gray[-band:, :band].reshape(-1),
+                        gray[-band:, -band:].reshape(-1),
+                    ]
+                )
+            )
+        )
+        rim = (binary > 0) & (dist_in <= 5.0)
+        # Soften pale-halo drop — only remove near-card AA, never chrome bezel.
+        drop = (
+            rim
+            & (gray >= min(studio_ref - 18.0, core_lum + 10.0))
+            & (mag < 22.0)
+        )
+        if not np.any(drop):
+            return binary
+        out = binary.copy()
+        out[drop] = 0
+        # Keep the largest component so corner clips cannot split the body.
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (out > 0).astype(np.uint8), connectivity=8
+        )
+        if num <= 2:
+            if np.count_nonzero(out) >= 64:
+                return out
+            return binary
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep = 1 + int(np.argmax(areas))
+        kept = (labels == keep).astype(np.uint8) * 255
+        if np.count_nonzero(kept) < 64:
+            return binary
+        # AABB corner wedges: walk 45° from each box corner to the first
+        # strong photo edge and drop mask pixels still outside that rim.
+        ys, xs = np.where(kept > 0)
+        if len(xs) < 64:
+            return kept
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        yy, xx = np.ogrid[:h, :w]
+        for cx, cy, sx, sy in (
+            (x0, y0, 1, 1),
+            (x1, y0, -1, 1),
+            (x0, y1, 1, -1),
+            (x1, y1, -1, -1),
+        ):
+            rim_i = None
+            for i in range(2, 64):
+                x = int(np.clip(cx + sx * i, 0, w - 1))
+                y = int(np.clip(cy + sy * i, 0, h - 1))
+                if mag[y, x] >= 28.0 and gray[y, x] < studio_ref - 8.0:
+                    rim_i = i
+                    break
+            if rim_i is None or rim_i < 4:
+                continue
+            # Pixels in this corner sector closer to the AABB corner than the rim.
+            dx = (xx - cx) * sx
+            dy = (yy - cy) * sy
+            sector = (dx >= 0) & (dy >= 0) & (dx + dy < float(rim_i) - 0.5)
+            kept = kept.copy()
+            kept[sector] = 0
+        if np.count_nonzero(kept) < 64:
+            return binary
+        return kept
+
+    @staticmethod
+    def _clip_body_to_photo_silhouette(
+        body: np.ndarray,
+        phone_bgr: np.ndarray,
+    ) -> np.ndarray:
+        """Hard clip printable body to the detected photo silhouette."""
+        from .cover_surface import CoverSurfaceEngine
+
+        binary = (body > 127).astype(np.uint8) * 255
+        if np.count_nonzero(binary) < 64 or phone_bgr is None:
+            return binary
+        sil = CoverSurfaceEngine.detect_phone_wrap_silhouette(
+            phone_bgr, cover_quad=None
+        )
+        if sil is None or np.count_nonzero(sil) < 64:
+            return binary
+        if sil.shape[:2] != binary.shape[:2]:
+            sil = cv2.resize(
+                sil, (binary.shape[1], binary.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        clipped = cv2.bitwise_and(binary, (sil > 127).astype(np.uint8) * 255)
+        if np.count_nonzero(clipped) >= 64:
+            return clipped
+        return binary
+
+    @staticmethod
+    def _fill_camera_face_bites(
+        mask: np.ndarray,
+        exclusion: Optional[np.ndarray],
+        phone_bgr: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """
+        Fill GrabCut camera-to-edge notches on the printable face.
+
+        Cutouts stay independent (punched later). This only restores wrap
+        coverage up to the real side wall so artwork can continue around
+        the lenses instead of stopping at a vertical bite.
+        """
+        body = (mask > 127).astype(np.uint8) * 255
+        if exclusion is None or np.count_nonzero(exclusion) < 16:
+            return body
+        cam = (exclusion > 64).astype(np.uint8)
+        if cam.shape[:2] != body.shape[:2]:
+            cam = cv2.resize(
+                cam, (body.shape[1], body.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        on = body > 0
+        h, w = on.shape[:2]
+        ys_on = np.where(np.any(on, axis=1))[0]
+        if ys_on.size == 0:
+            return body
+        lefts: List[float] = []
+        rights: List[float] = []
+        for y in range(h):
+            if np.any(cam[y]):
+                continue
+            xs = np.where(on[y])[0]
+            if len(xs) >= 8:
+                lefts.append(float(xs.min()))
+                rights.append(float(xs.max()))
+        if len(lefts) < 12:
+            return body
+        wall_l = float(np.percentile(lefts, 18))
+        wall_r = float(np.percentile(rights, 82))
+        out = on.copy()
+        cam_ys = np.where(np.any(cam, axis=1))[0]
+        if cam_ys.size == 0:
+            return body
+        y0 = int(cam_ys.min())
+        y1 = int(cam_ys.max())
+        body_top = int(ys_on.min())
+        body_bot = int(ys_on.max())
+        while y0 > body_top:
+            xs = np.where(on[y0 - 1])[0]
+            if len(xs) == 0 or float(xs.min()) > wall_l + 3.0:
+                y0 -= 1
+                continue
+            break
+        while y1 < body_bot:
+            xs = np.where(on[y1 + 1])[0]
+            if len(xs) == 0 or float(xs.max()) < wall_r - 3.0:
+                y1 += 1
+                continue
+            break
+        y0 = int(max(0, y0))
+        y1 = int(min(h - 1, y1))
+        for y in range(y0, y1 + 1):
+            xs = np.where(out[y])[0]
+            if len(xs) == 0:
+                cxs = np.where(cam[y])[0]
+                if len(cxs) == 0:
+                    continue
+                xl = int(round(wall_l))
+                xr = int(cxs.min())
+                if xr > xl:
+                    out[y, xl:xr] = True
+                continue
+            xmin = int(xs.min())
+            xmax = int(xs.max())
+            if xmin > wall_l + 3.0:
+                out[y, int(round(wall_l)):xmin] = True
+            if xmax < wall_r - 3.0:
+                out[y, xmax + 1:int(round(wall_r)) + 1] = True
+        filled = out.astype(np.uint8) * 255
+        # Keep the FULL phone face here — including pixels under the cutout.
+        # Cutouts are subtracted only at composite time:
+        #   selection ∩ body − cutouts
+        # Carving exclusion out of the body mask permanently balded the
+        # top-left rim whenever the hole AABB/pad touched the side wall.
+        if phone_bgr is not None:
+            filled = Compositor._strip_studio_overflow_mask(filled, phone_bgr)
+        if np.count_nonzero(filled) < 64:
+            return body
+        return filled
+
+    @staticmethod
+    def _seal_body_row_spans(mask: np.ndarray) -> np.ndarray:
+        """Fill interior holes between each row's true left and right walls."""
+        on = (mask > 127).astype(np.uint8) * 255
+        h, w = on.shape[:2]
+        out = np.zeros((h, w), dtype=np.uint8)
+        for y in range(h):
+            xs = np.where(on[y] > 0)[0]
+            if len(xs) >= 2:
+                out[y, int(xs.min()):int(xs.max()) + 1] = 255
+            elif len(xs) == 1:
+                out[y, int(xs[0])] = 255
+        if np.count_nonzero(out) < 64:
+            return on
+        return out
+
+    @staticmethod
+    def _border_connected_mask(flag: np.ndarray) -> np.ndarray:
+        """Pixels in ``flag`` that touch the image border (studio card, not the phone)."""
+        h, w = flag.shape[:2]
+        src = (np.asarray(flag).astype(bool).astype(np.uint8) * 255)
+        if int(np.count_nonzero(src)) < 8:
+            return np.zeros((h, w), dtype=bool)
+        ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        for x, y in (
+            (0, 0),
+            (w - 1, 0),
+            (0, h - 1),
+            (w - 1, h - 1),
+            (w // 2, 0),
+            (w // 2, h - 1),
+            (0, h // 2),
+            (w - 1, h // 2),
+        ):
+            if src[y, x] == 255:
+                cv2.floodFill(src, ff_mask, (int(x), int(y)), 128)
+        return src == 128
+
+    @staticmethod
     def _studio_plate_pixels(phone_bgr: np.ndarray) -> np.ndarray:
         """
-        Pixels that match the studio backdrop (not device content).
-
-        Uses the median plate colour so white/light phones are not treated as
-        backdrop — only samples that sit on the actual card.
+        Studio backdrop only — never the white/silver phone sitting on it.
         """
         h, w = phone_bgr.shape[:2]
         plate = phone_bgr.astype(np.float32)
         lum = plate.mean(axis=2)
         sat = plate.max(axis=2) - plate.min(axis=2)
-        studio_px = (lum >= 245.0) & (sat <= 12.0)
-        if int(np.count_nonzero(studio_px)) < 64:
+        # Include pale drop-shadow that is still the studio card, without
+        # treating the disconnected silver phone interior as backdrop.
+        bright = (lum >= 200.0) & (sat <= 22.0)
+        if int(np.count_nonzero(bright)) < 64:
             return np.zeros((h, w), dtype=bool)
-        studio_rgb = np.median(plate[studio_px], axis=0)
-        diff = np.abs(plate - studio_rgb.reshape(1, 1, 3)).mean(axis=2)
-        return (diff <= 10.0) & (sat <= 16.0)
+        return Compositor._border_connected_mask(bright)
 
     @staticmethod
     def _clip_studio_plate_wrap(
@@ -5477,40 +6857,10 @@ class Compositor:
             phone = phone / 255.0
         lum = phone.mean(axis=2)
         sat = phone.max(axis=2) - phone.min(axis=2)
-        studio = (lum >= 0.92) & (sat <= 0.10)
-        device = ~studio
-        # Preserve 1px AA on real device content (side fringe, corners).
-        near = cv2.dilate(
-            device.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-            iterations=1,
+        studio = Compositor._border_connected_mask(
+            (lum >= 0.78) & (sat <= 0.14)
         )
-        overflow = studio & (near == 0) & ((a > 0.02) | (m > 0.02))
-        # Bottom-center smudge: silhouette wrongly covers studio rows under the
-        # phone. Those sit inside the 1px near-halo, so also clear wrap on
-        # studio below the last real (non-studio) device row.
-        content_ys = np.where(np.any(device, axis=1))[0]
-        if content_ys.size > 0:
-            y_bot = int(content_ys.max())
-            below = np.arange(a.shape[0], dtype=np.int32)[:, None] > y_bot
-            overflow = overflow | (
-                studio & below & ((a > 0.02) | (m > 0.02))
-            )
-            # Mid-bottom only: opaque wrap on studio along the last content
-            # rows (center smudge). Skip left/right corner bands so rounded
-            # AA is unchanged.
-            content_xs = np.where(np.any(device, axis=0))[0]
-            if content_xs.size > 0:
-                x0c, x1c = int(content_xs.min()), int(content_xs.max())
-                margin = max(8, int(round(0.14 * (x1c - x0c + 1))))
-                mid = np.zeros_like(studio, dtype=bool)
-                mid[:, x0c + margin : max(x0c + margin, x1c - margin + 1)] = True
-                on_bot = np.arange(a.shape[0], dtype=np.int32)[:, None] >= max(
-                    0, y_bot - 1
-                )
-                overflow = overflow | (
-                    studio & mid & on_bot & (a >= 0.45) & (m >= 0.45)
-                )
+        overflow = studio & ((a > 0.02) | (m > 0.02))
         if protect is not None:
             prot = protect
             if prot.shape[:2] != a.shape[:2]:
@@ -5535,11 +6885,9 @@ class Compositor:
         ink_hi: float,
     ) -> np.ndarray:
         """
-        Spread inward body wrap onto each tip pixel (row-wise).
-
-        Offsets the sample by how far the tip sits past the body wall so
-        patterned artwork remains visible on thin side keys — not one flat
-        column smeared across the whole button.
+        Spread inward body wrap onto each tip pixel (row-wise) with
+        curvature-based foreshortening to simulate artwork wrapping onto
+        the button's visible side face.
         """
         allowed = tip_mask.astype(bool)
         body = body_mask.astype(bool) & ~allowed
@@ -5547,6 +6895,7 @@ class Compositor:
             return image
         h, w = allowed.shape[:2]
         out = image.copy()
+
         for y in range(h):
             txs = np.where(allowed[y])[0]
             if len(txs) == 0:
@@ -5558,6 +6907,15 @@ class Compositor:
             lum = row.mean(axis=1) if row.ndim == 2 else row.astype(np.float32)
             tl, tr = int(txs.min()), int(txs.max())
             bl, br = int(bxs.min()), int(bxs.max())
+
+            if tr < bl:
+                wall_x = bl
+                btn_width = float(wall_x - tl) if wall_x > tl else 1.0
+            elif tl > br:
+                wall_x = br
+                btn_width = float(tr - wall_x) if tr > wall_x else 1.0
+            else:
+                continue
 
             def _pick_sample(base_x: int) -> Optional[int]:
                 target = 0.5 * (ink_lo + ink_hi)
@@ -5581,19 +6939,184 @@ class Compositor:
                 return None
 
             if tr < bl:
-                wall_x = bl
                 for x in txs:
                     off = wall_x - int(x)
-                    sx = _pick_sample(min(w - 1, wall_x + off + 8))
+                    sx = _pick_sample(min(w - 1, wall_x + 4))
+                    if sx is None:
+                        sx = _pick_sample(min(w - 1, wall_x + off + 8))
                     if sx is not None:
-                        out[y, x] = row[sx]
+                        u = float(off) / max(btn_width, 1.0)
+                        u = min(u, 1.0)
+                        shade = 1.0 - 0.06 * u
+                        out[y, x] = np.clip(row[sx] * shade, 0.0, 255.0)
             elif tl > br:
-                wall_x = br
                 for x in txs:
                     off = int(x) - wall_x
-                    sx = _pick_sample(max(0, wall_x - off - 8))
+                    sx = _pick_sample(max(0, wall_x - 4))
+                    if sx is None:
+                        sx = _pick_sample(max(0, wall_x - off - 8))
                     if sx is not None:
-                        out[y, x] = row[sx]
+                        u = float(off) / max(btn_width, 1.0)
+                        u = min(u, 1.0)
+                        shade = 1.0 - 0.06 * u
+                        out[y, x] = np.clip(row[sx] * shade, 0.0, 255.0)
+        return out
+
+    @staticmethod
+    def _wrap_validated_button_surface(
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        tip_comp: np.ndarray,
+        body: np.ndarray,
+        *,
+        left_side: bool,
+        wrap_src: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Map body wrap artwork into one validated button mask.
+
+        Local space: each tip pixel's distance past the body wall is mirrored
+        inward on the same row, so texture continues from the main wrap.
+        ``wrap_src`` is the warped design. Writes only inside ``tip_comp``.
+        No phone-chrome high-pass (that imprinted the black button outline).
+        """
+        h, w = output.shape[:2]
+        out = output.astype(np.float32).copy()
+        if wrap_src is None:
+            src = out.copy()
+        else:
+            src = np.asarray(wrap_src, dtype=np.float32)
+            if src.ndim == 2:
+                src = cv2.cvtColor(src, cv2.COLOR_GRAY2BGR)
+            if src.shape[:2] != (h, w):
+                src = cv2.resize(src, (w, h), interpolation=cv2.INTER_LINEAR)
+            p99 = float(np.percentile(src, 99.5))
+            # 0–1 artwork (even with a few HDR overshoots) must be scaled;
+            # 0–255 wrap must not be multiplied again.
+            if p99 <= 2.0:
+                src = np.clip(src, 0.0, 2.0) * 255.0
+        photo = phone_bgr.astype(np.float32)
+        if photo.shape[:2] != (h, w):
+            photo = cv2.resize(photo, (w, h), interpolation=cv2.INTER_LINEAR)
+        if float(np.max(photo)) <= 1.5:
+            photo = photo * 255.0
+        # Continuous wrap from the body — do NOT imprint phone-chrome lips via
+        # photo high-pass (that painted the black outline around keys).
+        body_b = body.astype(bool) & ~tip_comp.astype(bool)
+        step = 1 if left_side else -1
+        src_lum = src.mean(axis=2)
+        src_sat = src.max(axis=2) - src.min(axis=2)
+        out_lum = out.mean(axis=2)
+        out_sat = out.max(axis=2) - out.min(axis=2)
+        print_src = (
+            body_b
+            & (src_lum >= 18.0)
+            & (src_lum < 240.0)
+            & (src_sat >= 6.0)
+        )
+        print_out = (
+            body_b
+            & (out_lum >= 18.0)
+            & (out_lum < 240.0)
+            & (out_sat >= 8.0)
+        )
+        if np.any(print_src):
+            ref_rgb = np.median(src[print_src], axis=0).astype(np.float32)
+        elif np.any(print_out):
+            ref_rgb = np.median(out[print_out], axis=0).astype(np.float32)
+        else:
+            ref_rgb = None
+
+        def _pick_wrap(y: int, start: int) -> np.ndarray:
+            sx = int(np.clip(start, 0, w - 1))
+
+            def _walk(lum: np.ndarray, sat: np.ndarray, img: np.ndarray, need_chroma: bool):
+                p = sx
+                for _ in range(72):
+                    if (
+                        body_b[y, p]
+                        and float(lum[y, p]) >= 18.0
+                        and float(lum[y, p]) < 242.0
+                        and (not need_chroma or float(sat[y, p]) >= 8.0)
+                    ):
+                        return img[y, p]
+                    nxt = int(np.clip(p + step, 0, w - 1))
+                    if nxt == p:
+                        break
+                    p = nxt
+                return None
+
+            pix = _walk(src_lum, src_sat, src, True)
+            if pix is None:
+                pix = _walk(src_lum, src_sat, src, False)
+            if pix is None:
+                pix = _walk(out_lum, out_sat, out, True)
+            if pix is None:
+                pix = _walk(out_lum, out_sat, out, False)
+            if pix is None or float(np.mean(pix)) < 18.0:
+                if ref_rgb is not None:
+                    return ref_rgb.copy()
+                if pix is None:
+                    return src[y, sx] if float(np.mean(src[y, sx])) >= 18.0 else (
+                        ref_rgb.copy() if ref_rgb is not None else out[y, sx]
+                    )
+            return pix
+
+        ys = np.where(np.any(tip_comp, axis=1))[0]
+        if ys.size == 0:
+            return out
+        y0 = int(ys.min())
+        y1 = int(ys.max())
+        yspan = max(y1 - y0, 1)
+        # Precompute a body wall column per row so tip caps still sample
+        # continuous wrap (no black gap when a tip row has no body pixels).
+        wall_col = np.full(h, -1, dtype=np.int32)
+        for y in range(h):
+            bxs = np.where(body_b[y])[0]
+            if bxs.size == 0:
+                continue
+            wall_col[y] = int(bxs.min() if left_side else bxs.max())
+        for y in ys:
+            if wall_col[y] < 0:
+                for dy in range(1, 24):
+                    for yy in (y - dy, y + dy):
+                        if 0 <= yy < h and wall_col[yy] >= 0:
+                            wall_col[y] = wall_col[yy]
+                            break
+                    if wall_col[y] >= 0:
+                        break
+            txs = np.where(tip_comp[y])[0]
+            if txs.size == 0 or wall_col[y] < 0:
+                continue
+            t_y = (float(y - y0) + 0.5) / float(yspan)
+            cap = float(np.sin(np.pi * np.clip(t_y, 0.0, 1.0)))
+            if left_side:
+                wall = int(wall_col[y])
+                x_out = int(txs.min())
+                depth_den = float(max(wall - x_out, 1))
+                for x in txs:
+                    xi = int(x)
+                    pix = _pick_wrap(y, 2 * wall - xi - 1)
+                    t_out = float(wall - xi) / depth_den
+                    # Very mild side-face depth only — no dark outline.
+                    shade = 0.97 + 0.04 * t_out + 0.02 * cap
+                    painted = np.clip(pix * shade, 0.0, 255.0)
+                    if float(np.mean(painted)) < 18.0 and ref_rgb is not None:
+                        painted = np.clip(ref_rgb * shade, 0.0, 255.0)
+                    out[y, xi] = painted
+            else:
+                wall = int(wall_col[y])
+                x_out = int(txs.max())
+                depth_den = float(max(x_out - wall, 1))
+                for x in txs:
+                    xi = int(x)
+                    pix = _pick_wrap(y, 2 * wall - xi + 1)
+                    t_out = float(xi - wall) / depth_den
+                    shade = 0.97 + 0.04 * t_out + 0.02 * cap
+                    painted = np.clip(pix * shade, 0.0, 255.0)
+                    if float(np.mean(painted)) < 18.0 and ref_rgb is not None:
+                        painted = np.clip(ref_rgb * shade, 0.0, 255.0)
+                    out[y, xi] = painted
         return out
 
     def _paint_button_tips_from_body(
@@ -5646,6 +7169,114 @@ class Compositor:
         alpha = np.where(allowed, np.maximum(alpha, cov * op), alpha)
         return design, alpha, mask
 
+    @staticmethod
+    def _button_photo_wrap_alpha(
+        tip_comp: np.ndarray,
+        all_tips: np.ndarray,
+        body: np.ndarray,
+        phone_bgr: np.ndarray,
+        *,
+        left_side: bool,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Final wrap mask from the photo contour, seeded by a validated
+        component (never its bounding rectangle).
+
+        Detection may fill ``x_out:wall`` over a grown y-span. The render
+        mask keeps only pixels that are the visible key in the source:
+        darker than the quiet bezel's AA lip, and outward of the solid
+        case wall. Rounded caps, tapered sides and studio-AA fringe are
+        therefore dropped instead of being painted as a bar.
+
+        Returns (paint, alpha, studio_bgr). Alpha is 1 on the solid
+        contour (opaque wrap-vs-studio). Bright leftover tip pixels are
+        snapped to studio by the caller — never mixed as a light halo.
+        """
+        h, w = tip_comp.shape[:2]
+        paint = np.zeros((h, w), dtype=bool)
+        alpha = np.zeros((h, w), dtype=np.float32)
+        studio_bgr = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+        if not np.any(tip_comp):
+            return paint, alpha, studio_bgr
+        phone = phone_bgr.astype(np.float32)
+        if phone.shape[:2] != (h, w):
+            phone = cv2.resize(phone, (w, h), interpolation=cv2.INTER_LINEAR)
+        if float(np.max(phone)) <= 1.5:
+            phone = phone * 255.0
+        g = phone.mean(axis=2)
+        sat = phone.max(axis=2) - phone.min(axis=2)
+        plate = (g >= 245.0) & (sat <= 12.0)
+        if int(np.count_nonzero(plate)) >= 32:
+            studio_bgr = np.median(phone[plate], axis=0).astype(np.float32)
+        studio_g = float(np.mean(studio_bgr))
+        device = ~plate
+
+        quiet_xs: List[float] = []
+        wall_xs: List[float] = []
+        case_gs: List[float] = []
+        lip_gs: List[float] = []
+        xx = np.arange(w)
+        toward = 1 if left_side else -1
+        for y in range(h):
+            if np.any(all_tips[y]):
+                continue
+            xs = np.where(device[y])[0]
+            if xs.size == 0:
+                continue
+            q = int(xs.min() if left_side else xs.max())
+            quiet_xs.append(float(q))
+            lip_g = float(g[y, q])
+            lip_gs.append(lip_g)
+            # Solid case wall: skip the bright AA lip on the first device pixel.
+            x = q
+            for _ in range(6):
+                if not (0 <= x < w):
+                    break
+                gv = float(g[y, x])
+                if gv < 120.0 or gv <= lip_g - 20.0:
+                    wall_xs.append(float(x))
+                    case_gs.append(gv)
+                    break
+                x += toward
+        if wall_xs:
+            wall = float(np.median(wall_xs))
+        elif quiet_xs:
+            wall = float(np.median(quiet_xs))
+        else:
+            bxs = np.where(body)[1]
+            wall = float(bxs.min() if left_side and bxs.size else (
+                bxs.max() if bxs.size else (0 if left_side else w - 1)
+            ))
+        case_g = float(np.median(case_gs)) if case_gs else 70.0
+        lip = float(np.median(lip_gs)) if lip_gs else case_g
+        span = max(float(studio_g - case_g), 24.0)
+
+        if left_side:
+            past_case = xx[None, :] < wall
+        else:
+            past_case = xx[None, :] > wall
+        del past_case
+        # Border-connected studio only — silver/white keys are device, not
+        # the backdrop. Local g>=245 dropped light buttons on many phones.
+        border_studio = Compositor._border_connected_mask(plate)
+        seed = tip_comp.astype(bool) & ~border_studio
+        if not np.any(seed):
+            seed = tip_comp.astype(bool) & device
+        if not np.any(seed):
+            seed = tip_comp.astype(bool)
+        if not np.any(seed):
+            return paint, alpha, studio_bgr
+        key_px = seed & (g < min(200.0, studio_g - 20.0))
+        if not np.any(key_px):
+            key_px = seed
+        key_g = float(np.median(g[key_px]))
+        aa = (g > (0.45 * key_g + 0.55 * studio_g)) & (g > key_g + 36.0)
+        paint = seed & ~aa
+        if not np.any(paint):
+            paint = seed
+        alpha = paint.astype(np.float32)
+        return paint, alpha, studio_bgr
+
     def _composite_side_button_layer(
         self,
         output: np.ndarray,
@@ -5653,17 +7284,18 @@ class Compositor:
         tip_mask: Optional[np.ndarray],
         phone_mask: Optional[np.ndarray] = None,
         tip_cov: Optional[np.ndarray] = None,
+        wrap_src: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Isolated per-button wrap layer ABOVE the finished body composite.
 
-        For each validated tip component (device-agnostic):
-          1. Claim its full photo protrusion (raw & ~body) when available
-          2. Build a localized side-face pad on the body wall (tip height only)
-          3. Sample body artwork onto tip + face
-          4. Apply reference-style top highlight / bottom shade / outer lip
-          5. Composite above the body — never invent capsules or edge streaks
+        Paint only the validated photo contour (never the component bbox).
+        Sample the warped design (``wrap_src``) so the body rim — which still
+        shows original bezel / washed AA — cannot copy hardware gray onto
+        the keys. Photo high-pass inside that helper keeps the real contour.
         """
+        del tip_cov
+        self._side_button_stem_bridge_mask = None
         if (
             output is None
             or phone_bgr is None
@@ -5698,16 +7330,6 @@ class Compositor:
 
         raw = self._phone_wrap_raw_mask
         if raw is not None and pm_u8 is not None:
-            raw_r = raw
-            if raw_r.shape[:2] != (h, w):
-                raw_r = cv2.resize(
-                    raw.astype(np.uint8),
-                    (w, h),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            tips = self._claim_full_raw_button_protrusions(
-                tips, raw_r, pm_u8, None
-            )
             plate = self._studio_plate_pixels(phone_bgr)
             if plate.shape[:2] != (h, w):
                 plate = (
@@ -5720,26 +7342,23 @@ class Compositor:
                 )
             tips = tips & ~plate
             body = (pm_u8 > 127) & ~tips
+        if not np.any(body):
+            return output
+
+        phone = phone_bgr
+        if phone.shape[:2] != (h, w):
+            phone = cv2.resize(phone, (w, h), interpolation=cv2.INTER_LINEAR)
 
         out_f = output.astype(np.float32)
         gray = out_f.mean(axis=2)
-        body_px = body & (gray >= 14.0) & (gray < 170.0)
+        sat = out_f.max(axis=2) - out_f.min(axis=2)
+        body_px = body & (gray >= 14.0) & (gray < 170.0) & (sat >= 8.0)
+        if not np.any(body_px):
+            body_px = body & (gray >= 14.0) & (gray < 170.0)
         if not np.any(body_px):
             body_px = body & (gray >= 10.0) & (gray < 210.0)
-        if not np.any(body_px):
+        if wrap_src is None and not np.any(body_px):
             return output
-
-        plate = phone_bgr.astype(np.float32)
-        if plate.shape[:2] != (h, w):
-            plate = cv2.resize(plate, (w, h), interpolation=cv2.INTER_LINEAR)
-        photo_g = plate.mean(axis=2)
-        pl = photo_g
-        ps = plate.max(axis=2) - plate.min(axis=2)
-        studio_px = (pl >= 245.0) & (ps <= 12.0)
-        if int(np.count_nonzero(studio_px)) >= 64:
-            studio_rgb = np.median(plate[studio_px], axis=0)
-        else:
-            studio_rgb = np.array([255.0, 255.0, 255.0], dtype=np.float32)
 
         tip_u8 = (tips.astype(np.uint8) * 255)
         nlab, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -5748,172 +7367,180 @@ class Compositor:
         if nlab < 2:
             return output
 
-        if tip_cov is not None and float(np.max(tip_cov)) > 0.05:
-            cov_all = np.clip(tip_cov.astype(np.float32), 0.0, 1.0)
-            if cov_all.shape[:2] != (h, w):
-                cov_all = cv2.resize(
-                    cov_all, (w, h), interpolation=cv2.INTER_LINEAR
-                )
-            cov_all = np.where(tips, cov_all, 0.0)
-        else:
-            cov_all = np.zeros((h, w), dtype=np.float32)
-
         result = out_f.copy()
-        face_depth = max(1, min(3, int(round(min(h, w) * 0.007))))
-
+        keep_paint = np.zeros((h, w), dtype=bool)
+        phone_f = phone.astype(np.float32)
+        if float(np.max(phone_f)) <= 1.5:
+            phone_f = phone_f * 255.0
         for lab in range(1, nlab):
-            area = int(stats[lab, cv2.CC_STAT_AREA])
-            if area < 4:
+            if int(stats[lab, cv2.CC_STAT_AREA]) < 4:
                 continue
             tip_comp = labels == lab
             if not np.any(tip_comp):
                 continue
             y0 = int(stats[lab, cv2.CC_STAT_TOP])
-            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
-            bw = int(stats[lab, cv2.CC_STAT_WIDTH])
-            y1 = min(h, y0 + bh)
-
-            face_pad = np.zeros((h, w), dtype=bool)
-            depth = max(1, min(face_depth, max(1, bw)))
-            for y in range(y0, y1):
-                if not np.any(tip_comp[y]):
-                    continue
-                txs = np.where(tip_comp[y])[0]
-                bxs = np.where(body[y])[0]
-                if len(txs) == 0 or len(bxs) == 0:
-                    continue
-                tmin, tmax = int(txs.min()), int(txs.max())
-                bmin, bmax = int(bxs.min()), int(bxs.max())
-                if tmax < bmin:
-                    face_pad[y, bmin : min(w, bmin + depth)] = True
-                elif tmin > bmax:
-                    face_pad[y, max(0, bmax - depth + 1) : bmax + 1] = True
-            face_pad = face_pad & body
-            surface = tip_comp | face_pad
-
-            cov = self._exact_coverage_aa(
-                (tip_comp.astype(np.uint8) * 255), scale=8
+            y1 = min(h, y0 + int(stats[lab, cv2.CC_STAT_HEIGHT]))
+            t_xs = np.where(tip_comp)[1]
+            b_xs = np.where(body[y0:y1])[1] if np.any(body[y0:y1]) else t_xs
+            left_side = (
+                float(t_xs.mean()) <= float(b_xs.mean()) if t_xs.size else True
             )
-            cov = np.where(tip_comp, cov, 0.0)
-            if np.any(cov_all > 0.05):
-                cov = np.where(tip_comp, np.maximum(cov, cov_all), cov)
-            if np.any(face_pad):
-                cov = np.where(face_pad, np.maximum(cov, 0.97), cov)
-
-            for y in range(y0, y1):
-                txs = np.where(tip_comp[y])[0]
-                if len(txs) == 0:
-                    continue
-                tmin, tmax = int(txs.min()), int(txs.max())
-                bxs = np.where(body[y])[0]
-                if len(bxs) == 0:
-                    cov[y, txs] = np.maximum(cov[y, txs], 0.94)
-                    continue
-                bmin, bmax = int(bxs.min()), int(bxs.max())
-                if tmax < bmin:
-                    cov[y, tmax] = max(float(cov[y, tmax]), 0.99)
-                    if tmax > tmin:
-                        cov[y, tmin] = min(max(float(cov[y, tmin]), 0.72), 0.92)
-                elif tmin > bmax:
-                    cov[y, tmin] = max(float(cov[y, tmin]), 0.99)
-                    if tmax > tmin:
-                        cov[y, tmax] = min(max(float(cov[y, tmax]), 0.72), 0.92)
-
-            painted = self._spread_tip_wrap_texture(
+            # Paint the full validated tip contour only (no bbox, no shrink).
+            paint = tip_comp
+            result = Compositor._wrap_validated_button_surface(
                 result,
-                surface,
-                body_px & ~face_pad,
-                ink_lo=14.0,
-                ink_hi=170.0,
+                phone,
+                paint,
+                body,
+                left_side=left_side,
+                wrap_src=wrap_src,
             )
+            keep_paint = keep_paint | paint
 
-            yy = np.arange(h, dtype=np.float32)
-            t_vert = np.zeros(h, dtype=np.float32)
-            if bh > 1:
-                t_vert[y0:y1] = (yy[y0:y1] - float(y0)) / float(bh - 1)
-            else:
-                t_vert[y0:y1] = 0.5
-            vert_k = (
-                1.22
-                - 0.18 * t_vert
-                - 0.20 * np.clip((t_vert - 0.72) / 0.28, 0.0, 1.0)
+        if np.any(keep_paint):
+            self._side_button_stem_bridge_mask = (
+                keep_paint.astype(np.uint8) * 255
             )
-            vert_k = np.clip(vert_k, 0.78, 1.28).astype(np.float32)
+            # Heal tip pixels that still match phone chrome (the black seam).
+            # Root cause: unfinished tip paint left plate RGB at the contour.
+            diff = np.abs(result - phone_f).max(axis=2)
+            gray_r = result.mean(axis=2)
+            still_plate = tips & (
+                (diff < 14.0) | ((gray_r < 22.0) & (diff < 40.0))
+            )
+            if np.any(still_plate):
+                t_xs = np.where(still_plate)[1]
+                b_xs = np.where(body)[1]
+                left_lo = (
+                    float(t_xs.mean()) <= float(b_xs.mean())
+                    if t_xs.size and b_xs.size
+                    else True
+                )
+                result = Compositor._wrap_validated_button_surface(
+                    result,
+                    phone,
+                    still_plate,
+                    body,
+                    left_side=left_lo,
+                    wrap_src=wrap_src,
+                )
+        return np.clip(np.round(result), 0, 255).astype(np.uint8)
 
-            outer = np.zeros_like(surface)
-            face = np.zeros_like(surface)
+    @staticmethod
+    def _apply_side_key_cover_relief(
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        tip_mask: Optional[np.ndarray],
+        body_mask: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """
+        Finish detected keys so they read as a real wrapped cover.
+
+        The isolated tip layer already painted artwork on the keys. This
+        pass adds the missing 3D: a raised pill on the visible side-face
+        and a recess between neighbouring keys. Widths are fractions of
+        the frame so any phone scales — no model table.
+        """
+        if (
+            output is None
+            or tip_mask is None
+            or np.count_nonzero(tip_mask) < 4
+        ):
+            return output
+        h, w = output.shape[:2]
+        tips = tip_mask > 127
+        if tips.shape[:2] != (h, w):
+            tips = (
+                cv2.resize(
+                    tip_mask.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                > 127
+            )
+        if not np.any(tips):
+            return output
+        body = np.zeros((h, w), dtype=bool)
+        if body_mask is not None and np.count_nonzero(body_mask) >= 64:
+            bm = body_mask
+            if bm.shape[:2] != (h, w):
+                bm = cv2.resize(bm, (w, h), interpolation=cv2.INTER_NEAREST)
+            body = bm > 127
+        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (tips.astype(np.uint8) * 255), connectivity=8
+        )
+        if nlab < 2:
+            return output
+        result = output.astype(np.float32).copy()
+        photo = phone_bgr.astype(np.float32)
+        if photo.shape[:2] != (h, w):
+            photo = cv2.resize(photo, (w, h), interpolation=cv2.INTER_LINEAR)
+        if float(np.max(photo)) <= 1.5:
+            photo = photo * 255.0
+        pg = photo.mean(axis=2)
+        band_w = max(3, int(round(min(h, w) * 0.016)))
+        by_side: dict = {"left": [], "right": []}
+        for lab in range(1, nlab):
+            if int(stats[lab, cv2.CC_STAT_AREA]) < 4:
+                continue
+            y0 = int(stats[lab, cv2.CC_STAT_TOP])
+            y1 = min(h, y0 + int(stats[lab, cv2.CC_STAT_HEIGHT]))
+            comp = labels == lab
+            t_xs = np.where(comp)[1]
+            b_xs = np.where(body[y0:y1])[1] if np.any(body[y0:y1]) else t_xs
+            left_side = (
+                float(t_xs.mean()) <= float(b_xs.mean()) if t_xs.size else True
+            )
+            side = "left" if left_side else "right"
+            by_side[side].append((y0, y1, left_side, comp))
+            yspan = max(y1 - y0, 1)
             for y in range(y0, y1):
-                xs = np.where(surface[y])[0]
-                if len(xs) == 0:
+                t_y = (float(y - y0) + 0.5) / float(yspan)
+                cap = float(np.sin(np.pi * np.clip(t_y, 0.0, 1.0)))
+                bxs = np.where(body[y])[0]
+                if bxs.size == 0:
                     continue
-                xmin, xmax = int(xs.min()), int(xs.max())
-                bxs = np.where(body[y] | tip_comp[y])[0]
-                if len(bxs) == 0:
-                    outer[y, xs] = True
-                    continue
-                bmin, bmax = int(bxs.min()), int(bxs.max())
-                if abs(xmin - bmin) <= abs(xmax - bmax):
-                    outer[y, xmin] = True
-                    face[y, xs[xs > xmin]] = True
-                    if not np.any(face[y]):
-                        face[y, xmax] = True
+                if left_side:
+                    wall = int(bxs.min())
+                    x0b, x1b = wall, min(w, wall + band_w)
                 else:
-                    outer[y, xmax] = True
-                    face[y, xs[xs < xmax]] = True
-                    if not np.any(face[y]):
-                        face[y, xmin] = True
-
-            shaded = painted.copy()
-            for y in range(y0, y1):
-                if not np.any(surface[y]):
+                    wall = int(bxs.max())
+                    x0b, x1b = max(0, wall - band_w + 1), wall + 1
+                for x in range(x0b, x1b):
+                    if tips[y, x] or not body[y, x]:
+                        continue
+                    # Skip studio-white leftovers.
+                    if float(pg[y, x]) >= 245.0:
+                        continue
+                    u = 1.0 - abs(float(x - wall)) / float(max(band_w, 1))
+                    shade = 0.86 + 0.22 * cap * max(u, 0.0)
+                    result[y, x] = np.clip(result[y, x] * shade, 0.0, 255.0)
+        # Recess between neighbouring keys on the same wall.
+        for side, items in by_side.items():
+            if len(items) < 2:
+                continue
+            items.sort(key=lambda t: t[0])
+            left_side = items[0][2]
+            for i in range(len(items) - 1):
+                _, y_hi, _, _ = items[i]
+                y_lo, _, _, _ = items[i + 1]
+                if y_lo <= y_hi + 1:
                     continue
-                shaded[y, surface[y]] = np.clip(
-                    shaded[y, surface[y]] * float(vert_k[y]), 0.0, 255.0
-                )
-            if np.any(face):
-                shaded[face] = np.clip(shaded[face] * 1.08, 0.0, 255.0)
-            if np.any(outer):
-                shaded[outer] = np.clip(shaded[outer] * 0.78, 0.0, 255.0)
-            if np.any(face_pad):
-                junction = face_pad & (
-                    cv2.dilate(
-                        tip_comp.astype(np.uint8) * 255,
-                        np.ones((3, 3), np.uint8),
-                        iterations=1,
-                    )
-                    > 0
-                )
-                if np.any(junction):
-                    shaded[junction] = np.clip(
-                        shaded[junction] * 0.86, 0.0, 255.0
-                    )
-
-            blended = shaded * cov[:, :, np.newaxis] + studio_rgb.reshape(
-                1, 1, 3
-            ) * (1.0 - cov[:, :, np.newaxis])
-            # Binary tip / side-face pixels get solid wrap — studio blend here
-            # turned 1–2px keys into faint gray outlines.
-            solid = surface & ((cov >= 0.50) | tip_comp | face_pad)
-            solid = solid & ~studio_px
-            soft = surface & ~solid & (cov > 0.08) & ~studio_px
-            result = np.where(solid[:, :, np.newaxis], shaded, result)
-            result = np.where(soft[:, :, np.newaxis], blended, result)
-
-            if np.any(face_pad):
-                groove = body & ~face_pad & (
-                    cv2.dilate(
-                        face_pad.astype(np.uint8) * 255,
-                        np.ones((3, 3), np.uint8),
-                        iterations=1,
-                    )
-                    > 0
-                )
-                row_band = np.zeros(h, dtype=bool)
-                row_band[y0:y1] = True
-                groove = groove & row_band[:, np.newaxis]
-                if np.any(groove):
-                    result[groove] = np.clip(result[groove] * 0.90, 0.0, 255.0)
-
+                for y in range(y_hi, y_lo):
+                    bxs = np.where(body[y])[0]
+                    if bxs.size == 0:
+                        continue
+                    wall = int(bxs.min() if left_side else bxs.max())
+                    if left_side:
+                        x0b, x1b = wall, min(w, wall + max(2, band_w // 2))
+                    else:
+                        x0b, x1b = max(0, wall - max(2, band_w // 2) + 1), wall + 1
+                    for x in range(x0b, x1b):
+                        if tips[y, x]:
+                            continue
+                        if float(pg[y, x]) >= 245.0:
+                            continue
+                        result[y, x] = np.clip(result[y, x] * 0.78, 0.0, 255.0)
         return np.clip(np.round(result), 0, 255).astype(np.uint8)
 
     @staticmethod
@@ -5944,13 +7571,14 @@ class Compositor:
             phone = phone / 255.0
         lum = phone.mean(axis=2)
         sat = phone.max(axis=2) - phone.min(axis=2)
-        # Soft ink beyond the wrap, on near-white card only.
+        studio = Compositor._border_connected_mask(
+            (lum >= 0.78) & (sat <= 0.14)
+        )
         fringe = (
             (keep == 0)
             & (a > 0.002)
             & (a < 0.60)
-            & (lum >= 0.90)
-            & (sat <= 0.12)
+            & studio
         )
         if phone_mask is not None and np.count_nonzero(phone_mask):
             pm = phone_mask
@@ -5966,7 +7594,7 @@ class Compositor:
                 & (keep == 0)
                 & (a > 0.002)
                 & (a < 0.60)
-                & (lum >= 0.90)
+                & studio
             )
         return np.where(fringe, 0.0, a).astype(np.float32)
 
@@ -6075,9 +7703,7 @@ class Compositor:
         out_f = output.astype(np.float32)
         if phone_bgr is not None:
             plate = phone_bgr.astype(np.float32)
-            pl = plate.mean(axis=2)
-            ps = plate.max(axis=2) - plate.min(axis=2)
-            studio_px = (pl >= 245.0) & (ps <= 12.0)
+            studio_px = Compositor._studio_plate_pixels(phone_bgr)
             if int(np.count_nonzero(studio_px)) >= 64:
                 studio_rgb = np.median(plate[studio_px], axis=0)
             else:
@@ -6103,54 +7729,86 @@ class Compositor:
         else:
             studio_rgb = np.array([255.0, 255.0, 255.0], dtype=np.float32)
 
-        # Deep interior stays opaque. Mid-side walls stay straight. Corner
-        # pockets keep the float geometric gate (forcing binary-on here was
-        # what re-quantized rounded arcs back into stairs).
+        # Deep interior stays opaque from the float gate itself. Do not
+        # re-threshold a 2× preview binary mask — that put stairs back
+        # onto mid-sides after every edit/zoom.
         body_on = np.zeros((h, w), dtype=bool)
         if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
             pm = phone_mask
             if pm.shape[:2] != (h, w):
+                # NEAREST — linear upsample softens the rim and falsely marks
+                # silhouette-edge pixels as outside-body (studio wash).
                 pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
             body_on = pm > 127
-            dist_in = cv2.distanceTransform(
-                body_on.astype(np.uint8), cv2.DIST_L2, 5
-            )
-            dist_out = cv2.distanceTransform(
-                (1 - body_on.astype(np.uint8)), cv2.DIST_L2, 5
-            ).astype(np.float32)
-            mid_force = np.ones((h, w), dtype=bool)
-            if corner_w is not None and float(np.max(corner_w)) > 0.05:
-                cw0 = corner_w
-                if cw0.shape[:2] != (h, w):
-                    cw0 = cv2.resize(
-                        cw0.astype(np.float32),
-                        (w, h),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                mid_force = np.clip(cw0, 0.0, 1.0) < 0.16
-            g = np.where(mid_force & body_on & (dist_in >= 1.0), 1.0, g)
-            # Clip stray wrap on straight walls only. Corner AA lives in the
-            # 1px exterior ramp — zeroing all dist_out>1.05 re-quantized arcs.
-            outside = mid_force & (~body_on) & (dist_out > 0.55)
-            far = (~body_on) & (dist_out > 1.8)
-            if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
-                tm0 = tip_mask
-                if tm0.shape[:2] != (h, w):
-                    tm0 = cv2.resize(
-                        tm0.astype(np.uint8),
-                        (w, h),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                outside = outside & ~(tm0 > 127)
-                far = far & ~(tm0 > 127)
-            g = np.where(outside | far, 0.0, g)
-            g = np.clip(g, 0.0, 1.0)
+        # Prefer photo silhouette when available so bright rim stays body.
+        if phone_bgr is not None:
+            try:
+                from .cover_surface import CoverSurfaceEngine
+
+                sil = CoverSurfaceEngine.detect_phone_wrap_silhouette(
+                    phone_bgr
+                    if phone_bgr.shape[:2] == (h, w)
+                    else cv2.resize(
+                        phone_bgr, (w, h), interpolation=cv2.INTER_LINEAR
+                    ),
+                    cover_quad=None,
+                )
+                if sil is not None and np.count_nonzero(sil) >= 64:
+                    if sil.shape[:2] != (h, w):
+                        sil = cv2.resize(
+                            sil, (w, h), interpolation=cv2.INTER_NEAREST
+                        )
+                    body_on = (sil > 127) | body_on
+            except Exception:
+                pass
+        solid = (g >= 0.45).astype(np.uint8)
+        if int(np.count_nonzero(solid)) < 64 and np.any(body_on):
+            solid = body_on.astype(np.uint8)
+        dist_in = cv2.distanceTransform(solid, cv2.DIST_L2, 5)
+        dist_out = cv2.distanceTransform(
+            (1 - solid), cv2.DIST_L2, 5
+        ).astype(np.float32)
+        mid_force = np.ones((h, w), dtype=bool)
+        if corner_w is not None and float(np.max(corner_w)) > 0.05:
+            cw0 = corner_w
+            if cw0.shape[:2] != (h, w):
+                cw0 = cv2.resize(
+                    cw0.astype(np.float32),
+                    (w, h),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            mid_force = np.clip(cw0, 0.0, 1.0) < 0.16
+        g = np.where(mid_force & (dist_in >= 1.5), np.maximum(g, 0.97), g)
+        # Do NOT stamp the binary body mask onto the float gate. That copied
+        # AABB/threshold stairs past the real rounded rim (over-wrap).
+        # Never zero gate on photo-silhouette body — bright rim is often
+        # border-connected to the studio card but must stay wrap-covered.
+        g = np.where(body_on, np.maximum(g, 0.97), g)
+        # Drop gate only on pure studio OUTSIDE the silhouette.
+        g = np.where(studio_px & ~body_on, 0.0, g)
+        g = np.where(g >= 0.92, 1.0, g)
+        # Clip stray wrap outside the photo silhouette (~0.55px AA band).
+        far = (~body_on) & (dist_out > 0.55)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm0 = tip_mask
+            if tm0.shape[:2] != (h, w):
+                tm0 = cv2.resize(
+                    tm0.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            far = far & ~(tm0 > 127)
+        g = np.where(far, 0.0, g)
+        g = np.clip(g, 0.0, 1.0)
 
         blended = out_f * g[:, :, np.newaxis] + studio_rgb.reshape(1, 1, 3) * (
             1.0 - g[:, :, np.newaxis]
         )
 
-        apply = g < 0.985
+        # Re-blend only leaks past the AA band. The 0–1px rim is already
+        # composited; mixing it with studio a second time washes it white.
+        # Never wash photo-silhouette body pixels with studio.
+        apply = (g < 0.45) & (dist_out > 0.85) & ~body_on
         if hole_w is not None and float(np.max(hole_w)) > 0.05:
             hw = hole_w
             if hw.shape[:2] != (h, w):
@@ -6220,7 +7878,7 @@ class Compositor:
                 mid_side
                 & (body_u8 > 127)
                 & (dist_in >= 1.0)
-                & (gray_chk > 40.0)
+                & (gray_chk > 210.0)
             )
             if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
                 tm = tip_mask
@@ -6269,7 +7927,7 @@ class Compositor:
         gray_r = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
         # Outside-ish soft gate: any leftover dark stair chips → re-blend or
         # studio. Does not touch opaque interior (g≈1) or tip masks.
-        weak = (g < 0.55) & (gray_r < 100)
+        weak = (g < 0.55) & (gray_r < 100) & ~body_on & (dist_out > 0.85)
         if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
             tm = tip_mask
             if tm.shape[:2] != (h, w):
@@ -6292,7 +7950,7 @@ class Compositor:
             if np.any(near_empty):
                 result[near_empty] = studio_bgr
         # Absolute outside: kill residual dark chips on near-zero gate.
-        chip = (g < 0.06) & (gray_r < 140)
+        chip = (g < 0.06) & (gray_r < 140) & ~body_on
         if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
             tm = tip_mask
             if tm.shape[:2] != (h, w):
@@ -6306,6 +7964,68 @@ class Compositor:
             result = result.copy()
             result[chip] = studio_bgr
         return result
+
+    @staticmethod
+    def _apply_premium_rim_finish(
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        phone_mask: Optional[np.ndarray],
+        hole_w: Optional[np.ndarray] = None,
+        tip_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Subtle manufactured-cover finish on wrap already clipped to the photo body.
+
+        Slight perimeter highlight/depth only. No extra ring, glow, or grow.
+        """
+        if (
+            output is None
+            or phone_bgr is None
+            or phone_mask is None
+            or np.count_nonzero(phone_mask) < 64
+        ):
+            return output
+        h, w = output.shape[:2]
+        pm = phone_mask
+        if pm.shape[:2] != (h, w):
+            pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
+        body = (pm > 127).astype(np.uint8)
+        if int(np.count_nonzero(body)) < 64:
+            return output
+        tip = np.zeros((h, w), dtype=bool)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm = tip_mask
+            if tm.shape[:2] != (h, w):
+                tm = cv2.resize(
+                    tm.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            tip = tm > 127
+        hole = np.zeros((h, w), dtype=bool)
+        if hole_w is not None and float(np.max(hole_w)) > 0.05:
+            hw = hole_w
+            if hw.shape[:2] != (h, w):
+                hw = cv2.resize(hw, (w, h), interpolation=cv2.INTER_LINEAR)
+            hole = np.clip(hw, 0.0, 1.0) > 0.45
+        dist_in = cv2.distanceTransform(body, cv2.DIST_L2, 5).astype(np.float32)
+        face = ((body > 0) | tip) & ~hole
+        band = face & (dist_in > 0.35) & (dist_in < 5.0)
+        if not np.any(band):
+            return output
+        gx = cv2.Sobel(dist_in, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(dist_in, cv2.CV_32F, 0, 1, ksize=3)
+        gn = np.sqrt(gx * gx + gy * gy) + 1e-6
+        lit = np.clip(0.5 + 0.5 * (-0.55 * (gx / gn) - 0.35 * (gy / gn)), 0.0, 1.0)
+        t = np.clip(dist_in / 5.0, 0.0, 1.0)
+        falloff = (1.0 - t) * (1.0 - t)
+        gain = 1.0 + (0.045 * (lit - 0.45) - 0.012) * falloff
+        gain = np.where(band, gain, 1.0).astype(np.float32)
+        out = output.astype(np.float32)
+        out = np.where(
+            face[:, :, np.newaxis],
+            np.clip(out * gain[:, :, np.newaxis], 0.0, 255.0),
+            out,
+        )
+        return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
     @staticmethod
     def _trim_exterior_speckles(
@@ -6461,7 +8181,8 @@ class Compositor:
             interior = interior & ~guard
             rim_band = rim_band & ~guard
         # Soft fringe from the geometric gate — not binary mask stairs.
-        fringe_px = max(2.5, float(min(h, w)) * 0.006)
+        # Keep it sub-pixel; 2.5px+ fringe was wrap painted onto studio.
+        fringe_px = 0.55
         gate_soft = (gate > 0.02) & (gate < 0.985)
         # In corner pockets force the geometric arc even when the photo rim
         # band thinks those pixels are "interior" (stairs would remain).
@@ -6478,7 +8199,12 @@ class Compositor:
         if corner_w is not None and corner_w.shape[:2] == (h, w):
             cw = np.clip(corner_w.astype(np.float32), 0.0, 1.0)
             env = np.where(cw > 0.18, np.minimum(env, gate), env)
-        env = np.where((gate < 0.015) & (dist_out > fringe_px), 0.0, env)
+            local_fringe = 0.40 + (fringe_px - 0.40) * np.clip(
+                cw / 0.18, 0.0, 1.0
+            )
+            env = np.where((gate < 0.02) & (dist_out > local_fringe), 0.0, env)
+        else:
+            env = np.where((gate < 0.015) & (dist_out > fringe_px), 0.0, env)
         env = np.clip(env, 0.0, 1.0)
         if hole_w is not None:
             hw = hole_w
@@ -6553,14 +8279,21 @@ class Compositor:
                     edge = rim | gate_soft | (cw > 0.18)
                 else:
                     edge = rim | gate_soft
-                m = np.where(interior & ~edge, np.maximum(m, 0.985), m)
-                m = np.where(edge, gate, m)
+                m = np.where(edge, np.minimum(m, gate), m)
                 if corner_w is not None and corner_w.shape[:2] == (h, w):
                     cw = np.clip(corner_w.astype(np.float32), 0.0, 1.0)
                     m = np.where(cw > 0.18, np.minimum(m, gate), m)
-                m = np.where((gate < 0.015) & (dist_out > fringe_px), 0.0, m)
+                    local_fringe = 0.40 + (fringe_px - 0.40) * np.clip(
+                        cw / 0.18, 0.0, 1.0
+                    )
+                    m = np.where(
+                        (gate < 0.02) & (dist_out > local_fringe), 0.0, m
+                    )
+                else:
+                    m = np.where(
+                        (gate < 0.015) & (dist_out > fringe_px), 0.0, m
+                    )
             else:
-                m = np.where(interior, np.maximum(m, 0.985), m)
                 ext = np.clip(
                     1.0 - np.maximum(dist_out - 0.5, 0.0) / 1.5, 0.0, 1.0
                 )
@@ -6577,18 +8310,25 @@ class Compositor:
                     edge = rim | gate_soft | (cw > 0.18)
                 else:
                     edge = rim | gate_soft
-                a = np.where(interior & ~edge, np.maximum(a, 0.97), a)
-                a = np.where(edge, gate, a)
+                a = np.where(edge, np.minimum(a, gate), a)
                 if corner_w is not None and corner_w.shape[:2] == (h, w):
                     cw = np.clip(corner_w.astype(np.float32), 0.0, 1.0)
                     a = np.where(cw > 0.18, np.minimum(a, gate), a)
-                a = np.where((gate < 0.015) & (dist_out > fringe_px), 0.0, a)
+                    local_fringe = 0.40 + (fringe_px - 0.40) * np.clip(
+                        cw / 0.18, 0.0, 1.0
+                    )
+                    a = np.where(
+                        (gate < 0.02) & (dist_out > local_fringe), 0.0, a
+                    )
+                else:
+                    a = np.where(
+                        (gate < 0.015) & (dist_out > fringe_px), 0.0, a
+                    )
             else:
                 ext = np.clip(
                     1.0 - np.maximum(dist_out - 0.5, 0.0) / 1.5, 0.0, 1.0
                 )
                 safe = interior if guard is None else (interior & ~guard)
-                a = np.where(safe, np.maximum(a, 0.97), a)
                 a = a * ext
             if hole_w is not None:
                 hw = hole_w
@@ -6709,6 +8449,7 @@ class Compositor:
         *,
         feather_radius: int = 0,
         phone_mask: Optional[np.ndarray] = None,
+        native_phone_mask: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         Perfect Wrap mask from the PHOTO phone silhouette.
@@ -6735,9 +8476,9 @@ class Compositor:
             )
             corner = float(np.clip(max(corner, med), 6.0, 18.0))
         radii = (corner, corner, corner, corner)
-        self.corner_radii = CornerRadii.uniform(corner)
-        self.corner_radius_estimate = corner
-        self.settings["corner_radius"] = corner
+        # Do not write corner_radius / corner_radii here. Every preview used
+        # to mutate them, so the next edit rebuilt UV from a clamped value
+        # while the phone boundary had not changed.
 
         if phone_mask is None or np.count_nonzero(phone_mask) < 64:
             phone_mask = self._resolve_phone_boundary_mask(mesh, (h, w))
@@ -6745,13 +8486,36 @@ class Compositor:
         # Primary coverage = silhouette contour SDF (photo truth).
         gate_f = None
         mask = None
-        if phone_mask is not None and np.count_nonzero(phone_mask) > 64:
-            pm = phone_mask
-            if pm.shape[:2] != (h, w):
-                pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_LINEAR)
-                pm = (pm > 127).astype(np.uint8) * 255
-            phone_mask = pm
-            gate_f = self._product_rim_gate(mesh, pm, (h, w))
+        gate_src = (
+            native_phone_mask
+            if native_phone_mask is not None
+            and np.count_nonzero(native_phone_mask) >= 64
+            else phone_mask
+        )
+        if gate_src is not None and np.count_nonzero(gate_src) >= 64:
+            from .cover_surface import CoverSurfaceEngine
+
+            rim_src = CoverSurfaceEngine.polish_product_silhouette(gate_src)
+            gate_f = self._product_rim_gate(mesh, rim_src, (h, w))
+            if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+                native_pm = phone_mask
+            elif gate_src is not None:
+                native_pm = gate_src
+            else:
+                native_pm = None
+            if native_pm is not None:
+                if native_pm.shape[:2] != (h, w):
+                    phone_mask = cv2.resize(
+                        native_pm.astype(np.uint8),
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    phone_mask = (phone_mask > 127).astype(np.uint8) * 255
+                else:
+                    phone_mask = (native_pm > 127).astype(np.uint8) * 255
+                # Do NOT strip studio-connected bright rim from the body mask.
+                # That removed the top/side bezel from phone_mask and the hard
+                # silhouette clip then zeroed wrap alpha across the top face.
             if gate_f is not None:
                 gate_f = np.clip(gate_f.astype(np.float32), 0.0, 1.0)
                 mask = gate_f.copy()
@@ -6766,7 +8530,7 @@ class Compositor:
                 smooth_boundary=True,
                 phone_silhouette=phone_mask,
                 corner_radii=radii,
-                prefer_live_boundary=True,
+                prefer_live_boundary=False,
             )
             mask = np.clip(mask, 0.0, 1.0)
 
@@ -6804,13 +8568,25 @@ class Compositor:
             _sharp_quad_from_mesh,
         )
 
-        h, w = map(int, shape)
+        dest_h, dest_w = map(int, shape)
         if phone_mask is None or np.count_nonzero(phone_mask) < 64:
             return None
-        gate = phone_mask
-        if gate.shape[:2] != (h, w):
-            gate = cv2.resize(gate, (w, h), interpolation=cv2.INTER_NEAREST)
-        binary = (gate > 127).astype(np.uint8) * 255
+        # Build the gate in photo-mask space. Preview is often 2× the source
+        # (549→1100); nearest/threshold upsample there turned 1px rim into
+        # stairs that only showed after zoom/edit.
+        binary = (phone_mask > 127).astype(np.uint8) * 255
+        h, w = binary.shape[:2]
+        # Wrap follows the phone pixels, never the edit-cage and never the
+        # studio card. Threshold is border-connected studio, so white
+        # phones stay intact (they are not connected to the card).
+        plate = None
+        if self.phone_image is not None:
+            pb = to_bgr(self.phone_image)
+            if pb.shape[:2] != (h, w):
+                pb = cv2.resize(pb, (w, h), interpolation=cv2.INTER_LINEAR)
+            plate = self._studio_plate_pixels(pb)
+            # Do not strip bright bezel pixels from the gate binary — that
+            # erased the top/side rim from coverage and left bare phone face.
         on = binary > 0
         if int(np.count_nonzero(on)) < 64:
             return None
@@ -6818,24 +8594,60 @@ class Compositor:
         # Body mask is already the photo silhouette. Displacement-capped
         # smoothing eases 1px kinks at the straight→arc join without growing
         # the corner radius. Then supersample-fill for sub-pixel AA.
+        exact = Compositor._exact_coverage_aa(binary, scale=16)
         pts = AdaptiveMeshBuilder.outer_contour_polyline(binary, smooth=False)
-        cov = None
+        cov = exact
         if pts is not None and pts.shape[0] >= 16:
             raw_pts = pts.astype(np.float32)
-            sm = AdaptiveMeshBuilder._smooth_closed_polyline(raw_pts, window=5)
+            sm = AdaptiveMeshBuilder._smooth_closed_polyline(raw_pts, window=7)
             delta = sm - raw_pts
             mag = np.linalg.norm(delta, axis=1, keepdims=True)
-            cap = 0.40
+            ys0, xs0 = np.where(on)
+            phone_short = float(
+                min(int(xs0.max()) - int(xs0.min()) + 1, int(ys0.max()) - int(ys0.min()) + 1)
+            )
+            # Mid-sides stay tight (0.4px). Corner stairs round using a
+            # fraction of THIS phone's short side — not a model table.
+            cap_mid = 0.40
+            cap_c = float(max(1.6, 0.014 * phone_short))
+            cw0 = _corner_proximity_map(
+                (h, w),
+                x0=float(xs0.min()),
+                y0=float(ys0.min()),
+                x1=float(xs0.max()),
+                y1=float(ys0.max()),
+                corner_frac=0.22,
+            )
+            ix = np.clip(np.round(raw_pts[:, 0]).astype(np.int32), 0, w - 1)
+            iy = np.clip(np.round(raw_pts[:, 1]).astype(np.int32), 0, h - 1)
+            cwp = cw0[iy, ix].astype(np.float32).reshape(-1, 1)
+            cap = cap_mid + (cap_c - cap_mid) * np.clip(cwp, 0.0, 1.0)
             pts = raw_pts + delta * np.minimum(
                 1.0, cap / np.maximum(mag, 1e-6)
             )
-            cov = _fill_closed_polyline_aa(
+            cov_poly = _fill_closed_polyline_aa(
                 pts, (h, w), scale=16, expand_px=0.0
             )
+            if cov_poly is not None and float(np.max(cov_poly)) > 0.05:
+                dist_in0 = cv2.distanceTransform(
+                    on.astype(np.uint8), cv2.DIST_L2, 5
+                )
+                # Interior only — polyline must never expand past the photo rim.
+                deep = on & (dist_in0 >= 3.0)
+                cov = np.where(
+                    deep,
+                    np.maximum(exact, np.minimum(cov_poly, 1.0)),
+                    exact,
+                )
         if cov is None or float(np.max(cov)) < 0.05:
+            q = _sharp_quad_from_mesh(mesh)
+            if (h, w) != (dest_h, dest_w) and q is not None:
+                q = np.asarray(q, dtype=np.float32).copy()
+                q[:, 0] *= float(w) / float(max(dest_w, 1))
+                q[:, 1] *= float(h) / float(max(dest_h, 1))
             cov = CoverSurfaceEngine.symmetric_rim_gate(
                 binary,
-                _sharp_quad_from_mesh(mesh),
+                q,
                 float(
                     np.clip(
                         float(self.corner_radius_estimate or 11.0),
@@ -6865,49 +8677,163 @@ class Compositor:
         mid = cw < 0.16
         # Deep interior stays opaque (Chaikin must not punch white holes).
         cov = np.where(on & (dist_in >= 8.0), 1.0, cov)
-        # Straight walls: 1px-AA coverage of the same mid-side wall used for
-        # the body. Isolated nubs past that wall are dropped — width unchanged.
-        edge_l = np.full(h, np.nan, dtype=np.float32)
-        edge_r = np.full(h, np.nan, dtype=np.float32)
-        for y in range(h):
-            row = np.where(on[y])[0]
-            if len(row):
-                edge_l[y] = float(row.min())
-                edge_r[y] = float(row.max())
-        el = self._fill_1d_edge_profile(edge_l)
-        er = self._fill_1d_edge_profile(edge_r)
-        y0i, y1i = int(ys.min()), int(ys.max())
-        ph = float(max(y1i - y0i + 1, 1))
-        wall_l = self._straight_wall_reference(
-            el, y0i, y1i, ph, side="left"
-        )
-        wall_r = self._straight_wall_reference(
-            er, y0i, y1i, ph, side="right"
-        )
-        xx = np.arange(w, dtype=np.float32)[None, :]
-        wall_cov = np.minimum(
-            np.clip(xx - (float(wall_l) - 0.5), 0.0, 1.0),
-            np.clip((float(wall_r) + 0.5) - xx, 0.0, 1.0),
-        )
-        # True mid only (cw≈0). Do not mix the rectangle into corner arcs.
-        wall_w = np.clip((0.12 - cw) / 0.08, 0.0, 1.0)
-        wall_w = wall_w * wall_w * (3.0 - 2.0 * wall_w)
-        cov = wall_w * wall_cov + (1.0 - wall_w) * cov
-        cov = np.where((cw < 0.18) & (xx > float(wall_r) + 0.60), 0.0, cov)
-        cov = np.where((cw < 0.18) & (xx < float(wall_l) - 0.60), 0.0, cov)
         cov = np.where(mid & on & (dist_in >= 1.0), 1.0, cov)
-        cov = np.where(mid & (~on) & (dist_out > 0.55), 0.0, cov)
-        # Far exterior speckles only — 1px corner AA band is kept.
-        cov = np.where((~on) & (dist_out > 1.8), 0.0, cov)
-        return np.clip(cov, 0.0, 1.0).astype(np.float32)
+        # Outside the binary silhouette: exact-AA sub-pixel band only.
+        cov = np.where(on, cov, exact)
+        cov = np.where((~on) & (dist_out > 0.65), 0.0, cov)
+        # Studio card is never wrap, even in corner AA. White phones are
+        # not border-connected to the card so they stay covered.
+        # CRITICAL: do not zero gate on silhouette body pixels — the bright
+        # phone rim is often border-connected to the studio card and must
+        # stay wrap-covered (was wiping the entire top bezel).
+        if plate is not None and np.any(plate):
+            pl = plate
+            if pl.shape[:2] != (h, w):
+                pl = (
+                    cv2.resize(
+                        pl.astype(np.uint8),
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    > 0
+                )
+            cov = np.where(pl & (~on), 0.0, cov)
+        # Interior studio wedges at rounded corners are not border-connected
+        # to the card edge — zero gate there so wrap cannot bleed past the rim.
+        if self.phone_image is not None:
+            pb_w = to_bgr(self.phone_image)
+            if pb_w.shape[:2] != (h, w):
+                pb_w = cv2.resize(pb_w, (w, h), interpolation=cv2.INTER_LINEAR)
+            pw = pb_w.astype(np.float32)
+            if float(np.max(pw)) > 1.5:
+                pw = pw / 255.0
+            lum_w = pw.mean(axis=2)
+            sat_w = pw.max(axis=2) - pw.min(axis=2)
+            wedge = (
+                (~on)
+                & (lum_w >= 0.94)
+                & (sat_w <= 0.10)
+                & (dist_out <= 8.0)
+                & (dist_out > 0.55)
+            )
+            cov = np.where(wedge, 0.0, cov)
+        cov = np.clip(cov, 0.0, 1.0).astype(np.float32)
+        if (h, w) != (dest_h, dest_w):
+            cov = cv2.resize(
+                cov, (dest_w, dest_h), interpolation=cv2.INTER_LINEAR
+            )
+            cov = np.clip(cov, 0.0, 1.0).astype(np.float32)
+            body_up = (
+                cv2.resize(
+                    binary.astype(np.float32),
+                    (dest_w, dest_h),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                > 127.0
+            )
+            dist_out_d = cv2.distanceTransform(
+                (~body_up).astype(np.uint8), cv2.DIST_L2, 5
+            ).astype(np.float32)
+            cov = np.where(dist_out_d > 0.65, 0.0, cov)
+            if self.phone_image is not None:
+                pb_d = to_bgr(self.phone_image)
+                if pb_d.shape[:2] != (dest_h, dest_w):
+                    pb_d = cv2.resize(
+                        pb_d, (dest_w, dest_h), interpolation=cv2.INTER_LINEAR
+                    )
+                pd = pb_d.astype(np.float32)
+                if float(np.max(pd)) > 1.5:
+                    pd = pd / 255.0
+                lum_d = pd.mean(axis=2)
+                sat_d = pd.max(axis=2) - pd.min(axis=2)
+                wedge_d = (
+                    (~body_up)
+                    & (lum_d >= 0.94)
+                    & (sat_d <= 0.10)
+                    & (dist_out_d <= 10.0)
+                    & (dist_out_d > 1.70)
+                )
+                cov = np.where(wedge_d, 0.0, cov)
+            cov = np.clip(cov, 0.0, 1.0).astype(np.float32)
+        return cov
+
+    def _silhouette_sampling_aspect(
+        self,
+        mesh: ControlMesh,
+        dest_hw: Tuple[int, int],
+    ) -> float:
+        """
+        Artwork cover aspect from the detected phone body, not the edit cage.
+
+        Selection bounds are a working rectangle; UV crop must match the real
+        phone width/height so art is not scaled to empty studio around it.
+        """
+        pm = self._phone_wrap_mask
+        if pm is None or np.count_nonzero(pm) < 64:
+            pm = getattr(self.cover_engine, "last_phone_mask", None)
+        if pm is not None and np.count_nonzero(pm) >= 64:
+            dh, dw = int(dest_hw[0]), int(dest_hw[1])
+            if pm.shape[:2] != (dh, dw):
+                pm = cv2.resize(
+                    pm.astype(np.uint8),
+                    (dw, dh),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            ys, xs = np.where(pm > 127)
+            if xs.size >= 16:
+                bw = float(int(xs.max()) - int(xs.min()) + 1)
+                bh = float(int(ys.max()) - int(ys.min()) + 1)
+                if bh > 1.0:
+                    return bw / bh
+        return mesh_aspect(mesh)
+
+    def _destination_uv_maps(
+        self,
+        mesh: ControlMesh,
+        output_shape: Tuple[int, int],
+        curved: CurvedUVParams,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cached dest→UV field for the current wrap mesh and preview size."""
+        h, w = int(output_shape[0]), int(output_shape[1])
+        cr = None
+        radii = getattr(curved, "corner_radii", None)
+        if radii is not None:
+            try:
+                cr = tuple(radii.as_tuple())
+            except Exception:
+                cr = None
+        key = (
+            h,
+            w,
+            int(mesh.rows),
+            int(mesh.cols),
+            hash(np.ascontiguousarray(mesh.points).tobytes()),
+            round(float(curved.rim_uv), 5),
+            round(float(curved.bevel_strength), 5),
+            bool(curved.enabled),
+            cr,
+            4,  # UV raster densify factor
+        )
+        cached = self._uv_field_cache
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2], cached[3], cached[4]
+        uv = MeshWarper.parametric_uv(mesh.rows, mesh.cols, curved)
+        map_u, map_v, coverage = MeshWarper.rasterize_vertex_maps(
+            mesh, uv, (h, w)
+        )
+        self._uv_field_cache = (key, map_u, map_v, coverage, uv)
+        return map_u, map_v, coverage, uv
 
     def _composite(
         self, phone_bgr: np.ndarray, mesh: ControlMesh,
         exclusion_mask: Optional[np.ndarray],
         printable_mask: Optional[np.ndarray],
+        *,
+        interpolation: int = cv2.INTER_LINEAR,
+        settings: Optional[Dict[str, float]] = None,
     ) -> np.ndarray:
         """Run the full compositing pipeline for one resolution."""
-        s = self.settings
+        s = dict(self.settings if settings is None else settings)
         h, w = phone_bgr.shape[:2]
 
         phone = phone_bgr.astype(np.float32) / 255.0
@@ -6916,49 +8842,63 @@ class Compositor:
         # Do NOT ray-expand corners here — that reintroduced tilt/unequal
         # margins at render time while the edit cage stayed upright.
 
-        # 1. Map the design through independent affine mesh triangles with
-        # Phase 2 curved UV foreshortening on the bevel rim (flat back stays
-        # identity). Editing one vertex still only affects adjacent cells.
+        # 1. Sample the original artwork once through dest→UV maps. Pan/zoom
+        # only updates the crop window; geometry maps stay cached.
+        # Linear UV: curved bevel foreshortening fattens/distorts the photo.
+        # Wrap still follows the phone silhouette via the destination mesh.
+        # Curved rim UV so the print wraps the case sides like the old cover.
         curved = CurvedUVParams(
-            rim_uv=min(float(self.settings.get("rim_uv", 5.5)) / 100.0, 0.035),
+            rim_uv=min(float(s.get("rim_uv", 5.5)) / 100.0, 0.022),
             bevel_strength=min(
-                float(self.settings.get("bevel_strength", 92.0)) / 100.0, 0.72
+                float(s.get("bevel_strength", 92.0)) / 100.0, 0.38
             ),
             corner_radii=self.corner_radii,
-            enabled=float(self.settings.get("curved_uv", 1.0)) >= 0.5,
+            enabled=True,
         )
-        # Prefer live session params when margin-derived rim is fresher.
-        if self.curved_uv_params is not None and curved.enabled:
-            curved.rim_uv = float(
-                np.clip(
-                    0.65 * curved.rim_uv
-                    + 0.35 * self.curved_uv_params.rim_uv,
-                    0.03,
-                    0.12,
-                )
-            )
-            curved.corner_radii = self.corner_radii
-        self.curved_uv_params = curved.clamped()
+        self.curved_uv_params = curved
 
-        source = MeshWarper.source_points(
+        map_u, map_v, uv_cov, uv_table = self._destination_uv_maps(
+            mesh, (h, w), self.curved_uv_params
+        )
+        # Artwork cover window follows the detected phone silhouette, never
+        # an oversized/tilted selection cage that only contains the phone.
+        center, crop_w, crop_h = MeshWarper.sampling_window(
             self.design_image.shape[:2],
-            mesh.rows,
-            mesh.cols,
-            mesh_aspect(mesh),
+            self._silhouette_sampling_aspect(mesh, (h, w)),
             fit_mode=self.fit_mode,
             scale=float(s.get('design_scale', 100.0)) / 100.0,
             offset_x=float(s.get('offset_x', 0.0)) / 100.0,
             offset_y=float(s.get('offset_y', 0.0)) / 100.0,
             rotation=float(s.get('rotation', 0.0)),
-            curved_uv=self.curved_uv_params,
+            uv_table=uv_table,
         )
-
-        warped = MeshWarper.warp(
+        map_x, map_y = MeshWarper.apply_sampling_window(
+            map_u,
+            map_v,
+            uv_cov,
+            center,
+            crop_w,
+            crop_h,
+            float(s.get('rotation', 0.0)),
+        )
+        pm_seal = None
+        if self._phone_wrap_mask is not None:
+            pm_seal = self._scaled_mask(self._phone_wrap_mask, (h, w))
+        elif getattr(self.cover_engine, "last_phone_mask", None) is not None:
+            pm_seal = self._scaled_mask(
+                self.cover_engine.last_phone_mask, (h, w)
+            )
+        if pm_seal is not None and np.count_nonzero(pm_seal) > 64:
+            map_x, map_y, uv_cov = MeshWarper.seal_maps_to_mask(
+                map_x, map_y, uv_cov, pm_seal
+            )
+        warped = MeshWarper.remap_design(
             self.design_image,
-            source,
-            mesh,
-            (h, w),
+            map_x,
+            map_y,
+            uv_cov,
             mirror=self.mirror,
+            interpolation=interpolation,
         )
 
         if warped is None:
@@ -6980,7 +8920,36 @@ class Compositor:
                 if self._phone_wrap_mask is not None
                 else getattr(self.cover_engine, "last_phone_mask", None)
             ),
+            native_phone_mask=self._phone_wrap_mask,
         )
+        # Authority: photo body silhouette is fully wrap-covered. Mesh/gate
+        # rounded-rect topology must not leave bald side/corner strips inside
+        # the real phone (selection cage is reference only).
+        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+            pm_full = phone_mask
+            if pm_full.shape[:2] != (h, w):
+                pm_full = cv2.resize(
+                    pm_full.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            body_on = pm_full > 127
+            dist_in_full = cv2.distanceTransform(
+                body_on.astype(np.uint8), cv2.DIST_L2, 5
+            ).astype(np.float32)
+            mask = np.where(
+                body_on & (dist_in_full >= 1.25),
+                np.maximum(mask.astype(np.float32), 0.985),
+                mask,
+            )
+            dist_out_full = cv2.distanceTransform(
+                (~body_on).astype(np.uint8), cv2.DIST_L2, 5
+            ).astype(np.float32)
+            mask = np.where(
+                (~body_on) & (dist_out_full > 0.55),
+                0.0,
+                mask,
+            )
         from .mesh import _corner_proximity_map, _sharp_quad_from_mesh
 
         try:
@@ -7046,50 +9015,25 @@ class Compositor:
             dist_fc = cv2.distanceTransform(phone_bin_fc, cv2.DIST_L2, 5)
             interior_core = dist_fc > max(3.0, float(min(h, w)) * 0.012)
 
-        # Close thin transparent fringes at the rim so the cover reaches the
-        # phone edge (large camera holes in the artwork stay open).
-        if float(np.max(design_alpha)) > 0.05 and float(np.max(mask)) > 0.05:
-            solid = (mask > 0.88).astype(np.uint8) * 255
-            opaque = (design_alpha > 0.35).astype(np.uint8) * 255
-            edge_px = max(3, int(round(min(h, w) * 0.010)))
-            grown = cv2.dilate(
-                opaque,
-                cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (edge_px * 2 + 1, edge_px * 2 + 1)
-                ),
-                iterations=1,
-            )
-            grown = cv2.bitwise_and(grown, solid)
-            design_alpha = np.maximum(
-                design_alpha, grown.astype(np.float32) / 255.0 * 0.98
-            )
-            # If wrap mask is solid but warp missed the rim, seed alpha from mask.
-            seed = (solid > 0) & (opaque > 0)
-            if np.any(seed):
+        # Full-case skin: fill wrap holes with the loaded design (the navy
+        # cover reached every corner; the print must too). RGB first — boosting
+        # alpha over empty pixels painted the navy/black corner ring.
+        solid = mask > 0.50
+        opaque = design_alpha > 0.35
+        miss = solid & ~opaque
+        if np.any(miss) and np.any(opaque):
+            wgt = opaque.astype(np.float32)
+            den = cv2.GaussianBlur(wgt, (0, 0), sigmaX=2.2)
+            den = np.maximum(den, 1e-4)
+            filled = miss & (den > 0.10)
+            if np.any(filled):
+                for c in range(3):
+                    ch = design[:, :, c]
+                    num = cv2.GaussianBlur(ch * wgt, (0, 0), sigmaX=2.2)
+                    design[:, :, c] = np.where(filled, num / den, ch)
                 design_alpha = np.where(
-                    (solid > 0) & (design_alpha < 0.90),
-                    np.maximum(design_alpha, mask * 0.97),
-                    design_alpha,
+                    filled, np.maximum(design_alpha, mask), design_alpha
                 )
-            # Extend RGB into the fringe from nearby opaque design pixels.
-            miss = (grown > 0) & (opaque == 0)
-            if interior_core is not None:
-                miss = miss & interior_core
-            if np.any(miss):
-                for c in range(3):
-                    ch = design[:, :, c]
-                    blur = cv2.GaussianBlur(ch, (0, 0), sigmaX=1.4)
-                    ch = np.where(miss, blur, ch)
-                    design[:, :, c] = ch
-            miss2 = (solid > 0) & (opaque == 0) & (design_alpha > 0.5)
-            if interior_core is not None:
-                miss2 = miss2 & interior_core
-            if np.any(miss2):
-                for c in range(3):
-                    ch = design[:, :, c]
-                    blur = cv2.GaussianBlur(ch, (0, 0), sigmaX=1.6)
-                    ch = np.where(miss2, blur, ch)
-                    design[:, :, c] = ch
 
         # Hardware cutouts: full user exclusion (nothing inside the cutout).
         # Camera bump is a raised RIDGE on the border only — never fills inside.
@@ -7120,9 +9064,18 @@ class Compositor:
                 )
                 excl_for_holes = excl_f * (1.0 - release)
             hole_w = self._hard_hole_weight(excl_for_holes)
+            # Buttons are a separate layer — never punch them as camera holes.
             if btn_cov is not None and float(np.max(btn_cov)) > 0.05:
-                # Camera hole AA rims must not shave the bezel button masks.
                 hole_w = hole_w * (1.0 - np.clip(btn_cov, 0.0, 1.0))
+            if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
+                tmh = tip_vm
+                if tmh.shape[:2] != (h, w):
+                    tmh = cv2.resize(
+                        tip_vm.astype(np.uint8),
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                hole_w = hole_w * (1.0 - (tmh > 127).astype(np.float32))
             mask = mask * (1.0 - hole_w)
 
         material = self._resolve_material(s)
@@ -7130,17 +9083,9 @@ class Compositor:
         # Opaque covers fully hide phone-body graphics (MagSafe, logo) under
         # the print. Transparent materials keep natural show-through.
         if material.opacity >= 0.90 and opacity >= 0.90:
-            content = np.clip(design_alpha, 0.0, 1.0)
-            solid = np.clip(mask, 0.0, 1.0)
-            solid = np.where(solid > 0.90, np.maximum(solid, 0.96), solid)
-            boosted = np.clip(content * 1.12, 0.0, 1.0)
-            # Opaque wrap: wherever the phone face is covered by wrap mask and
-            # the design has any ink nearby, keep the cover opaque to the rim.
-            alpha = np.clip(solid * boosted * opacity, 0.0, 1.0)
+            ink = design_alpha > 0.15
             alpha = np.where(
-                (solid > 0.90) & (boosted > 0.12),
-                np.maximum(alpha, solid * 0.96),
-                alpha,
+                ink, np.clip(mask * opacity, 0.0, 1.0), 0.0
             )
         else:
             alpha = design_alpha * mask * opacity
@@ -7159,14 +9104,33 @@ class Compositor:
         # the body stabilize path and speckled the left outer edge.
 
         # 3. Colour and detail adjustments on the design only.
+        s = dict(s)
+        # Leftover leather/matte sliders recolour the loaded photo (hue,
+        # tone-match to the black body, unsharp, grain). Keep the print as
+        # the artwork; wrap geometry is unchanged.
+        for key in (
+            "hue", "tone_match", "sharpness", "clarity", "blur", "grain",
+            "contrast", "texture_strength", "micro_disp",
+            "reflection_strength", "shadow_strength", "rim_bevel",
+            "ao_strength", "normal_lighting", "vignette",
+            "lighting_reflection", "lighting_highlight",
+        ):
+            s[key] = 0.0
+        from dataclasses import replace as _dc_replace
+        material = _dc_replace(
+            material,
+            texture_kind="none",
+            texture_strength=0.0,
+            grain=0.0,
+            micro_blur=0.0,
+            reflection=0.0,
+            highlight=0.0,
+            shadow_softness=0.0,
+        )
         design = ImageFilters.apply_adjustments(design, s)
 
-        # Kill affine warp streaks along cutout arcs and outer rounded corners
-        # before material grain / gloss amplifies them into visible tearing.
-        if excl_f is not None or float(np.max(wrap_mask)) > 0.05:
-            design = MaterialRenderingEngine.stabilize_wrap_texture(
-                design, wrap_mask, excl_f
-            )
+        # Do not re-smear the wrap along the contour — that was compensating
+        # for per-triangle warpAffine tearing and corrupted photos/gradients.
 
         tone_match = float(s.get('tone_match', 0.0)) / 100.0
         if tone_match > 0:
@@ -7175,20 +9139,13 @@ class Compositor:
                 design, phone, mask, min(tone_match, 0.35)
             )
 
-        # 4. Material Rendering Engine — surface texture, reflections,
-        # highlights, body shadows, edge rim, and contact shadow map.
+        # Do not shade a Matte/Silicon case on top of the loaded artwork.
+        # That pass painted the hardcoded navy/dark wrap the user sees.
         lighting = LIGHTING.get(self.lighting_name)
-        design, contact = self.material_engine.apply(
-            design, phone, mask,
-            material=material,
-            lighting=lighting,
-            settings=s,
-            exclusion=excl_f,
-        )
+        contact = None
 
-        # 4b. Camera bump ridge DISABLED — the raised lip looked blocky /
-        # "inner messed up" on dark wraps. Keep a clean hard cutout only.
-        if False and bump_module is not None:
+        # 4b. Camera bump ridge on the wrap, just outside the punched hole.
+        if bump_module is not None:
             design, mask = MaterialRenderingEngine.apply_camera_bump(
                 design,
                 mask,
@@ -7213,20 +9170,23 @@ class Compositor:
             else:
                 alpha = design_alpha * mask * opacity
 
-        # Seal wrap right up to the cutout — kill light-leak fringe between
-        # cover and camera island (inner polish). Never paints inside the hole.
+        # Seal wrap right up to the editable cutout contour; punch only the
+        # inset lens opening so chrome stays under wrap (manufactured lip).
         if hole_w is not None and float(np.max(hole_w)) > 0.05:
             hw = hole_w
             if hw.shape[:2] != (h, w):
                 hw = cv2.resize(hw, (w, h), interpolation=cv2.INTER_LINEAR)
             hw = np.clip(hw.astype(np.float32), 0.0, 1.0)
-            hole_bin = (hw > 0.45).astype(np.uint8)
-            if np.count_nonzero(hole_bin) >= 16:
+            seal_src = excl_f if excl_f is not None else hw
+            if seal_src.shape[:2] != (h, w):
+                seal_src = cv2.resize(seal_src, (w, h), interpolation=cv2.INTER_LINEAR)
+            seal_src = np.clip(seal_src.astype(np.float32), 0.0, 1.0)
+            solid = (seal_src >= 0.50).astype(np.uint8)
+            if np.count_nonzero(solid) >= 16:
                 dist_out = cv2.distanceTransform(
-                    (1 - hole_bin).astype(np.uint8), cv2.DIST_L2, 5
+                    (1 - solid), cv2.DIST_L2, 5
                 ).astype(np.float32)
-                # 1–2px wrap band just outside the hole: full opacity.
-                seal = (hw < 0.20) & (dist_out <= 2.0) & (dist_out > 0.0)
+                seal = (seal_src < 0.40) & (dist_out <= 1.45) & (dist_out > 0.0)
                 if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
                     tclip = tip_vm > 127
                     if tclip.shape[:2] != (h, w):
@@ -7240,9 +9200,11 @@ class Compositor:
                         )
                     seal = seal & ~tclip
                 if np.any(seal):
-                    alpha = np.where(seal, np.maximum(alpha, 0.97), alpha)
-                    mask = np.where(seal, np.maximum(mask, 0.97), mask)
-                # Inside hole stays punched.
+                    seal = seal & (design_alpha > 0.35)
+                    if np.any(seal):
+                        alpha = np.where(seal, np.maximum(alpha, 0.97), alpha)
+                        mask = np.where(seal, np.maximum(mask, 0.97), mask)
+                # Soft inset punch — chrome ring keeps wrap coverage.
                 alpha = alpha * (1.0 - hw)
                 mask = mask * (1.0 - hw)
 
@@ -7390,18 +9352,18 @@ class Compositor:
                         )
                         > 127
                     )
-                body_on = np.zeros((h, w), dtype=bool)
-                if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
-                    pm_t = phone_mask
-                    if pm_t.shape[:2] != (h, w):
-                        pm_t = cv2.resize(
-                            pm_t, (w, h), interpolation=cv2.INTER_NEAREST
-                        )
-                    body_on = pm_t > 127
-                protr = vmask & ~body_on
-                if np.any(protr):
-                    alpha = np.where(protr, 0.0, alpha)
-                    mask = np.where(protr, 0.0, mask)
+                # Gate is body-only. Do not force opaque wrap on keys that
+                # still have no print ink — that painted black holes.
+                ink = design_alpha > 0.20
+                if ink.shape[:2] != vmask.shape[:2]:
+                    ink = cv2.resize(
+                        ink.astype(np.uint8),
+                        (vmask.shape[1], vmask.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ) > 0
+                keep = vmask & ink
+                alpha = np.where(keep, np.maximum(alpha, 0.98), alpha)
+                mask = np.where(keep, np.maximum(mask, 0.98), mask)
         if hole_w is not None:
             hw = hole_w
             if hw.shape[:2] != (h, w):
@@ -7429,6 +9391,7 @@ class Compositor:
                     (corner_w > 0.32)
                     & (g_edge > 0.35)
                     & (alpha < 0.35)
+                    & (design_alpha > 0.25)
                 )
             if hole_w is not None:
                 hw = hole_w
@@ -7466,13 +9429,13 @@ class Compositor:
                     mid_band = np.clip(corner_w, 0.0, 1.0) < 0.16
                 soft_edge = soft_edge & (
                     (~mid_band & (dist_in < 4.0))
-                    | (mid_band & (dist_in < 1.0))
+                    | (mid_band & (dist_in < 1.5))
                 )
-                # Allow at most ~1.5 px outside the photo rim for AA.
-                corner_gap = corner_gap & (dist_out <= 1.5) & (dist_in < 6.0)
+                # Allow at most ~0.65 px outside the photo rim for AA.
+                corner_gap = corner_gap & (dist_out <= 0.65) & (dist_in < 6.0)
                 # Mid-side body must stay fully opaque wrap (no soft alpha wash).
                 solid_mid = (
-                    mid_band & (pm_e > 127) & (dist_in >= 1.0)
+                    mid_band & (pm_e > 127) & (dist_in >= 1.5)
                 )
                 if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
                     tclip = tip_vm > 127
@@ -7485,7 +9448,9 @@ class Compositor:
                             )
                             > 127
                         )
-                    solid_mid = solid_mid & ~tclip
+                    # Only outward protrusions leave the body gate — tip pixels
+                    # that sit on the body wall must keep wrap (no black cut).
+                    solid_mid = solid_mid & ~(tclip & ~(pm_e > 127))
                 # Exclude solid mid-body from soft rim rewrite.
                 if np.any(solid_mid):
                     soft_edge = soft_edge & ~solid_mid
@@ -7495,8 +9460,19 @@ class Compositor:
                 rim_fix = rim_fix & (bf_guard < 0.25)
             if np.any(rim_fix):
                 # Replace binary stairs with float gate coverage on the rim.
-                alpha = np.where(rim_fix, g_edge, alpha)
-                mask = np.where(rim_fix, np.minimum(mask, g_edge), mask)
+                # For pixels inside the body silhouette, keep alpha near-opaque
+                # to prevent white bleed-through; AA lives outside only.
+                pm_rf = phone_mask
+                if pm_rf is not None and pm_rf.shape[:2] != (h, w):
+                    pm_rf = cv2.resize(pm_rf, (w, h), interpolation=cv2.INTER_NEAREST)
+                on_body_rf = np.zeros((h, w), dtype=bool)
+                if pm_rf is not None and np.count_nonzero(pm_rf) >= 64:
+                    on_body_rf = pm_rf > 127
+                alpha_target = np.where(
+                    on_body_rf, np.maximum(g_edge, 0.995), g_edge
+                )
+                alpha = np.where(rim_fix, alpha_target, alpha)
+                mask = np.where(rim_fix, np.minimum(mask, alpha_target), mask)
                 ink = alpha > 0.85
                 if np.any(ink):
                     for c in range(3):
@@ -7516,13 +9492,10 @@ class Compositor:
                     pm_e = cv2.resize(
                         pm_e, (w, h), interpolation=cv2.INTER_NEAREST
                     )
-                dist_in = cv2.distanceTransform(
-                    (pm_e > 127).astype(np.uint8), cv2.DIST_L2, 5
-                ).astype(np.float32)
-                mid_band = np.ones((h, w), dtype=bool)
-                if corner_w is not None and corner_w.shape[:2] == (h, w):
-                    mid_band = np.clip(corner_w, 0.0, 1.0) < 0.16
-                solid_mid = mid_band & (pm_e > 127) & (dist_in >= 1.0)
+                # Every body pixel — including the outermost column and
+                # corners — must stay wrap-opaque. Partial alpha here is
+                # studio white mixed into the silhouette.
+                solid_mid = pm_e > 127
                 if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
                     tclip = tip_vm > 127
                     if tclip.shape[:2] != (h, w):
@@ -7534,10 +9507,52 @@ class Compositor:
                             )
                             > 127
                         )
-                    solid_mid = solid_mid & ~tclip
+                    solid_mid = solid_mid & ~(tclip & ~(pm_e > 127))
+                if hole_w is not None:
+                    hw_sm = hole_w
+                    if hw_sm.shape[:2] != (h, w):
+                        hw_sm = cv2.resize(
+                            hw_sm, (w, h), interpolation=cv2.INTER_LINEAR
+                        )
+                    solid_mid = solid_mid & (np.clip(hw_sm, 0.0, 1.0) < 0.18)
                 if np.any(solid_mid):
-                    alpha = np.where(solid_mid, np.maximum(alpha, 0.97), alpha)
-                    mask = np.where(solid_mid, np.maximum(mask, 0.97), mask)
+                    # UV mesh often misses the outer 1–3px; still force opaque
+                    # body coverage and pull design RGB from nearby print.
+                    need_rgb = solid_mid & (design_alpha < 0.35)
+                    if np.any(need_rgb):
+                        ink = (design_alpha > 0.35) & solid_mid
+                        if np.any(ink):
+                            ink_f = ink.astype(np.float32)
+                            wt = cv2.GaussianBlur(ink_f, (0, 0), 2.0)
+                            k = np.ones((7, 7), np.uint8)
+                            for ch in range(3):
+                                src = np.where(
+                                    ink, design[:, :, ch], 0.0
+                                ).astype(np.float32)
+                                blur = cv2.GaussianBlur(src, (0, 0), 2.0)
+                                dil = cv2.dilate(src, k)
+                                dil_w = cv2.dilate(ink_f, k)
+                                fill = np.where(
+                                    wt > 1e-3,
+                                    blur / np.maximum(wt, 1e-3),
+                                    np.where(
+                                        dil_w > 1e-3,
+                                        dil / np.maximum(dil_w, 1e-3),
+                                        design[:, :, ch],
+                                    ),
+                                )
+                                design[:, :, ch] = np.where(
+                                    need_rgb, fill, design[:, :, ch]
+                                )
+                            design_alpha = np.where(
+                                need_rgb, np.maximum(design_alpha, 0.92), design_alpha
+                            )
+                    alpha = np.where(
+                        solid_mid, np.maximum(alpha, 0.995), alpha
+                    )
+                    mask = np.where(
+                        solid_mid, np.maximum(mask, 0.995), mask
+                    )
 
         # True outward tips stay reserved — body rim AA must not own them.
         paint_src = tip_vm
@@ -7560,10 +9575,7 @@ class Compositor:
                         pm_t, (w, h), interpolation=cv2.INTER_NEAREST
                     )
                 body_on = pm_t > 127
-            protr = vmask & ~body_on
-            if np.any(protr):
-                alpha = np.where(protr, 0.0, alpha)
-                mask = np.where(protr, 0.0, mask)
+            # Keep wrap on the keys — zeroing them showed the original phone.
 
         # Re-seal camera cutout AFTER rim soft rewrites so outer polish
         # cannot reopen a light-leak fringe beside the island.
@@ -7572,12 +9584,12 @@ class Compositor:
             if hw.shape[:2] != (h, w):
                 hw = cv2.resize(hw, (w, h), interpolation=cv2.INTER_LINEAR)
             hw = np.clip(hw.astype(np.float32), 0.0, 1.0)
-            hole_bin = (hw > 0.45).astype(np.uint8)
-            if np.count_nonzero(hole_bin) >= 16:
+            solid = (hw >= 0.50).astype(np.uint8)
+            if np.count_nonzero(solid) >= 16:
                 dist_out = cv2.distanceTransform(
-                    (1 - hole_bin).astype(np.uint8), cv2.DIST_L2, 5
+                    (1 - solid), cv2.DIST_L2, 5
                 ).astype(np.float32)
-                seal = (hw < 0.18) & (dist_out <= 2.25) & (dist_out > 0.0)
+                seal = (hw < 0.35) & (dist_out <= 1.35) & (dist_out > 0.0)
                 if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
                     tclip = tip_vm > 127
                     if tclip.shape[:2] != (h, w):
@@ -7591,20 +9603,91 @@ class Compositor:
                         )
                     seal = seal & ~tclip
                 if np.any(seal):
-                    alpha = np.where(seal, np.maximum(alpha, 0.98), alpha)
-                    mask = np.where(seal, np.maximum(mask, 0.98), mask)
+                    seal = seal & (design_alpha > 0.35)
+                    if np.any(seal):
+                        alpha = np.where(seal, np.maximum(alpha, 0.98), alpha)
+                        mask = np.where(seal, np.maximum(mask, 0.98), mask)
             alpha = alpha * (1.0 - hw)
             mask = mask * (1.0 - hw)
 
-        # Drop wrap painted onto pure studio white. Protect validated tips.
+        # Drop wrap painted onto pure studio white. Protect validated tips
+        # AND the photo-silhouette body (bright rim is border-connected to
+        # the card but must stay wrap-covered).
         tip_protect = None
         if paint_src is not None and np.count_nonzero(paint_src) >= 4:
             tip_protect = (paint_src > 127).astype(np.uint8) * 255
+        body_protect = tip_protect
+        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+            pm_p = phone_mask
+            if pm_p.shape[:2] != (h, w):
+                pm_p = cv2.resize(
+                    pm_p, (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            if body_protect is None:
+                body_protect = (pm_p > 127).astype(np.uint8) * 255
+            else:
+                body_protect = np.maximum(
+                    body_protect, (pm_p > 127).astype(np.uint8) * 255
+                )
         alpha, mask = self._clip_studio_plate_wrap(
-            alpha, mask, phone_bgr, protect=tip_protect
+            alpha, mask, phone_bgr, protect=body_protect
         )
 
+        # Hard clip: wrap alpha/mask never extend past the photo silhouette
+        # (+ sub-pixel AA). Prevents gate fringe from painting outside the phone.
+        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+            from .cover_surface import CoverSurfaceEngine
+
+            pm = phone_mask
+            if pm.shape[:2] != (h, w):
+                pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
+            on = pm > 127
+            if phone_bgr is not None:
+                pb = phone_bgr
+                if pb.shape[:2] != (h, w):
+                    pb = cv2.resize(pb, (w, h), interpolation=cv2.INTER_LINEAR)
+                sil = CoverSurfaceEngine.detect_phone_wrap_silhouette(
+                    pb, cover_quad=None
+                )
+                if sil is not None and np.count_nonzero(sil) >= 64:
+                    if sil.shape[:2] != (h, w):
+                        sil = cv2.resize(
+                            sil, (w, h), interpolation=cv2.INTER_NEAREST
+                        )
+                    on = sil > 127
+            dist_out = cv2.distanceTransform(
+                (~on).astype(np.uint8), cv2.DIST_L2, 5
+            ).astype(np.float32)
+            allow = on | (dist_out <= 0.55)
+            if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
+                tclip = tip_vm > 127
+                if tclip.shape[:2] != (h, w):
+                    tclip = (
+                        cv2.resize(
+                            tip_vm.astype(np.uint8),
+                            (w, h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        > 127
+                    )
+                allow = allow | tclip
+            alpha = np.where(allow, alpha, 0.0)
+            mask = np.where(allow, mask, 0.0)
+
         # 5. Blend and finish (float until the last step).
+        # Extend design RGB into partially-transparent edge pixels to prevent
+        # white studio bleed-through at the AA boundary.
+        edge_band = (alpha > 0.01) & (alpha < 0.95)
+        if np.any(edge_band):
+            opaque_src = (alpha >= 0.95).astype(np.float32)
+            weight = cv2.GaussianBlur(opaque_src, (0, 0), sigmaX=1.8)
+            for c in range(3):
+                ch = design[:, :, c]
+                seeded = ch * opaque_src
+                blurred = cv2.GaussianBlur(seeded, (0, 0), sigmaX=1.8)
+                filled = blurred / np.maximum(weight, 1e-4)
+                design[:, :, c] = np.where(edge_band, filled, ch)
+
         alpha3 = alpha[:, :, np.newaxis]
         result = design * alpha3 + phone_blend * (1.0 - alpha3)
 
@@ -7666,17 +9749,25 @@ class Compositor:
                     pm_fin, (w, h), interpolation=cv2.INTER_NEAREST
                 )
             opaque_rim = np.zeros((h, w), dtype=bool)
+            washed_rim = np.zeros((h, w), dtype=bool)
             if pm_fin is not None and np.count_nonzero(pm_fin) >= 64:
                 dist_in = cv2.distanceTransform(
                     (pm_fin > 127).astype(np.uint8), cv2.DIST_L2, 5
                 )
                 opaque_rim = (
                     (pm_fin > 127)
-                    & (dist_in <= 2.25)
-                    & (gray_f < 12.0)
+                    & (dist_in <= 3.5)
+                    & (gray_f < 14.0)
                     & ~tip_bool
                 )
-            crush_mask = (rim_band & (gray_f < 12.0)) | opaque_rim
+                washed_rim = (
+                    (pm_fin > 127)
+                    & (dist_in <= 3.0)
+                    & (gray_f > 70.0)
+                    & ~tip_bool
+                )
+            crush_mask = (rim_band & (gray_f < 14.0)) | opaque_rim
+            wash_keep = washed_rim.copy()
             if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
                 from .mesh import _corner_proximity_map
 
@@ -7687,13 +9778,21 @@ class Compositor:
                     )
                 ys_cr, xs_cr = np.where(pm_cr > 127)
                 if xs_cr.size >= 16:
+                    st_cr = Compositor._silhouette_wall_state(
+                        (pm_cr > 127).astype(np.uint8)
+                    )
+                    cf_cr = (
+                        float(st_cr["corner_frac"])
+                        if st_cr is not None
+                        else 0.22
+                    )
                     cw_f = _corner_proximity_map(
                         (h, w),
                         x0=float(xs_cr.min()),
                         y0=float(ys_cr.min()),
                         x1=float(xs_cr.max()),
                         y1=float(ys_cr.max()),
-                        corner_frac=0.22,
+                        corner_frac=cf_cr,
                     )
                     crush_mask = crush_mask & (
                         np.clip(cw_f, 0.0, 1.0) < 0.30
@@ -7707,11 +9806,17 @@ class Compositor:
                         interpolation=cv2.INTER_LINEAR,
                     )
                 crush_mask = crush_mask & (np.clip(cw_f, 0.0, 1.0) < 0.30)
+            crush_mask = crush_mask | wash_keep
             # Never touch camera cutout neighborhood (inner must stay clean).
             if hole_w is not None and float(np.max(hole_w)) > 0.05:
                 cut_g = self._cutout_guard(hole_w, (h, w), margin_px=6.0)
                 if cut_g is not None:
                     crush_mask = crush_mask & ~cut_g
+            _, crush_prot = Compositor._sides_with_buttons(
+                tip_vm, phone_mask, (h, w)
+            )
+            if np.any(crush_prot):
+                crush_mask = crush_mask & ~crush_prot
             if np.any(crush_mask):
                 plate = phone_bgr.astype(np.float32)
                 pl = plate.mean(axis=2)
@@ -7765,23 +9870,32 @@ class Compositor:
                         if src_xy is not None:
                             break
                     gg = float(g_fin[y, x])
+                    on_body_px = pm_fin is not None and int(pm_fin[y, x]) > 127
                     if src_xy is None:
-                        src_rgb = wrap_rgb
-                    else:
-                        src_rgb = out_f[src_xy[0], src_xy[1]]
-                    if gg < 0.92:
+                        if on_body_px:
+                            out_f[y, x] = wrap_rgb
+                        continue
+                    src_rgb = out_f[src_xy[0], src_xy[1]]
+                    # Body pixels keep wrap RGB. Mixing studio here is the
+                    # remaining light fringe along the silhouette.
+                    if on_body_px:
+                        out_f[y, x] = src_rgb
+                    elif gg < 0.92:
                         out_f[y, x] = src_rgb * gg + studio_rgb * (1.0 - gg)
                     else:
                         out_f[y, x] = src_rgb
                 output = np.clip(np.round(out_f), 0, 255).astype(np.uint8)
 
         # Button wrap as its own top layer (above body). Strict tip mask only.
+        # Sample the warped design — not the composited rim, which still
+        # shows original bezel where tip alpha was reserved.
         output = self._composite_side_button_layer(
             output,
             phone_bgr,
             tip_vm,
             phone_mask=phone_mask,
             tip_cov=bf_guard,
+            wrap_src=design,
         )
 
         # Final perimeter chip kill AFTER tip layer — outside body|tips only.
@@ -7792,6 +9906,17 @@ class Compositor:
                     pm_c, (w, h), interpolation=cv2.INTER_NEAREST
                 )
             keep_c = pm_c > 127
+            tip_src = None
+            stem_keep = self._side_button_stem_bridge_mask
+            if stem_keep is not None and np.count_nonzero(stem_keep) >= 4:
+                sk = stem_keep
+                if sk.shape[:2] != (h, w):
+                    sk = cv2.resize(
+                        stem_keep.astype(np.uint8),
+                        (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                keep_c = keep_c | (sk > 127)
             if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
                 tm = tip_vm
                 if tm.shape[:2] != (h, w):
@@ -7801,6 +9926,33 @@ class Compositor:
                         interpolation=cv2.INTER_NEAREST,
                     )
                 keep_c = keep_c | (tm > 127)
+                tip_src = tm
+            keep_c = (
+                cv2.dilate(
+                    keep_c.astype(np.uint8) * 255,
+                    np.ones((3, 3), np.uint8),
+                    iterations=1,
+                )
+                > 0
+            )
+            from .mesh import _corner_proximity_map
+
+            mid_c = np.ones((h, w), dtype=bool)
+            ys_k, xs_k = np.where(pm_c > 127)
+            state_c = Compositor._silhouette_wall_state(
+                (pm_c > 127).astype(np.uint8)
+            )
+            cf_c = float(state_c["corner_frac"]) if state_c is not None else 0.22
+            if xs_k.size >= 16:
+                cw_c = _corner_proximity_map(
+                    (h, w),
+                    x0=float(xs_k.min()),
+                    y0=float(ys_k.min()),
+                    x1=float(xs_k.max()),
+                    y1=float(ys_k.max()),
+                    corner_frac=cf_c,
+                )
+                mid_c = np.clip(cw_c, 0.0, 1.0) < 0.28
             keep_halo = (
                 cv2.dilate(
                     keep_c.astype(np.uint8) * 255,
@@ -7823,28 +9975,476 @@ class Compositor:
             dist_out = cv2.distanceTransform(
                 (1 - keep_c.astype(np.uint8)), cv2.DIST_L2, 5
             )
-            chips = (~keep_halo) & (dist_out <= 2.5) & (gray_c < 160)
+            # Mid-straight: no 1px halo (that kept right-edge ticks). Corners
+            # keep a 1px halo so rounded AA is not crushed.
+            chips = (
+                ((mid_c & ~keep_c) | ((~mid_c) & ~keep_halo))
+                & (dist_out <= 2.5)
+                & (gray_c < 200)
+            )
+            wall_chips = np.zeros((h, w), dtype=bool)
+            if state_c is not None:
+                tip_c = keep_c & ~(pm_c > 127)
+                _btn_sides_c, btn_prot_c = Compositor._sides_with_buttons(
+                    tip_src,
+                    pm_c,
+                    (h, w),
+                )
+                # Clip nubs between keys; dilated tip contours stay protected.
+                wall_chips = Compositor._straight_wall_nub_mask(
+                    state_c,
+                    (h, w),
+                    eps=0.45,
+                    protect=btn_prot_c,
+                )
+                wall_chips = (
+                    wall_chips
+                    & ~tip_c
+                    & (dist_out <= 3.0)
+                    & (gray_c < 230)
+                )
+                if np.any(btn_prot_c):
+                    wall_chips = wall_chips & ~btn_prot_c
+                    chips = chips & ~btn_prot_c
+                chips = chips | wall_chips
             if np.any(chips):
                 output = output.copy()
                 output[chips] = studio_bgr
 
-        # Hard guarantee: opaque hole cores stay pixel-identical to the phone.
-        # Threshold high so the soft SDF AA rim is not crushed into stairs.
-        if exclusion_mask is not None:
-            excl = exclusion_mask
-            if excl.shape[:2] != (h, w):
-                excl = cv2.resize(excl, (w, h), interpolation=cv2.INTER_LINEAR)
-            hard_core = excl >= 238
-            btn_cov = self._side_button_wrap_cov
-            if btn_cov is not None and float(np.max(btn_cov)) > 0.05:
-                bf = btn_cov
-                if bf.shape[:2] != (h, w):
-                    bf = cv2.resize(bf, (w, h), interpolation=cv2.INTER_LINEAR)
-                hard_core = hard_core & (bf < 0.35)
-            if np.any(hard_core):
-                output[hard_core] = phone_bgr[hard_core]
+        # Soft phone show-through for cutouts (float AA — no binary paste stairs).
+        output = self._soft_phone_through_cutouts(
+            output, phone_bgr, exclusion_mask, tip_mask=tip_vm
+        )
+        # Manufactured plastic lip — covers silver AA jaggies, follows hole shape.
+        output = self._apply_manufactured_cutout_rim(
+            output, phone_bgr, exclusion_mask, tip_mask=tip_vm
+        )
+        # Rim paints a thin inward lip; re-assert deep cutout interiors are
+        # phone hardware so wrap cannot remain as blobs on the module.
+        output = self._soft_phone_through_cutouts(
+            output, phone_bgr, exclusion_mask, tip_mask=tip_vm
+        )
+
+        output = self._purge_exterior_wrap(
+            output,
+            phone_bgr,
+            phone_mask,
+            tip_mask=tip_vm,
+            aa_px=0.55,
+            exclusion_mask=exclusion_mask,
+        )
+        # Photo-silhouette authority: seal under-wrap, kill over-wrap fringe,
+        # clean corner AA. Always prefer the wrap body built from the photo
+        # (not a stale/larger composite phone_mask).
+        sil_mask = phone_mask
+        if (
+            self._phone_wrap_mask is not None
+            and np.count_nonzero(self._phone_wrap_mask) >= 64
+        ):
+            sil_mask = self._scaled_mask(self._phone_wrap_mask, (h, w))
+        output = self._finalize_body_boundary_raster(
+            output,
+            phone_bgr,
+            sil_mask,
+            tip_mask=tip_vm,
+            exclusion_mask=exclusion_mask,
+        )
+        output = self._apply_premium_rim_finish(
+            output,
+            phone_bgr,
+            sil_mask,
+            hole_w=hole_w,
+            tip_mask=tip_vm,
+        )
 
         return output
+
+    @staticmethod
+    def _finalize_body_boundary_raster(
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        phone_mask: Optional[np.ndarray],
+        tip_mask: Optional[np.ndarray] = None,
+        exclusion_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Final body-boundary seal: photo silhouette is the only wrap limit.
+
+        - Zero over-wrap outside the silhouette (+ tips + cutout protect).
+        - Zero under-wrap on the visible body face (seal from inward ink).
+        - Soft coverage AA only on the exterior ~1px band.
+        Does not touch camera/cutout interiors.
+        """
+        if (
+            output is None
+            or phone_bgr is None
+            or phone_mask is None
+            or np.count_nonzero(phone_mask) < 64
+        ):
+            return output
+        from .mesh import AdaptiveMeshBuilder, _fill_closed_polyline_aa
+
+        h, w = output.shape[:2]
+        phone = phone_bgr
+        if phone.shape[:2] != (h, w):
+            phone = cv2.resize(phone, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # phone_mask is already the photo wrap body at render size (built
+        # upstream from silhouette + tip split). Re-running
+        # detect_phone_wrap_silhouette here cost ~4s per preview and was only
+        # needed when we wrongly clipped to a shrunken detector result.
+        pm = phone_mask
+        if pm.shape[:2] != (h, w):
+            pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
+        body = (pm > 127).astype(np.uint8)
+
+        tip = np.zeros((h, w), dtype=bool)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm = tip_mask
+            if tm.shape[:2] != (h, w):
+                tm = cv2.resize(
+                    tm.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            tip = tm > 127
+        # Validated tips are lateral side-button protrusions. Never let a
+        # mis-labeled tip island protect wrap at the camera / top bezel.
+        if np.any(tip) and np.any(body > 0):
+            ys_b, xs_b = np.where(body > 0)
+            y_top = float(ys_b.min())
+            x_l = float(xs_b.min())
+            x_r = float(xs_b.max())
+            yy, xx = np.mgrid[0:h, 0:w]
+            lateral = (xx <= x_l + 0.10 * w) | (xx >= x_r - 0.10 * w)
+            below_top = yy >= (y_top + 0.06 * h)
+            tip = tip & lateral & below_top
+        if exclusion_mask is not None and np.count_nonzero(exclusion_mask) >= 16:
+            em0 = exclusion_mask
+            if em0.shape[:2] != (h, w):
+                em0 = cv2.resize(em0, (w, h), interpolation=cv2.INTER_LINEAR)
+            tip = tip & ~(em0 > 64)
+        hole_core = np.zeros((h, w), dtype=bool)
+        cut_protect = np.zeros((h, w), dtype=bool)
+        if exclusion_mask is not None and np.count_nonzero(exclusion_mask) >= 16:
+            em = exclusion_mask
+            if em.shape[:2] != (h, w):
+                em = cv2.resize(em, (w, h), interpolation=cv2.INTER_LINEAR)
+            hole_core = em > 160
+            # Protect only the thin manufactured lip on the BODY, never wrap
+            # that spilled into the hole or past the photo silhouette.
+            lip = cv2.dilate(
+                (em > 64).astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            ) > 0
+            cut_protect = lip & (body > 0) & ~hole_core & ~tip
+
+        # Float coverage from the photo contour (sub-pixel AA, no grow).
+        cov = Compositor._exact_coverage_aa(body * 255, scale=12)
+        pts = AdaptiveMeshBuilder.outer_contour_polyline(body * 255, smooth=False)
+        if pts is not None and pts.shape[0] >= 16:
+            raw_pts = pts.astype(np.float32)
+            sm = AdaptiveMeshBuilder._smooth_closed_polyline(raw_pts, window=5)
+            delta = sm - raw_pts
+            mag = np.linalg.norm(delta, axis=1, keepdims=True)
+            short = float(min(h, w))
+            cap = float(max(0.55, 0.006 * short))
+            pts_s = raw_pts + delta * np.minimum(1.0, cap / np.maximum(mag, 1e-6))
+            poly = _fill_closed_polyline_aa(
+                pts_s, (h, w), scale=12, expand_px=0.0
+            )
+            if poly is not None and float(np.max(poly)) > 0.05:
+                on = body > 0
+                dist_in0 = cv2.distanceTransform(
+                    on.astype(np.uint8), cv2.DIST_L2, 5
+                )
+                cov = np.where(on & (dist_in0 >= 2.0), 1.0, cov)
+                cov = np.where(on, np.maximum(cov, np.minimum(poly, 1.0)), cov)
+                cov = np.where(~on, np.minimum(cov, poly), cov)
+        if np.any(tip):
+            tip_aa = Compositor._exact_coverage_aa(
+                tip.astype(np.uint8) * 255, scale=8
+            )
+            cov = np.maximum(cov, tip_aa)
+        dist_out = cv2.distanceTransform(
+            (1 - (body > 0).astype(np.uint8)), cv2.DIST_L2, 5
+        ).astype(np.float32)
+        cov = np.where(
+            (~(body > 0)) & (~tip) & (dist_out > 0.50),
+            0.0,
+            cov,
+        )
+        cov = np.clip(cov.astype(np.float32), 0.0, 1.0)
+
+        out = output.astype(np.float32)
+        plate = phone.astype(np.float32)
+        diff = np.abs(out - plate).max(axis=2)
+        gray_o = out.mean(axis=2)
+        is_wrap = (diff > 8.0) | ((gray_o < 100.0) & (diff > 3.0))
+        # Never treat punched camera glass as wrap source for rim seal.
+        is_wrap = is_wrap & ~hole_core
+
+        dist_in = cv2.distanceTransform(body, cv2.DIST_L2, 5).astype(np.float32)
+
+        # --- Under-wrap seal on body face (not hole interiors) ---
+        # UV mesh often stops short of the photo silhouette (top bezel, side
+        # chrome). Fill bare plate pixels on the sil face from real wrap ink.
+        excl_zone = np.zeros((h, w), dtype=bool)
+        if exclusion_mask is not None and np.count_nonzero(exclusion_mask) >= 16:
+            em0 = exclusion_mask
+            if em0.shape[:2] != (h, w):
+                em0 = cv2.resize(em0, (w, h), interpolation=cv2.INTER_LINEAR)
+            excl_zone = em0 > 64
+        chroma_o = out.max(axis=2) - out.min(axis=2)
+        # Include mid-gray chrome (AA / soft bezel), not only near-white.
+        bare = (
+            (body > 0)
+            & ~tip
+            & ~hole_core
+            & ~excl_zone
+            & (gray_o > 55.0)
+            & (diff < 28.0)
+        )
+
+        def _good_ink(gray, diff_m, chroma, wrap_m):
+            return (
+                wrap_m
+                & (body > 0)
+                & ~hole_core
+                & ~excl_zone
+                & (gray > 10.0)  # never seed crushed-black fringe
+                & (gray < 130.0)
+                & (diff_m > 8.0)
+                & ((chroma > 4.0) | (gray > 18.0))
+            )
+
+        if np.any(bare):
+            ink = _good_ink(gray_o, diff, chroma_o, is_wrap)
+            if not np.any(ink):
+                ink = (
+                    is_wrap
+                    & (body > 0)
+                    & ~hole_core
+                    & ~excl_zone
+                    & (gray_o > 10.0)
+                )
+            # Fast nearest-ink fill (scipy EDT) — replaces multi-second Python
+            # row/column scans + large dilate passes with identical intent:
+            # every bare chrome pixel takes RGB from the nearest wrap seed.
+            if np.any(ink):
+                from scipy import ndimage as _ndimage
+
+                seed = ink & ~tip
+                if not np.any(seed):
+                    seed = ink
+                _, inds = _ndimage.distance_transform_edt(
+                    ~seed, return_indices=True
+                )
+                src = out[inds[0], inds[1]]
+                if np.any(seed):
+                    out = np.where(bare[:, :, np.newaxis], src, out)
+                    gray_o = out.mean(axis=2)
+                    diff = np.abs(out - plate).max(axis=2)
+                    chroma_o = out.max(axis=2) - out.min(axis=2)
+                    is_wrap = is_wrap | bare
+
+        # --- Over-wrap purge outside silhouette ---
+        keep = (cov > 0.02) | tip
+        over = (~keep) & is_wrap & (dist_out > 0.55)
+        if np.any(over):
+            out = np.where(over[:, :, np.newaxis], plate, out)
+        # Absolute: studio card never carries wrap (even when silhouette halo
+        # marked those pixels as body). White/silver phones stay — they are
+        # not border-connected to the card.
+        phone_f = phone.astype(np.float32)
+        lum_s = phone_f.mean(axis=2)
+        sat_s = phone_f.max(axis=2) - phone_f.min(axis=2)
+        studio = Compositor._border_connected_mask(
+            (lum_s >= 185.0) & (sat_s <= 28.0)
+        )
+        if np.any(studio & ~tip):
+            out = np.where((studio & ~tip)[:, :, np.newaxis], plate, out)
+        # Refresh wrap mask after studio purge for AA / seal steps.
+        gray_o = out.mean(axis=2)
+        diff = np.abs(out - plate).max(axis=2)
+        is_wrap = (diff > 8.0) | ((gray_o < 100.0) & (diff > 3.0))
+        is_wrap = is_wrap & ~hole_core
+
+        # --- Soft coverage AA on exterior band only (wrap RGB, not empty) ---
+        soft = (
+            (cov > 0.04)
+            & (cov < 0.96)
+            & ~(body > 0)
+            & ~tip
+            & ~cut_protect
+            & (dist_out <= 0.55)
+        )
+        if np.any(soft):
+            ink2 = (
+                is_wrap
+                & (body > 0)
+                & (dist_in <= 8.0)
+                & ~hole_core
+                & (out.mean(axis=2) > 10.0)
+            )
+            wrap_rgb = out.copy()
+            if np.any(ink2):
+                ink_f2 = ink2.astype(np.float32)
+                wt2 = cv2.GaussianBlur(ink_f2, (0, 0), 1.2)
+                for ch in range(3):
+                    num = cv2.GaussianBlur(out[:, :, ch] * ink_f2, (0, 0), 1.2)
+                    fill_ch = np.where(
+                        wt2 > 1e-3, num / np.maximum(wt2, 1e-3), out[:, :, ch]
+                    )
+                    wrap_rgb[:, :, ch] = np.where(soft, fill_ch, wrap_rgb[:, :, ch])
+            w3 = cov[:, :, np.newaxis]
+            blended = wrap_rgb * w3 + plate * (1.0 - w3)
+            out = np.where(soft[:, :, np.newaxis], blended, out)
+
+        # Final chrome sweep on outer sil column (small kernel only).
+        gray_o = out.mean(axis=2)
+        diff = np.abs(out - plate).max(axis=2)
+        chroma_o = out.max(axis=2) - out.min(axis=2)
+        rim_need = (
+            (body > 0)
+            & ~tip
+            & ~hole_core
+            & ~excl_zone
+            & (dist_in <= 5.0)
+            & (gray_o > 55.0)
+            & (diff < 28.0)
+        )
+        if np.any(rim_need):
+            ink3 = _good_ink(gray_o, diff, chroma_o, is_wrap)
+            if np.any(ink3):
+                ink_f3 = ink3.astype(np.float32)
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+                dil_w = cv2.dilate(ink_f3, k)
+                for ch in range(3):
+                    src = np.where(ink3, out[:, :, ch], 0.0).astype(np.float32)
+                    dil_ch = cv2.dilate(src, k)
+                    fill_ch = dil_ch / np.maximum(dil_w, 1e-3)
+                    out[:, :, ch] = np.where(
+                        rim_need & (dil_w > 0.05), fill_ch, out[:, :, ch]
+                    )
+                gray_o = out.mean(axis=2)
+
+        # Hard over-wrap kill outside sil (+ tips / cut protect).
+        over2 = (
+            ~(body > 0)
+            & ~tip
+            & ~cut_protect
+            & (dist_out > 0.55)
+            & (
+                (np.abs(out - plate).max(axis=2) > 8.0)
+                | (out.mean(axis=2) < 170.0)
+            )
+        )
+        if np.any(over2):
+            out = np.where(over2[:, :, np.newaxis], plate, out)
+
+        # Last-chance rim: any remaining bright sil edge pixel pulls from
+        # inward wrap (covers the outermost AA row the column fill can miss).
+        gray_o = out.mean(axis=2)
+        diff = np.abs(out - plate).max(axis=2)
+        chroma_o = out.max(axis=2) - out.min(axis=2)
+        edge_bare = (
+            (body > 0)
+            & ~tip
+            & ~hole_core
+            & ~excl_zone
+            & ~studio
+            & (dist_in <= 2.5)
+            & (gray_o > 90.0)
+            & (diff < 30.0)
+        )
+        edge_ink = _good_ink(gray_o, diff, chroma_o, is_wrap)
+        if np.any(edge_bare) and np.any(edge_ink):
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            iw = cv2.dilate(edge_ink.astype(np.float32), k)
+            for ch in range(3):
+                src = np.where(edge_ink, out[:, :, ch], 0.0).astype(np.float32)
+                fill = cv2.dilate(src, k) / np.maximum(iw, 1e-3)
+                out[:, :, ch] = np.where(
+                    edge_bare & (iw > 0.05), fill, out[:, :, ch]
+                )
+
+        # Subtle natural edge gloss — chroma only, silhouette unchanged.
+        rim = (
+            (body > 0)
+            & (dist_in > 0.0)
+            & (dist_in <= 2.0)
+            & ~tip
+            & ~hole_core
+            & ~studio
+        )
+        if np.any(rim):
+            crest = np.sin(np.pi * np.clip(dist_in / 2.0, 0.0, 1.0)).astype(
+                np.float32
+            )
+            crest = crest * rim.astype(np.float32) * 0.035
+            out = np.clip(out * (1.0 + crest[:, :, np.newaxis]), 0.0, 255.0)
+
+        # Final authority: studio card pixels are always the phone plate.
+        if np.any(studio & ~tip):
+            out = np.where((studio & ~tip)[:, :, np.newaxis], plate, out)
+        # Absolute exterior kill — nothing outside the photo body/tips.
+        exterior = ~(body > 0) & ~tip & (dist_out > 0.35)
+        if np.any(exterior):
+            out = np.where(exterior[:, :, np.newaxis], plate, out)
+
+        return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _purge_exterior_wrap(
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        phone_mask: Optional[np.ndarray],
+        tip_mask: Optional[np.ndarray] = None,
+        *,
+        aa_px: float = 0.70,
+        exclusion_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Replace wrap ink outside the photo silhouette + thin AA halo.
+
+        Uses the uploaded phone silhouette (not an inset body wall) so the
+        outer rim is never purged back to silver/white phone chrome.
+        Never touches camera cutout interiors or validated button tips.
+        """
+        del exclusion_mask
+        if output is None or phone_bgr is None or phone_mask is None:
+            return output
+        if np.count_nonzero(phone_mask) < 64:
+            return output
+
+        h, w = output.shape[:2]
+        phone = phone_bgr
+        if phone.shape[:2] != (h, w):
+            phone = cv2.resize(phone, (w, h), interpolation=cv2.INTER_LINEAR)
+        # Reuse the render wrap mask — do not re-detect silhouette (multi-second).
+        pm = phone_mask
+        if pm.shape[:2] != (h, w):
+            pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
+        body = (pm > 127).astype(np.uint8)
+        dist_out = cv2.distanceTransform(
+            (1 - body).astype(np.uint8), cv2.DIST_L2, 5
+        ).astype(np.float32)
+        keep = (body > 0) | (dist_out <= aa_px)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm = tip_mask
+            if tm.shape[:2] != (h, w):
+                tm = cv2.resize(
+                    tm.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            keep = keep | (tm > 127)
+        # Camera interiors are restored by the cutout pass. Do NOT keep a
+        # dilated camera halo — that leaked wrap past the top silhouette.
+        purge = (~keep) & (dist_out > 0)
+        if not np.any(purge):
+            return output
+        out = output.copy()
+        out[purge] = phone[purge]
+        return out
 
     @staticmethod
     def _suppress_mid_side_edge_speckles(
@@ -7878,18 +10478,14 @@ class Compositor:
                     interpolation=cv2.INTER_NEAREST,
                 )
             keep = keep | (tip > 127)
-        # Allow 1px body AA — only kill spills beyond that.
-        keep_u8 = keep.astype(np.uint8) * 255
-        keep_halo = cv2.dilate(
-            keep_u8,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-            iterations=1,
-        ) > 0
+        tip_bool = keep & ~(pm > 127)
         from .mesh import _corner_proximity_map
 
         mid = np.ones((h, w), dtype=bool)
         phone_bin = (pm > 127).astype(np.uint8)
         ys_m, xs_m = np.where(phone_bin > 0)
+        state = Compositor._silhouette_wall_state(phone_bin)
+        cf = float(state["corner_frac"]) if state is not None else 0.22
         if xs_m.size >= 16:
             cw = _corner_proximity_map(
                 (h, w),
@@ -7897,7 +10493,7 @@ class Compositor:
                 y0=float(ys_m.min()),
                 x1=float(xs_m.max()),
                 y1=float(ys_m.max()),
-                corner_frac=0.22,
+                corner_frac=cf,
             )
             mid = np.clip(cw, 0.0, 1.0) < 0.30
         elif corner_w is not None and float(np.max(corner_w)) > 0.05:
@@ -7927,73 +10523,49 @@ class Compositor:
             studio_rgb = np.array([255.0, 255.0, 255.0], dtype=np.float32)
         studio_bgr = np.clip(np.round(studio_rgb), 0, 255).astype(np.uint8)
 
-        leak = mid & ~keep_halo & near_rim & (gray < 120)
+        leak = mid & ~keep & near_rim & (gray < 200) & ~tip_bool & (dist_out > 1.0)
+        _btn_sides, btn_prot = Compositor._sides_with_buttons(
+            tip_mask, pm, (h, w)
+        )
+        if np.any(btn_prot):
+            leak = leak & ~btn_prot
         if np.any(leak):
             out[leak] = studio_bgr
 
         dist_in = cv2.distanceTransform(phone_bin, cv2.DIST_L2, 5)
-        tip_bool = np.zeros((h, w), dtype=bool)
-        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
-            tip_bool = tip_mask > 127
-            if tip_bool.shape[:2] != (h, w):
-                tip_bool = (
-                    cv2.resize(
-                        tip_mask.astype(np.uint8),
-                        (w, h),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    > 127
-                )
 
-        # Isolated right-wall nubs past the robust mid-side wall (compositing
-        # only — body width / wrap geometry stay put).
-        if xs_m.size >= 16:
-            edge_r = np.full(h, np.nan, dtype=np.float32)
-            for y in range(h):
-                row = np.where(phone_bin[y] > 0)[0]
-                if len(row):
-                    edge_r[y] = float(row.max())
-            er = Compositor._fill_1d_edge_profile(edge_r)
-            y0i, y1i = int(ys_m.min()), int(ys_m.max())
-            ph = float(max(y1i - y0i + 1, 1))
-            wall_r = Compositor._straight_wall_reference(
-                er, y0i, y1i, ph, side="right"
+        # Isolated nubs past a STRAIGHT wall only (compositing — geometry stays).
+        # Never shave detected side-button relief.
+        wall_nubs = np.zeros((h, w), dtype=bool)
+        if state is not None:
+            wall_nubs = Compositor._straight_wall_nub_mask(
+                state,
+                (h, w),
+                eps=0.45,
+                protect=btn_prot,
             )
-            xx = np.arange(w, dtype=np.float32)[None, :]
-            right_nub = (
-                mid
-                & (xx > float(wall_r) + 0.60)
-                & near_rim
-                & ~tip_bool
-                & (gray < 220)
-            )
-            if np.any(right_nub):
-                out[right_nub] = studio_bgr
-        else:
-            right_nub = np.zeros((h, w), dtype=bool)
+            wall_nubs = wall_nubs & near_rim & ~tip_bool & (gray < 230) & (dist_out > 1.0)
+            if np.any(wall_nubs):
+                out[wall_nubs] = studio_bgr
 
         # Mid-side soft white fringe (gray≈240) reads as a blurry vertical line.
         # Snap near-white outside body|tips to pure studio; keep corner AA.
+        # Mixed photo-AA leftover on the studio plate (not wrap ink).
+        # Includes corners — that is where the light halo was remaining.
         soft_fringe = (
-            mid
-            & ~keep
+            ~keep
             & near_rim
-            & (gray >= 200)
+            & (gray >= 70)
             & (gray < 252)
             & ~tip_bool
         )
+        if np.any(btn_prot):
+            soft_fringe = soft_fringe & ~btn_prot
         if np.any(soft_fringe):
             out[soft_fringe] = studio_bgr
 
-        rim_grain = (
-            mid
-            & (pm > 127)
-            & (dist_in <= 2.5)
-            & (dist_in >= 0.5)
-            & (gray > 40)
-            & ~tip_bool
-        )
-        if np.any(rim_grain):
+        rim_grain = np.zeros((h, w), dtype=bool)
+        if False:
             ys_g, xs_g = np.where(rim_grain)
             for y, x in zip(ys_g, xs_g):
                 body_xs = np.where(pm[y] > 127)[0]
@@ -8016,12 +10588,45 @@ class Compositor:
                         break
                 if ref is not None:
                     out[y, x] = out[y, ref]
+        # Left-wall light grains — disabled: this resampling introduced
+        # visible thin lines along the left wall perimeter.
+        left_dane = np.zeros((h, w), dtype=bool)
+        # When L-side keys exist, the button layer owns that wall — polishing
+        # here created visible horizontal dashes between keys.
+        if state is not None and float(state.get("s_l", 0.0)) >= 0.45:
+            _btn_sides_dane, _ = Compositor._sides_with_buttons(
+                tip_mask, pm, (h, w)
+            )
+            if "left" in _btn_sides_dane:
+                xl_d = int(xs_m.min()) if xs_m.size else 0
+                left_dane = left_dane & (
+                    np.arange(w, dtype=np.int16)[None, :] > xl_d + 2
+                )
+        if np.any(left_dane):
+            ys_d, xs_d = np.where(left_dane)
+            for y, x in zip(ys_d, xs_d):
+                body_xs = np.where(pm[y] > 127)[0]
+                if len(body_xs) == 0:
+                    continue
+                xl = int(body_xs.min())
+                if x > xl + 2:
+                    continue
+                ref = None
+                for cand in range(xl + 2, min(w, xl + 14)):
+                    gv = int(gray[y, cand])
+                    if 10 <= gv < 50:
+                        ref = cand
+                        break
+                if ref is not None:
+                    out[y, x] = out[y, ref]
         # Outside body|tips: restore studio plate — never paint wrap ink onto
         # the studio fringe (that produced long vertical edge streaks).
         outside_spill = mid & ~keep & near_rim & (gray < 220)
         # Keep tip surfaces; only clear wrap/fringe leaks past the silhouette.
         if tip_bool.any():
             outside_spill = outside_spill & ~tip_bool
+        if np.any(btn_prot):
+            outside_spill = outside_spill & ~btn_prot
         spill_fixed = False
         if np.any(outside_spill):
             # Dark wrap leaks → studio; leave near-white studio AA alone.
@@ -8073,31 +10678,186 @@ class Compositor:
                     if 18 <= int(gray[y, ref]) < 200:
                         out[y, x] = out[y, ref]
                         corner_sealed = True
-        if (
-            np.any(leak)
-            or np.any(rim_grain)
-            or spill_fixed
-            or corner_sealed
-            or np.any(right_nub)
-        ):
-            return out
-        return output
+        # Isolated 1px grains on the mid-side studio fringe.
+        dark_out = mid & ~keep & near_rim & ~tip_bool & (gray < 180)
+        if np.any(dark_out):
+            ncount = cv2.filter2D(
+                dark_out.astype(np.float32),
+                -1,
+                np.ones((3, 3), dtype=np.float32),
+            )
+            isolated = dark_out & (ncount <= 2.5)
+            if np.any(isolated):
+                out[isolated] = studio_bgr
+        # Lift crushed-black 1px bands on straight rims (double-edge / dane).
+        gray2 = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+        crush_line = (
+            mid
+            & (pm > 127)
+            & ~tip_bool
+            & (gray2 < 14)
+            & (dist_in <= 4.0)
+            & (dist_in >= 0.5)
+        )
+        # Skip the button-side outer columns using actual tip pixels
+        # (`> 0`), not `> 127` / side-name lookup — that miss left the
+        # leftover horizontal lines on the bezel.
+        tip_on = np.zeros((h, w), dtype=bool)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm = tip_mask
+            if tm.shape[:2] != (h, w):
+                tm = cv2.resize(
+                    tm.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            tip_on = tm if tm.dtype == bool else tm > 0
+        _sides_cl = set()
+        if np.any(tip_on[:, : max(1, w // 2)]):
+            _sides_cl.add("left")
+        if np.any(tip_on[:, max(1, w // 2) :]):
+            _sides_cl.add("right")
+        if "left" in _sides_cl:
+            xl_cl = int(xs_m.min()) if xs_m.size else 0
+            crush_line[:, : min(w, xl_cl + 4)] = False
+        if np.any(crush_line):
+            ys_l, xs_l = np.where(crush_line)
+            cx = float(xs_m.mean()) if xs_m.size else w * 0.5
+            cy = float(ys_m.mean()) if ys_m.size else h * 0.5
+            for y, x in zip(ys_l, xs_l):
+                if x >= cx:
+                    refs = range(x - 2, max(-1, x - 12), -1)
+                else:
+                    refs = range(x + 2, min(w, x + 12))
+                ref = None
+                for cand in refs:
+                    gv = int(gray2[y, cand])
+                    if 14 <= gv < 50:
+                        ref = cand
+                        break
+                if ref is not None:
+                    out[y, x] = out[y, ref]
+                elif 0 <= int(y - np.sign(y - cy) * 3) < h:
+                    yy2 = int(y - np.sign(y - cy) * 3)
+                    gv = int(gray2[yy2, x])
+                    if 14 <= gv < 50:
+                        out[y, x] = out[yy2, x]
+        return out
+
+    def _exclusion_mask_for_render(
+        self, dest_hw: Tuple[int, int]
+    ) -> Optional[np.ndarray]:
+        """
+        Cutout coverage at render resolution from editable specs.
+
+        Upsampling the native bitmask stairs every circle. Re-paint SDF /
+        densified paths at destination size so zoom stays smooth.
+        """
+        dh, dw = int(dest_hw[0]), int(dest_hw[1])
+        if dh < 8 or dw < 8:
+            return self._scaled_mask(self.exclusion_mask, (dh, dw))
+        specs = list(getattr(self, "cutout_specs", None) or [])
+        if not specs or self.phone_image is None:
+            return self._scaled_mask(self.exclusion_mask, (dh, dw))
+
+        from .device_template import CutoutSpec
+        from .region_detector import HardwareRegionDetector
+
+        sh, sw = self.phone_image.shape[:2]
+        sx = float(dw) / float(max(sw, 1))
+        sy = float(dh) / float(max(sh, 1))
+        s_avg = 0.5 * (sx + sy)
+        mask = np.zeros((dh, dw), dtype=np.uint8)
+        for spec in specs:
+            geom = str(getattr(spec, "geom", "") or "")
+            raw_params = [float(p) for p in (getattr(spec, "params", None) or [])]
+            params = list(raw_params)
+            if geom == "circle" and len(params) >= 3:
+                params = [
+                    params[0] * sx,
+                    params[1] * sy,
+                    params[2] * s_avg,
+                ]
+            elif geom in (
+                "stadium",
+                "rounded_rect",
+                "rectangle",
+                "square",
+                "rounded_square",
+            ) and len(params) >= 5:
+                params = [
+                    params[0] * sx,
+                    params[1] * sy,
+                    params[2] * sx,
+                    params[3] * sy,
+                    params[4] * s_avg,
+                ]
+            # Contour verts are normalised — pixel_contour(dw,dh) is exact.
+            frozen = CutoutSpec(
+                kind=str(getattr(spec, "kind", "other") or "other"),
+                contour=list(getattr(spec, "contour", []) or []),
+                label=str(getattr(spec, "label", "") or ""),
+                geom=geom,
+                params=params,
+                expand_px=0.0,
+                authoritative=bool(getattr(spec, "authoritative", False)),
+                shape_tag=str(getattr(spec, "shape_tag", "") or ""),
+            )
+            try:
+                HardwareRegionDetector.paint_from_cutout_spec(
+                    mask, frozen, dw, dh
+                )
+            except Exception:
+                pts = frozen.pixel_contour(dw, dh)
+                if pts.shape[0] >= 3:
+                    HardwareRegionDetector.paint_cutout_mask(
+                        mask,
+                        pts,
+                        analytical=False,
+                        expand_override=0.0,
+                        force_contour=True,
+                    )
+        if int(np.count_nonzero(mask)) < 16:
+            return self._scaled_mask(self.exclusion_mask, (dh, dw))
+        return mask
 
     @staticmethod
     def _hard_hole_weight(excl_f: np.ndarray) -> np.ndarray:
         """
-        Punch holes with a wider soft AA rim so circles/stadiums stay round.
-
-        Soft exclusion ramps used to leave milky wrap inside openings; a hard
-        binary core still clears the interior while the rim keeps product AA.
+        Float punch for wrap alpha — open the real cutout, leave only a
+        sub-pixel join for the manufactured lip. A large inset left wrap
+        painted on the camera module.
         """
-        excl_f = np.clip(excl_f.astype(np.float32), 0.0, 1.0)
-        # Clear the hole interior aggressively — a high core threshold left a
-        # milky design tongue inside camera/button openings on light phones.
-        rim = np.clip((excl_f - 0.05) / 0.55, 0.0, 1.0)
-        rim = rim * rim * (3.0 - 2.0 * rim)
-        core = (excl_f > 0.55).astype(np.float32)
-        return np.clip(np.maximum(core, rim), 0.0, 1.0)
+        hole = np.clip(excl_f.astype(np.float32), 0.0, 1.0)
+        if float(np.max(hole)) < 0.05:
+            return hole
+        solid = (hole >= 0.50).astype(np.uint8)
+        if int(np.count_nonzero(solid)) < 16:
+            return hole
+        h, w = hole.shape[:2]
+        dist_in = cv2.distanceTransform(solid, cv2.DIST_L2, 5).astype(np.float32)
+        # Per-component inset — global module bbox made flash lips huge.
+        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
+        inset_map = np.zeros((h, w), dtype=np.float32)
+        for lab in range(1, nlab):
+            area = int(stats[lab, cv2.CC_STAT_AREA])
+            if area < 12:
+                continue
+            bw = int(stats[lab, cv2.CC_STAT_WIDTH])
+            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
+            cut_short = float(min(bw, bh))
+            inset = float(
+                np.clip(
+                    max(0.20, cut_short * 0.004, min(h, w) * 0.0003),
+                    0.20,
+                    cut_short * 0.012,
+                )
+            )
+            inset_map[labels == lab] = inset
+        punch = np.clip((dist_in - (inset_map - 0.15)) / 0.55, 0.0, 1.0)
+        punch = np.where(inset_map > 0.0, punch, 0.0)
+        punch = punch * punch * (3.0 - 2.0 * punch)
+        return np.clip(punch, 0.0, 1.0)
 
     def _camera_bump_exclusion_maps(
         self,
@@ -8105,58 +10865,312 @@ class Compositor:
         phone: np.ndarray,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Build cutout module masks for the border ridge (camera + buttons).
-
-        Returns (module, None, None). Punch is always the full user exclusion —
-        nothing from the cover may appear inside the cutout border. The bump
-        ridge is shaded later along each module outline using wrap design.
+        Module coverage for the cutout rim — identical to the punched hole.
         """
-        from .region_detector import HardwareRegionDetector
-
-        h, w = exclusion_mask.shape[:2]
-        contours: List[np.ndarray] = []
-        if self.hardware_contours:
-            contours = list(self.hardware_contours)
-        if not contours:
-            contours = HardwareRegionDetector._smooth_exclusion_contours(
-                exclusion_mask
-            )
-
-        camera_ids = {
-            id(c) for c in self._camera_like_contours(list(contours))
-        }
-        module_u8 = np.zeros((h, w), np.uint8)
-        for contour in contours:
-            pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
-            if len(pts) < 3:
-                continue
-            x1 = float(pts[:, 0].min())
-            y1 = float(pts[:, 1].min())
-            x2 = float(pts[:, 0].max())
-            y2 = float(pts[:, 1].max())
-            bw, bh = x2 - x1, y2 - y1
-            if bw > w * 0.42 or bh > h * 0.38:
-                continue
-            near_side = x1 < w * 0.14 or x2 > w * 0.86
-            if id(contour) in camera_ids:
-                expand = CAMERA_HOLE_EXPAND_PX
-            elif near_side:
-                expand = 3.5
-            else:
-                expand = 2.2
-            HardwareRegionDetector.paint_cutout_mask(
-                module_u8, pts, analytical=True,
-                expand_override=expand,
-            )
-        if int(np.count_nonzero(module_u8)) < 64:
-            return None, None, None
-
-        module = np.clip(module_u8.astype(np.float32) / 255.0, 0.0, 1.0)
+        del phone
         excl_f = np.clip(exclusion_mask.astype(np.float32) / 255.0, 0.0, 1.0)
-        module = module * np.clip(excl_f * 1.05, 0.0, 1.0)
-        if float(np.max(module)) < 0.05:
+        if float(np.max(excl_f)) < 0.05:
             return None, None, None
-        return module, None, None
+        return excl_f, None, None
+
+    def _soft_phone_through_cutouts(
+        self,
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        exclusion_mask: Optional[np.ndarray],
+        tip_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Soft-composite phone hardware through cutouts.
+
+        Uses a sharper coverage curve so the soft AA band stays ~1px (not a
+        thick muddy silver fringe). A manufactured rim pass then covers the
+        wrap↔phone join with wrap-colored plastic lip.
+        """
+        if (
+            output is None
+            or phone_bgr is None
+            or exclusion_mask is None
+            or np.count_nonzero(exclusion_mask) < 16
+        ):
+            return output
+        h, w = output.shape[:2]
+        excl = exclusion_mask
+        if excl.shape[:2] != (h, w):
+            excl = cv2.resize(excl, (w, h), interpolation=cv2.INTER_LINEAR)
+        cov = np.clip(excl.astype(np.float32) / 255.0, 0.0, 1.0)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm = tip_mask
+            if tm.shape[:2] != (h, w):
+                tm = cv2.resize(
+                    tip_mask.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            cov = np.where(tm > 127, 0.0, cov)
+        btn_cov = getattr(self, "_side_button_wrap_cov", None)
+        if btn_cov is not None and float(np.max(btn_cov)) > 0.05:
+            bf = btn_cov
+            if bf.shape[:2] != (h, w):
+                bf = cv2.resize(bf, (w, h), interpolation=cv2.INTER_LINEAR)
+            cov = cov * (1.0 - np.clip(bf, 0.0, 1.0))
+        if float(np.max(cov)) < 0.02:
+            return output
+        # Phone only deep inside — outer chrome stays under wrap/rim.
+        solid0 = (cov >= 0.50).astype(np.uint8)
+        if int(np.count_nonzero(solid0)) >= 16:
+            dist_in = cv2.distanceTransform(solid0, cv2.DIST_L2, 5).astype(
+                np.float32
+            )
+            nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid0, 8)
+            inset_map = np.zeros((h, w), dtype=np.float32)
+            for lab in range(1, nlab):
+                if int(stats[lab, cv2.CC_STAT_AREA]) < 12:
+                    continue
+                cut_short = float(
+                    min(
+                        int(stats[lab, cv2.CC_STAT_WIDTH]),
+                        int(stats[lab, cv2.CC_STAT_HEIGHT]),
+                    )
+                )
+                inset = float(
+                    np.clip(
+                        max(0.31, cut_short * 0.0102, min(h, w) * 0.00054),
+                        0.31,
+                        cut_short * 0.0264,
+                    )
+                )
+                inset_map[labels == lab] = inset
+            # Phone glass only deep inside — thin soft join, not a thick ring.
+            cov = np.clip((dist_in - (inset_map - 0.22)) / 0.65, 0.0, 1.0)
+            cov = np.where(inset_map > 0.0, cov, 0.0)
+        t = np.clip(cov, 0.0, 1.0)
+        cov_s = t * t * (3.0 - 2.0 * t)
+        out_f = output.astype(np.float32)
+        phone_f = phone_bgr.astype(np.float32)
+        if phone_f.shape[:2] != (h, w):
+            phone_f = cv2.resize(phone_f, (w, h), interpolation=cv2.INTER_LINEAR)
+        # Soft AA ring: don't pull bright chrome fringe into wrap.
+        # Deep inside the cutout: always show real camera hardware.
+        phone_gray = phone_f.mean(axis=2)
+        phone_sat = phone_f.max(axis=2) - phone_f.min(axis=2)
+        chrome_phone = (phone_gray > 95.0) & (phone_sat < 50.0)
+        soft_ring = (t > 0.05) & (t < 0.85)
+        cov_s = np.where(chrome_phone & soft_ring, cov_s * 0.08, cov_s)
+        cov_s = np.where(t >= 0.70, np.maximum(cov_s, 0.992), cov_s)
+        w3 = cov_s[:, :, np.newaxis]
+        blended = phone_f * w3 + out_f * (1.0 - w3)
+        return np.clip(np.round(blended), 0, 255).astype(np.uint8)
+
+    def _apply_manufactured_cutout_rim(
+        self,
+        output: np.ndarray,
+        phone_bgr: np.ndarray,
+        exclusion_mask: Optional[np.ndarray],
+        *,
+        tip_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Thin plastic lip around every cutout, sampled from surrounding wrap ink.
+
+        Follows the exact hole contour (any shape). Subtle depth only — no thick
+        opaque ring. Does not change hole size / geometry.
+        """
+        if (
+            output is None
+            or exclusion_mask is None
+            or np.count_nonzero(exclusion_mask) < 16
+        ):
+            return output
+        del phone_bgr
+        h, w = output.shape[:2]
+        excl = exclusion_mask
+        if excl.shape[:2] != (h, w):
+            excl = cv2.resize(excl, (w, h), interpolation=cv2.INTER_LINEAR)
+        hole = np.clip(excl.astype(np.float32) / 255.0, 0.0, 1.0)
+        if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
+            tm = tip_mask
+            if tm.shape[:2] != (h, w):
+                tm = cv2.resize(
+                    tip_mask.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            hole = np.where(tm > 127, 0.0, hole)
+        solid = (hole >= 0.50).astype(np.uint8)
+        if int(np.count_nonzero(solid)) < 16:
+            return output
+        short = float(min(h, w))
+        dist_out = cv2.distanceTransform(
+            (1 - solid), cv2.DIST_L2, 5
+        ).astype(np.float32)
+        dist_in = cv2.distanceTransform(solid, cv2.DIST_L2, 5).astype(np.float32)
+        # Soften binary distance stairs so circle lips stay round at zoom.
+        dist_out = cv2.GaussianBlur(dist_out, (0, 0), 0.28)
+        dist_in = cv2.GaussianBlur(dist_in, (0, 0), 0.22)
+
+        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
+        ridge_map = np.zeros((h, w), dtype=np.float32)
+        inset_map = np.zeros((h, w), dtype=np.float32)
+        reach_map = np.zeros((h, w), dtype=np.float32)
+        for lab in range(1, nlab):
+            if int(stats[lab, cv2.CC_STAT_AREA]) < 12:
+                continue
+            cut_short = float(
+                min(
+                    int(stats[lab, cv2.CC_STAT_WIDTH]),
+                    int(stats[lab, cv2.CC_STAT_HEIGHT]),
+                )
+            )
+            # ~12% of original manufactured-rim thickness.
+            ridge_w = float(
+                np.clip(max(0.22, cut_short * 0.0066, short * 0.00054), 0.22, 1.08)
+            )
+            inset = float(
+                np.clip(
+                    max(0.24, cut_short * 0.0102, short * 0.00054),
+                    0.24,
+                    cut_short * 0.0264,
+                )
+            )
+            reach = float(
+                np.clip(max(0.35, cut_short * 0.0096, ridge_w * 1.25), 0.35, 1.44)
+            )
+            # Assign on component + a local exterior halo for maps.
+            x0 = max(0, int(stats[lab, cv2.CC_STAT_LEFT]) - int(reach) - 2)
+            y0 = max(0, int(stats[lab, cv2.CC_STAT_TOP]) - int(reach) - 2)
+            x1 = min(w, int(stats[lab, cv2.CC_STAT_LEFT] + stats[lab, cv2.CC_STAT_WIDTH] + reach + 2))
+            y1 = min(h, int(stats[lab, cv2.CC_STAT_TOP] + stats[lab, cv2.CC_STAT_HEIGHT] + reach + 2))
+            roi = (labels[y0:y1, x0:x1] == lab) | (
+                (solid[y0:y1, x0:x1] == 0) & (dist_out[y0:y1, x0:x1] <= reach)
+            )
+            ridge_map[y0:y1, x0:x1] = np.where(roi, ridge_w, ridge_map[y0:y1, x0:x1])
+            inset_map[y0:y1, x0:x1] = np.where(
+                labels[y0:y1, x0:x1] == lab, inset, inset_map[y0:y1, x0:x1]
+            )
+            reach_map[y0:y1, x0:x1] = np.where(roi, reach, reach_map[y0:y1, x0:x1])
+        ridge_w_ref = float(
+            max(0.35, np.median(ridge_map[ridge_map > 0]))
+            if np.any(ridge_map > 0)
+            else 0.4
+        )
+
+        # Soft AA lip: thin outside ridge + light inward chrome cover.
+        t_out = np.clip(dist_out / np.maximum(ridge_map, 1e-3), 0.0, 1.0)
+        outer_lip = (
+            np.sin(np.pi * t_out)
+            * (dist_out > 0.0)
+            * (dist_out <= ridge_map)
+            * (ridge_map > 0.0)
+        )
+        chrome_in = np.clip(1.0 - dist_in / np.maximum(inset_map, 1e-3), 0.0, 1.0)
+        chrome_in = np.where(solid > 0, chrome_in, 0.0)
+        fade = np.clip((inset_map - dist_in) / 0.75, 0.0, 1.0)
+        fade = fade * fade * (3.0 - 2.0 * fade)
+        chrome_in = chrome_in * fade * 0.32
+        out_f0 = output.astype(np.float32)
+        gray0 = out_f0.mean(axis=2)
+        sat0 = out_f0.max(axis=2) - out_f0.min(axis=2)
+        near_out = (solid == 0) & (dist_out <= reach_map) & (reach_map > 0.0)
+        bright_out = near_out & (gray0 > 105.0)
+        silver_out = near_out & (gray0 > 88.0) & (sat0 < 42.0)
+        chrome_out = np.clip(
+            1.0 - dist_out / np.maximum(reach_map, 1e-3), 0.0, 1.0
+        ).astype(np.float32)
+        chrome_out = np.where(bright_out | silver_out, chrome_out, 0.0)
+        chrome_out = chrome_out * chrome_out * (3.0 - 2.0 * chrome_out) * 0.28
+        chrome_cover = np.maximum(chrome_in, chrome_out)
+        # Soften leftover bright phone pixels at the rim↔lens soft join.
+        join_bright = (
+            (solid > 0)
+            & (gray0 > 95.0)
+            & (sat0 < 55.0)
+            & (dist_in <= (inset_map + 0.40))
+            & (inset_map > 0.0)
+        )
+        chrome_cover = np.maximum(
+            chrome_cover, join_bright.astype(np.float32) * 0.20
+        )
+        lip = np.clip(
+            np.maximum(outer_lip.astype(np.float32) * 0.55, chrome_cover),
+            0.0,
+            1.0,
+        )
+        lip = np.maximum(
+            lip,
+            (bright_out | silver_out | join_bright).astype(np.float32) * 0.16,
+        )
+        lip = cv2.GaussianBlur(lip, (0, 0), 0.22)
+        if float(np.max(lip)) < 0.02:
+            return output
+
+        # Sample wrap ink just outside the thin ridge (local cover color).
+        wrap_gate = (dist_out > ridge_map * 0.55) & (dist_out < ridge_map * 5.5) & (
+            ridge_map > 0.0
+        )
+        sat = out_f0.max(axis=2) - out_f0.min(axis=2)
+        wrap_px = wrap_gate & (gray0 >= 18.0) & (gray0 < 210.0) & (sat >= 6.0)
+        if not np.any(wrap_px):
+            wrap_px = wrap_gate & (gray0 >= 14.0) & (gray0 < 230.0)
+        if np.any(wrap_px):
+            base_rgb = np.median(out_f0[wrap_px], axis=0).astype(np.float32)
+        else:
+            # Neutral fallback from nearby mid-tone body pixels (no fixed brown).
+            body_px = (gray0 >= 20.0) & (gray0 < 200.0) & (sat >= 4.0)
+            if np.any(body_px):
+                base_rgb = np.median(out_f0[body_px], axis=0).astype(np.float32)
+            else:
+                base_rgb = np.median(out_f0.reshape(-1, 3), axis=0).astype(
+                    np.float32
+                )
+
+        ink = wrap_px.astype(np.float32)
+        ink_b = cv2.GaussianBlur(ink, (0, 0), max(0.55, ridge_w_ref * 0.7))
+        filled = np.empty_like(out_f0)
+        for ch in range(3):
+            num = cv2.GaussianBlur(
+                out_f0[:, :, ch] * ink, (0, 0), max(0.55, ridge_w_ref * 0.7)
+            )
+            filled[:, :, ch] = np.where(
+                ink_b > 1e-3, num / np.maximum(ink_b, 1e-3), base_rgb[ch]
+            )
+        # Prefer local wrap fill; only fall back to base where sampling is empty.
+        force_base = ink_b < 0.08
+        for ch in range(3):
+            filled[:, :, ch] = np.where(force_base, base_rgb[ch], filled[:, :, ch])
+
+        gx = cv2.Sobel(dist_out + dist_in * 0.15, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(dist_out + dist_in * 0.15, cv2.CV_32F, 0, 1, ksize=3)
+        gn = np.sqrt(gx * gx + gy * gy) + 1e-6
+        nx, ny = gx / gn, gy / gn
+        lit = np.clip(0.60 + 0.12 * (-0.60 * nx - 0.32 * ny), 0.0, 1.0)
+        shade = np.clip(0.60 + 0.12 * (0.60 * nx + 0.32 * ny), 0.0, 1.0)
+        # Very slight manufactured depth only.
+        bevel = (0.985 + 0.030 * lit - 0.025 * (1.0 - shade)).astype(np.float32)
+        bevel = cv2.GaussianBlur(bevel, (0, 0), max(0.20, ridge_w_ref * 0.12))
+        rim_rgb = filled * bevel[:, :, np.newaxis]
+        crest = np.sin(
+            np.pi * np.clip(dist_out / np.maximum(ridge_map, 1e-3), 0.0, 1.0)
+        )
+        crest = crest * outer_lip.astype(np.float32) * 0.018
+        crest = cv2.GaussianBlur(crest, (0, 0), 0.20)
+        rim_rgb = np.clip(
+            rim_rgb * (1.0 + crest[:, :, np.newaxis] * 0.06), 0.0, 255.0
+        )
+
+        a = np.clip(lip, 0.0, 1.0)[:, :, np.newaxis]
+        a = np.where(
+            chrome_cover[:, :, np.newaxis] > 0.35,
+            np.maximum(a, 0.22),
+            a,
+        )
+        a = np.where(
+            (bright_out | silver_out | join_bright)[:, :, np.newaxis],
+            np.maximum(a, 0.18),
+            a,
+        )
+        out_f = rim_rgb * a + out_f0 * (1.0 - a)
+        return np.clip(np.round(out_f), 0, 255).astype(np.uint8)
 
     def _apply_studio_background(
         self,

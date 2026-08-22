@@ -161,7 +161,7 @@ class CutoutSpec:
         if self.expand_px >= 0.0:
             return float(self.expand_px)
         if self.kind in ("camera", "flash"):
-            return 2.25
+            return 0.0
         if self.kind == "button":
             # Tall volume rockers: tight punch so wrap hugs the ridge.
             # Compact side fingerprint / power pills: wider hole so the
@@ -466,6 +466,8 @@ def build_cutout_specs(
 
     When ``authoritative`` is True (Perfect Finish / detect), geom+params are
     frozen from classification / photo snap so export paint never re-guesses.
+    Live edits (authoritative=False) paint the user's verts + ``shape_tags``
+    — the photo silhouette must not move a bump the user just placed.
 
     ``shape_tags`` (parallel to contours) preserve editor tools such as
     rectangle — without them paint reclassifies AABBs into heavy stadiums.
@@ -504,6 +506,21 @@ def build_cutout_specs(
             tagged_geom, tagged_params = _box_params(frac)
             if tag == "rectangle":
                 tagged_geom = "rectangle"
+        elif not tag and kind in ("camera", "other"):
+            # Untagged camera AABB / selection box → rounded module hole.
+            # Never fall through to circle classification (giant disk).
+            n_verts = int(pts.shape[0])
+            x1 = float(pts[:, 0].min())
+            y1 = float(pts[:, 1].min())
+            x2 = float(pts[:, 0].max())
+            y2 = float(pts[:, 1].max())
+            bw = max(x2 - x1, 1.0)
+            bh = max(y2 - y1, 1.0)
+            area = float(cv2.contourArea(pts.reshape(-1, 1, 2)))
+            bbox_fill = area / max(bw * bh, 1.0)
+            aspect = max(bw, bh) / min(bw, bh)
+            if (n_verts <= 12 and bbox_fill >= 0.72) or aspect <= 1.65:
+                tagged_geom, tagged_params = _box_params(mild)
         elif tag in ("pill_h", "pill_v", "capsule", "button"):
             x1 = float(pts[:, 0].min())
             y1 = float(pts[:, 1].min())
@@ -525,19 +542,35 @@ def build_cutout_specs(
             short = min(x2 - x1, y2 - y1)
             tagged_geom = "stadium"
             tagged_params = (x1, y1, x2, y2, short * 0.5 - 0.5)
-        elif tag in ("squircle", "superellipse"):
-            tagged_geom, tagged_params = _box_params(
-                0.42 if tag == "squircle" else 0.35
-            )
+        elif tag in (
+            "squircle",
+            "superellipse",
+            "polygon",
+            "triangle",
+            "custom_path",
+            "free",
+            "diamond",
+        ):
+            # Exact editor polygon — never collapse to a rounded AABB.
+            tagged_geom = "contour"
+            tagged_params = ()
         elif tag == "circle":
-            cx, cy, radius = HardwareRegionDetector._circle_params_from_pts(pts)
+            # Inscribed circle from AABB — matches the Shift+click tool,
+            # not min-enclosing-circle (which bloated box selections).
+            x1 = float(pts[:, 0].min())
+            y1 = float(pts[:, 1].min())
+            x2 = float(pts[:, 0].max())
+            y2 = float(pts[:, 1].max())
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            radius = 0.5 * min(x2 - x1, y2 - y1)
             if radius > 0.5:
                 tagged_geom = "circle"
                 tagged_params = (float(cx), float(cy), float(radius))
 
         if authoritative:
             if tagged_geom:
-                expand = 2.25 if kind in ("camera", "flash") else (
+                expand = 0.0 if kind in ("camera", "flash") else (
                     1.25 if kind == "button" else -1.0
                 )
                 if kind == "button" and tagged_geom == "stadium":
@@ -583,7 +616,7 @@ def build_cutout_specs(
                 if radius > 0.5:
                     geom = "circle"
                     params = (float(cx), float(cy), float(radius))
-        expand = 2.25 if kind in ("camera", "flash") else -1.0
+        expand = 0.0 if kind in ("camera", "flash") else -1.0
         if kind == "button":
             bw = float(pts[:, 0].max() - pts[:, 0].min())
             bh = float(pts[:, 1].max() - pts[:, 1].min())
