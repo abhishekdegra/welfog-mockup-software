@@ -706,6 +706,74 @@ class ModelAgnosticRimTests(unittest.TestCase):
         self.assertGreater(int(sealed[60, 36]), 127)
         self.assertEqual(int(sealed[10, 10]), 0)
 
+    def test_left_button_nubs_do_not_become_the_body_wall(self) -> None:
+        """False left strips between keys must leave the body mask."""
+        body = _rounded_rect_mask(400, 220, 40, 20, 180, 380, 18)
+        # Quiet left wall is x=40. Fake nubs between two real keys.
+        body[90:100, 32:40] = 255
+        body[160:172, 30:40] = 255
+        tips = np.zeros((400, 220), dtype=np.uint8)
+        tips[70:88, 34:40] = 255
+        tips[200:218, 34:40] = 255
+        right_before = int(np.count_nonzero(body[:, 180:]))
+        cleaned = Compositor()._detach_side_button_nubs_from_body(body, tips)
+        self.assertEqual(int(np.count_nonzero(cleaned[90:100, 32:40])), 0)
+        self.assertEqual(int(np.count_nonzero(cleaned[160:172, 30:40])), 0)
+        # Real keys stay on the tip mask, not the body wall.
+        self.assertGreater(int(np.count_nonzero(cleaned[120:150, 40:50])), 0)
+        self.assertEqual(int(np.count_nonzero(cleaned[:, 180:])), right_before)
+
+    def test_protrusion_paint_stays_on_the_key_row(self) -> None:
+        body = np.zeros((80, 60), dtype=np.uint8)
+        body[:, 20:50] = 255
+        tips = np.zeros((80, 60), dtype=np.uint8)
+        tips[20:30, 16:20] = 255
+        raw = body.copy()
+        raw[20:30, 16:20] = 255
+        raw[22:28, 10:16] = 255  # noise in the AABB column, not the key
+        paint = Compositor._raw_protrusion_paint_for_components(body, tips, raw)
+        self.assertEqual(int(np.count_nonzero(paint[22:28, 10:16])), 0)
+        self.assertGreater(int(np.count_nonzero(paint[20:30, 16:20])), 0)
+
+    def test_preview_scale_does_not_mutate_canonical_button_mask(self) -> None:
+        """Coverage at preview size must not replace phone-space button geometry."""
+        h, w = 80, 40
+        native = np.zeros((h, w), dtype=np.uint8)
+        native[20:36, 4:8] = 255
+        native[48:58, 4:8] = 255
+        comp = Compositor()
+        comp.phone_image = np.zeros((h, w, 3), dtype=np.uint8)
+        comp._side_button_validated_mask = native.copy()
+        cov_a = comp._build_side_button_wrap_coverage((160, 80), None, None)
+        self.assertIsNotNone(cov_a)
+        self.assertEqual(comp._side_button_validated_mask.shape[:2], (h, w))
+        self.assertEqual(
+            int(np.count_nonzero(comp._side_button_validated_mask)),
+            int(np.count_nonzero(native)),
+        )
+        cov_b = comp._build_side_button_wrap_coverage((240, 120), None, None)
+        self.assertIsNotNone(cov_b)
+        self.assertEqual(comp._side_button_validated_mask.shape[:2], (h, w))
+        # Same physical keys: top of first button stays ~20/80 of height.
+        ya = int(np.where(cov_a > 0.5)[0].min())
+        yb = int(np.where(cov_b > 0.5)[0].min())
+        self.assertAlmostEqual(ya / 160.0, 20.0 / 80.0, delta=0.03)
+        self.assertAlmostEqual(yb / 240.0, 20.0 / 80.0, delta=0.03)
+
+    def test_canonical_mask_recovers_from_viewport_copy(self) -> None:
+        h, w = 60, 30
+        native = np.zeros((h, w), dtype=np.uint8)
+        native[10:20, 2:6] = 255
+        preview = cv2.resize(native, (90, 180), interpolation=cv2.INTER_NEAREST)
+        comp = Compositor()
+        comp.phone_image = np.zeros((h, w, 3), dtype=np.uint8)
+        comp._phone_wrap_mask = np.ones((h, w), dtype=np.uint8) * 255
+        comp._side_button_validated_mask = preview
+        got = comp._canonical_side_button_mask()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.shape[:2], (h, w))
+
 
 if __name__ == "__main__":
     unittest.main()
+

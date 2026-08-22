@@ -194,6 +194,7 @@ class Compositor:
         # Per-button float coverage in the active composite space (wrap, not punch).
         self._side_button_wrap_cov: Optional[np.ndarray] = None
         self._side_button_validated_mask: Optional[np.ndarray] = None
+        self._side_button_render_mask: Optional[np.ndarray] = None
         self._side_button_stem_bridge_mask: Optional[np.ndarray] = None
         self._scaled_phone_cache: "OrderedDict[int, Tuple[np.ndarray, float]]" = OrderedDict()
         self._uv_field_cache: Optional[
@@ -556,6 +557,7 @@ class Compositor:
         self._side_button_relief_mask = None
         self._side_button_wrap_cov = None
         self._side_button_validated_mask = None
+        self._side_button_render_mask = None
         self._side_button_stem_bridge_mask = None
         self._product_body_corner = None
         self._uv_field_cache = None
@@ -602,10 +604,10 @@ class Compositor:
         raw_mask: Optional[np.ndarray],
     ) -> np.ndarray:
         """
-        All photo-silhouette pixels for each validated button component.
+        Photo-silhouette pixels of each validated key, on its own rows only.
 
-        Covers partial tip rows (e.g. y=297 with only x=25) without inventing
-        geometry — only ``raw & ~body`` inside each component's vertical band.
+        Never fills the component bounding-box column — that invented
+        vertical strips between neighbouring buttons.
         """
         h, w = phone_mask.shape[:2]
         paint = (tip_mask > 127).copy()
@@ -618,23 +620,30 @@ class Compositor:
             btn_u8, connectivity=8
         )
         for label in range(1, num):
-            y0 = int(stats[label, cv2.CC_STAT_TOP])
-            bh = int(stats[label, cv2.CC_STAT_HEIGHT])
-            x0 = int(stats[label, cv2.CC_STAT_LEFT])
-            bw = int(stats[label, cv2.CC_STAT_WIDTH])
-            cx = x0 + 0.5 * float(bw)
-            for y in range(y0, min(h, y0 + bh)):
+            comp = labels == label
+            ys = np.where(np.any(comp, axis=1))[0]
+            if ys.size == 0:
+                continue
+            t_xs_all = np.where(comp)[1]
+            left_side = float(t_xs_all.mean()) < 0.5 * float(w)
+            for y in ys:
                 bxs = np.where(body[y])[0]
-                if len(bxs) == 0:
+                txs = np.where(comp[y])[0]
+                if len(bxs) == 0 or len(txs) == 0:
                     continue
                 xl, xr = int(bxs.min()), int(bxs.max())
-                if cx < 0.5 * float(w):
-                    xs_range = range(0, xl)
+                # Only the photo pixels of THIS key on this row — never the
+                # component AABB column, which invented vertical strips
+                # between neighbouring buttons.
+                if left_side:
+                    x_lo, x_hi = int(txs.min()), xl
                 else:
-                    xs_range = range(xr + 1, w)
-                for x in xs_range:
-                    if raw_out[y, x]:
-                        paint[y, x] = True
+                    x_lo, x_hi = xr + 1, int(txs.max()) + 1
+                if x_hi <= x_lo:
+                    continue
+                row = raw_out[y, x_lo:x_hi]
+                if np.any(row):
+                    paint[y, x_lo:x_hi] = paint[y, x_lo:x_hi] | row
         return paint.astype(np.uint8) * 255
 
     def _side_button_paint_mask_for_size(
@@ -1180,6 +1189,76 @@ class Compositor:
                     if a < b:
                         protect[y, a:b] = True
         return sides, protect
+
+    def _detach_side_button_nubs_from_body(
+        self,
+        body: np.ndarray,
+        tip_mask: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """
+        Keep the body wall independent of side-button masks.
+
+        Silhouette-authority overwrite re-imports photo AA / button stems into
+        the wrap body on the keyed side. Those nubs are not the case edge —
+        buttons stay on ``tip_mask``. Sides without keys are left untouched.
+        """
+        out = (body > 127).astype(np.uint8) * 255
+        if tip_mask is None or np.count_nonzero(tip_mask) < 4:
+            return out
+        h, w = out.shape[:2]
+        tips_u8 = tip_mask.astype(np.uint8)
+        if tips_u8.shape[:2] != (h, w):
+            tips_u8 = cv2.resize(
+                tips_u8, (w, h), interpolation=cv2.INTER_NEAREST
+            )
+        tips = tips_u8 > 127
+        sides, _ = Compositor._sides_with_buttons(tips_u8, out, (h, w))
+        if not sides:
+            return out
+        state = Compositor._silhouette_wall_state(out)
+        if state is None:
+            return out
+        y0 = int(state["y0"])
+        y1 = int(state["y1"])
+        ph = float(max(y1 - y0 + 1, 1))
+        inset = float(
+            np.clip(max(0.14, float(state["corner_frac"]) * 0.95), 0.14, 0.30)
+        )
+        y_lo = y0 + int(round(ph * inset))
+        y_hi = y1 - int(round(ph * inset))
+        y_lo = int(np.clip(y_lo, 0, max(h - 1, 0)))
+        y_hi = int(np.clip(y_hi, y_lo, max(h - 1, 0)))
+        xx = np.arange(w, dtype=np.int32)
+        on = out > 0
+        if "left" in sides:
+            left_tip_row = np.any(tips[:, : max(1, w // 2)], axis=1)
+            quiet: List[float] = []
+            for y in range(y_lo, y_hi + 1):
+                if left_tip_row[y]:
+                    continue
+                xs = np.where(on[y])[0]
+                if xs.size:
+                    quiet.append(float(xs.min()))
+            if len(quiet) >= 8:
+                wall = float(np.median(np.asarray(quiet, dtype=np.float32)))
+                for y in range(y_lo, y_hi + 1):
+                    out[y, xx < wall] = 0
+        if "right" in sides:
+            right_tip_row = np.any(tips[:, (w - w // 2) :], axis=1)
+            quiet_r: List[float] = []
+            for y in range(y_lo, y_hi + 1):
+                if right_tip_row[y]:
+                    continue
+                xs = np.where(on[y])[0]
+                if xs.size:
+                    quiet_r.append(float(xs.max()))
+            if len(quiet_r) >= 8:
+                wall_r = float(np.median(np.asarray(quiet_r, dtype=np.float32)))
+                for y in range(y_lo, y_hi + 1):
+                    out[y, xx > wall_r] = 0
+        if np.count_nonzero(out) < 64:
+            return (body > 127).astype(np.uint8) * 255
+        return out
 
     def _midwall_aabb_quad_from_mask(
         self, mask: np.ndarray
@@ -2270,6 +2349,12 @@ class Compositor:
             if tip_out is not None and tip_out.shape[:2] == deep.shape[:2]:
                 deep = deep & ~tip_out
             body = np.where(deep, 255, body).astype(np.uint8)
+        # Silhouette fill restored the camera face AND re-attached left-edge
+        # button stems / AA nicks to the body. Detach those from the body
+        # wall only — validated buttons stay on their own mask.
+        body = self._detach_side_button_nubs_from_body(
+            body, self._canonical_side_button_mask()
+        )
         # Do not re-clip with a strict device mask here — that carved white
         # under-wrap gaps along the left/bottom chrome. Silhouette + tip
         # split above is the printable authority; studio purge is finalize.
@@ -2852,54 +2937,77 @@ class Compositor:
         )
         return None
 
-    def _build_side_button_wrap_coverage(
-        self,
-        composite_hw: Tuple[int, int],
-        phone_mask: Optional[np.ndarray],
-        exclusion_mask: Optional[np.ndarray],
-    ) -> Optional[np.ndarray]:
+    def _canonical_side_button_mask(self) -> Optional[np.ndarray]:
         """
-        Float AA coverage from detected button pixels only (phone-native space).
+        Validated side buttons in phone-image pixels only.
 
-        Uses the existing side-button detection mask as-is — no synthetic
-        capsules, outward extrusion, or bezel rebuild. Each component gets
-        sub-pixel AA on its actual contour; coverage never extends past the
-        detected footprint.
+        Preview/export scale must never become the stored geometry. A stale
+        viewport-sized copy is dropped and recovered from native detection.
         """
-        # Remove unused chaikin import path — coverage uses validated contour only.
-        from .mesh import _fill_closed_polyline_aa
-
         if self.phone_image is None:
             return None
         ph, pw = self.phone_image.shape[:2]
-        # Prefer the already-validated mask from geometry split — do not
-        # re-detect / overwrite (that broke the wrap connection).
-        det = self._side_button_validated_mask
-        if det is not None and np.count_nonzero(det) >= 4:
-            if det.shape[:2] != (ph, pw):
-                det = cv2.resize(
-                    det.astype(np.uint8),
+        vm = self._side_button_validated_mask
+        if (
+            vm is not None
+            and np.count_nonzero(vm) >= 4
+            and vm.shape[:2] == (ph, pw)
+        ):
+            return vm
+        stale = vm
+        # Do not keep a transformed copy as the source of truth.
+        self._side_button_validated_mask = None
+        recovered = self._side_button_detection_mask_native(self.exclusion_mask)
+        if recovered is not None and np.count_nonzero(recovered) >= 4:
+            if recovered.shape[:2] != (ph, pw):
+                recovered = cv2.resize(
+                    recovered.astype(np.uint8),
                     (pw, ph),
                     interpolation=cv2.INTER_NEAREST,
                 )
-                det = (det > 127).astype(np.uint8) * 255
-        else:
-            det = self._side_button_detection_mask_native(exclusion_mask)
-        if det is None or np.count_nonzero(det) < 4:
-            return None
+                recovered = (recovered > 127).astype(np.uint8) * 255
+            self._side_button_validated_mask = recovered
+            return recovered
+        if stale is not None and np.count_nonzero(stale) >= 4:
+            restored = cv2.resize(
+                stale.astype(np.uint8),
+                (pw, ph),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            restored = (restored > 127).astype(np.uint8) * 255
+            self._side_button_validated_mask = restored
+            return restored
+        return None
 
-        cam_bin = self._side_button_camera_block(
-            (ph, pw), exclusion_mask, self._phone_wrap_mask
-        ) > 127
-        btn = ((det > 127) & ~cam_bin).astype(np.uint8) * 255
-        if np.count_nonzero(btn) < 4:
-            return None
+    def _rasterize_side_buttons_at_size(
+        self,
+        dest_hw: Tuple[int, int],
+        native: np.ndarray,
+        exclusion_mask: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Paint native button contours at ``dest_hw``.
 
-        # Exact validated tips + float AA (same composite space as body).
-        cov = np.zeros((ph, pw), dtype=np.float32)
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(
-            btn, connectivity=8
-        )
+        Scales contour vertices (not a previously resized bitmask) so preview
+        and export share the same physical keys.
+        """
+        from .mesh import _fill_closed_polyline_aa
+
+        dh, dw = int(dest_hw[0]), int(dest_hw[1])
+        ph, pw = native.shape[:2]
+        btn = ((native > 127).astype(np.uint8) * 255)
+        if (ph, pw) == (dh, dw):
+            cam = self._side_button_camera_block(
+                (ph, pw), exclusion_mask, self._phone_wrap_mask
+            ) > 127
+            btn[cam] = 0
+            cov = (btn > 127).astype(np.float32)
+            return btn, cov
+        sx = float(dw) / float(max(pw, 1))
+        sy = float(dh) / float(max(ph, 1))
+        mask = np.zeros((dh, dw), dtype=np.uint8)
+        cov = np.zeros((dh, dw), dtype=np.float32)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(btn, 8)
         for label in range(1, num):
             if int(stats[label, cv2.CC_STAT_AREA]) < 4:
                 continue
@@ -2908,49 +3016,64 @@ class Compositor:
                 comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
             )
             if not contours:
-                cov = np.maximum(cov, comp.astype(np.float32) / 255.0)
                 continue
             pts = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(
                 np.float32
             )
+            pts[:, 0] *= sx
+            pts[:, 1] *= sy
             patch = _fill_closed_polyline_aa(
-                pts, (ph, pw), scale=8, expand_px=0.0
+                pts, (dh, dw), scale=8, expand_px=0.0
             )
-            # Exact tip footprint only — no dilate halo (that leaked soft wrap
-            # into long vertical edge streaks outside the buttons).
-            patch = np.maximum(patch, comp.astype(np.float32) / 255.0)
-            patch = np.where(comp > 0, patch, 0.0)
+            hard = np.zeros((dh, dw), dtype=np.uint8)
+            cv2.fillPoly(
+                hard,
+                [np.round(pts).astype(np.int32).reshape(-1, 1, 2)],
+                255,
+            )
+            patch = np.maximum(patch, hard.astype(np.float32) / 255.0)
+            patch = np.where(hard > 0, patch, 0.0)
             cov = np.maximum(cov, patch)
+            mask = np.maximum(mask, hard)
+        cam_c = self._side_button_camera_block(
+            (dh, dw), exclusion_mask, self._phone_wrap_mask
+        ) > 127
+        mask[cam_c] = 0
+        cov[cam_c] = 0.0
+        cov = np.where(mask > 127, cov, 0.0)
+        return mask, np.clip(cov, 0.0, 1.0)
 
-        cov = np.clip(cov, 0.0, 1.0)
-        cov[cam_bin] = 0.0
-        if float(np.max(cov)) < 0.05:
+    def _build_side_button_wrap_coverage(
+        self,
+        composite_hw: Tuple[int, int],
+        phone_mask: Optional[np.ndarray],
+        exclusion_mask: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        """
+        Button coverage at ``composite_hw``, from native phone geometry.
+
+        Never writes the destination raster back into
+        ``_side_button_validated_mask`` — that is phone-image space only.
+        """
+        del phone_mask
+        if self.phone_image is None:
             return None
-
-        ch, cw = int(composite_hw[0]), int(composite_hw[1])
-        if (ph, pw) != (ch, cw):
-            # Nearest for mask fidelity; coverage clipped to resized tip mask.
-            vm_src = det if det is not None else btn
-            vm = (vm_src > 127).astype(np.uint8) * 255
-            vm = cv2.resize(vm, (cw, ch), interpolation=cv2.INTER_NEAREST)
-            cam_c = self._side_button_camera_block(
-                (ch, cw), exclusion_mask, self._phone_wrap_mask
-            ) > 127
-            vm = cv2.bitwise_and(
-                vm, cv2.bitwise_not(cam_c.astype(np.uint8) * 255)
+        native = self._canonical_side_button_mask()
+        if native is None or np.count_nonzero(native) < 4:
+            return None
+        ph, pw = self.phone_image.shape[:2]
+        if native.shape[:2] == (ph, pw):
+            self._side_button_validated_mask = (
+                (native > 127).astype(np.uint8) * 255
             )
-            self._side_button_validated_mask = (vm > 127).astype(np.uint8) * 255
-            cov = cv2.resize(cov, (cw, ch), interpolation=cv2.INTER_LINEAR)
-            cov = np.where(vm > 127, cov, 0.0)
-            cov[cam_c] = 0.0
-        else:
-            self._side_button_validated_mask = (btn > 127).astype(np.uint8) * 255
-            cov = np.where(btn > 127, cov, 0.0)
-        cov = np.clip(cov, 0.0, 1.0)
-        self._log_side_button_mask(
-            self._side_button_validated_mask,
-            space="validated",
+        mask, cov = self._rasterize_side_buttons_at_size(
+            composite_hw, native, exclusion_mask
         )
+        if float(np.max(cov)) < 0.05:
+            self._side_button_render_mask = None
+            return None
+        self._side_button_render_mask = mask
+        self._log_side_button_mask(native, space="canonical")
         return cov
 
     def _apply_side_button_wrap(
@@ -7324,7 +7447,10 @@ class Compositor:
             if pm.shape[:2] != (h, w):
                 pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
             pm_u8 = (pm > 127).astype(np.uint8) * 255
-            body = (pm > 127) & ~tips
+            # Body wall stays continuous. Only wrap the key pixels that sit
+            # past that wall — detection may also mark bezel columns.
+            tips = tips & ~(pm_u8 > 127)
+            body = pm_u8 > 127
         else:
             body = ~tips
 
@@ -7341,7 +7467,7 @@ class Compositor:
                     > 0
                 )
             tips = tips & ~plate
-            body = (pm_u8 > 127) & ~tips
+            body = pm_u8 > 127
         if not np.any(body):
             return output
 
@@ -7385,8 +7511,18 @@ class Compositor:
             left_side = (
                 float(t_xs.mean()) <= float(b_xs.mean()) if t_xs.size else True
             )
-            # Paint the full validated tip contour only (no bbox, no shrink).
-            paint = tip_comp
+            paint, _, studio_bgr = Compositor._button_photo_wrap_alpha(
+                tip_comp,
+                tips,
+                body,
+                phone,
+                left_side=left_side,
+            )
+            dropped = tip_comp & ~paint
+            if np.any(dropped):
+                result[dropped] = studio_bgr
+            if not np.any(paint):
+                continue
             result = Compositor._wrap_validated_button_surface(
                 result,
                 phone,
@@ -7405,7 +7541,7 @@ class Compositor:
             # Root cause: unfinished tip paint left plate RGB at the contour.
             diff = np.abs(result - phone_f).max(axis=2)
             gray_r = result.mean(axis=2)
-            still_plate = tips & (
+            still_plate = keep_paint & (
                 (diff < 14.0) | ((gray_r < 22.0) & (diff < 40.0))
             )
             if np.any(still_plate):
@@ -9041,12 +9177,20 @@ class Compositor:
         wrap_mask = np.clip(mask, 0.0, 1.0).copy()
         excl_f = None
         hole_w = None
-        # Side-button coverage in THIS composite space (native detect → resize).
+        # Side-button coverage from native contours, rasterized at dest size.
         btn_cov = self._build_side_button_wrap_coverage(
             (h, w), phone_mask, exclusion_mask
         )
         self._side_button_wrap_cov = btn_cov
-        tip_vm = self._side_button_validated_mask
+        tip_vm = getattr(self, "_side_button_render_mask", None)
+        if tip_vm is None or (
+            btn_cov is not None and tip_vm.shape[:2] != (h, w)
+        ):
+            if btn_cov is not None:
+                tip_vm = ((btn_cov >= 0.50).astype(np.uint8) * 255)
+            else:
+                tip_vm = None
+
         if exclusion_mask is not None:
             excl = exclusion_mask
             if excl.shape[:2] != (h, w):
