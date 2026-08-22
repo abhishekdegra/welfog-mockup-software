@@ -17,6 +17,7 @@ from src.image_processing.device_template import (
     UVBounds,
     build_cutout_specs,
     classify_cutout_kind,
+    classify_cutout_kinds,
     estimate_corner_radii,
     slugify_model_name,
 )
@@ -172,6 +173,39 @@ def test_classify_cutout_kind_camera_vs_button():
     kinds = {s.kind for s in specs}
     assert "camera" in kinds or "flash" in kinds
     assert "button" in kinds
+
+
+def _circle_pts(cx: float, cy: float, radius: float, n: int = 24) -> np.ndarray:
+    ang = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    return np.stack(
+        [cx + radius * np.cos(ang), cy + radius * np.sin(ang)], axis=1
+    ).astype(np.float32)
+
+
+def test_classify_kinds_uses_cluster_size_not_phone_fraction():
+    """Lenses on a tall cover stay cameras; only the smaller satellite is flash."""
+    cover = np.array(
+        [[20, 20], [220, 20], [220, 460], [20, 460]], dtype=np.float32
+    )
+    parts = [
+        _circle_pts(70.0, 70.0, 18.0),
+        _circle_pts(70.0, 118.0, 17.5),
+        _circle_pts(70.0, 166.0, 17.5),
+        _circle_pts(112.0, 92.0, 6.0),
+    ]
+    kinds = classify_cutout_kinds(parts, cover)
+    assert kinds.count("camera") == 3
+    assert kinds.count("flash") == 1
+    assert kinds[3] == "flash"
+
+
+def test_left_cover_disk_is_camera_not_button():
+    """Vertical camera stacks sit near the left rim on many phones."""
+    cover = np.array(
+        [[20, 20], [220, 20], [220, 460], [20, 460]], dtype=np.float32
+    )
+    lens = _circle_pts(38.0, 180.0, 16.0)
+    assert classify_cutout_kind(lens, cover) == "camera"
 
 
 def test_slugify_and_legacy_cover_template_load(tmp_path: Path):

@@ -135,22 +135,17 @@ class CoverSurfaceEngine:
                 # especially). Older templates often only stored camera holes.
                 fresh_excl, fresh_contours, hw_conf = (
                     HardwareRegionDetector.detect(
-                        phone, region.mesh.corner_points()
+                        phone,
+                        CoverSurfaceEngine._canonical_hardware_quad(
+                            phone, region.mesh.corner_points()
+                        ),
                     )
                 )
                 if np.count_nonzero(fresh_excl) > 0:
-                    if np.count_nonzero(region.exclusion_mask) > 0:
-                        region.exclusion_mask = cv2.max(
-                            region.exclusion_mask, fresh_excl
-                        )
-                        region.hardware_contours = (
-                            HardwareRegionDetector._smooth_exclusion_contours(
-                                region.exclusion_mask
-                            )
-                        )
-                    else:
-                        region.exclusion_mask = fresh_excl
-                        region.hardware_contours = fresh_contours
+                    # Live photo hardware is canonical. OR-ing a cached island
+                    # AABB with discrete lenses rebuilt a rectangular hole.
+                    region.exclusion_mask = fresh_excl
+                    region.hardware_contours = fresh_contours
                     region.confidence = min(
                         1.0, region.confidence * 0.7 + hw_conf * 0.3
                     )
@@ -249,7 +244,10 @@ class CoverSurfaceEngine:
                 # Refresh exclusions against the upright live cage so orphan
                 # template holes (false top-right circles) are not restored.
                 fresh_excl2, fresh_contours2, _ = HardwareRegionDetector.detect(
-                    phone, region.mesh.corner_points()
+                    phone,
+                    CoverSurfaceEngine._canonical_hardware_quad(
+                        phone, region.mesh.corner_points(), phone_gate
+                    ),
                 )
                 if np.count_nonzero(fresh_excl2) > 0:
                     region.exclusion_mask = fresh_excl2
@@ -282,6 +280,43 @@ class CoverSurfaceEngine:
         boundary = PhoneBoundaryDetector.detect(source)
         self.last_phone_mask = boundary.mask
         return self._detect_fresh(phone, boundary, rows, cols)
+
+    @staticmethod
+    def _canonical_hardware_quad(
+        phone: np.ndarray,
+        fallback_quad: Optional[np.ndarray],
+        phone_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Axis-aligned quad of the photo silhouette for hardware detect.
+
+        The edit cage is only a working bound — a larger/tilted cage warps
+        camera and side-button samples off the real phone.
+        """
+        gate = phone_mask
+        if gate is None or np.count_nonzero(gate) < 64:
+            try:
+                est = PhoneBoundaryDetector.detect(phone)
+                gate = getattr(est, "mask", None)
+            except Exception:
+                gate = None
+        if gate is not None and np.count_nonzero(gate) >= 64:
+            if gate.shape[:2] != phone.shape[:2]:
+                gate = cv2.resize(
+                    (gate > 127).astype(np.uint8) * 255,
+                    (phone.shape[1], phone.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            quad = AdaptiveMeshBuilder._aabb_quad_from_mask(gate)
+            if quad is not None:
+                return quad
+        if fallback_quad is not None:
+            return fallback_quad
+        h, w = phone.shape[:2]
+        return np.array(
+            [[0.0, 0.0], [w - 1.0, 0.0], [w - 1.0, h - 1.0], [0.0, h - 1.0]],
+            dtype=np.float32,
+        )
 
     @staticmethod
     def _cheap_silhouette(phone: np.ndarray) -> np.ndarray:
@@ -453,7 +488,10 @@ class CoverSurfaceEngine:
             corner_radii=corner_radii.as_tuple(),
         )
         exclusion_mask, contours, hw_confidence = HardwareRegionDetector.detect(
-            phone, cover_quad
+            phone,
+            CoverSurfaceEngine._canonical_hardware_quad(
+                phone, cover_quad, cover_mask
+            ),
         )
         # Production polish on detect: stadiums / circles, merge overlaps.
         if contours:

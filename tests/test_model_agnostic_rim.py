@@ -208,6 +208,90 @@ class ModelAgnosticRimTests(unittest.TestCase):
         self.assertTrue(nick_xmin and quiet_xmin)
         self.assertLessEqual(abs(int(np.median(nick_xmin)) - int(np.median(quiet_xmin))), 1)
 
+    def test_long_rocker_buttons_use_quiet_wall_not_median(self) -> None:
+        """A tall volume key must not pull the quiet edge out to 1px AA."""
+        h, w = 500, 260
+        phone = np.full((h, w, 3), 210, dtype=np.uint8)
+        x0, x1, y0, y1 = 40, 220, 30, 470
+        phone[y0:y1, x0:x1] = (180, 180, 185)
+        phone[:, : x0 - 4] = (255, 255, 255)
+        # Long silver-ish rocker + shorter key, both darker than the bezel.
+        phone[90:200, x0 - 3 : x0] = (70, 70, 75)
+        phone[230:280, x0 - 3 : x0] = (65, 65, 70)
+        raw = np.zeros((h, w), dtype=np.uint8)
+        raw[y0:y1, x0:x1] = 255
+        raw[90:200, x0 - 3 : x0] = 255
+        raw[230:280, x0 - 3 : x0] = 255
+        body, btn = Compositor()._derive_clean_body_and_button_masks(
+            raw, phone, exclusion_mask=None
+        )
+        self.assertIsNotNone(btn)
+        n, _, st, _ = cv2.connectedComponentsWithStats(
+            (btn > 127).astype(np.uint8), connectivity=8
+        )
+        self.assertGreaterEqual(n - 1, 2)
+        widths = [int(st[i, cv2.CC_STAT_WIDTH]) for i in range(1, n)]
+        self.assertTrue(any(ww >= 2 for ww in widths))
+        # Quiet mid-body wall is not a button strip.
+        self.assertEqual(int(np.count_nonzero(btn[320:360, :x0])), 0)
+
+    def test_snap_island_keeps_discrete_lens_circles(self) -> None:
+        from src.image_processing.region_detector import HardwareRegionDetector
+
+        h, w = 220, 180
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for cy in (40, 78, 116):
+            cv2.circle(mask, (48, cy), 14, 255, -1)
+        cv2.circle(mask, (78, 58), 6, 255, -1)  # flash
+        before = int(cv2.connectedComponents((mask > 0).astype(np.uint8), 8)[0])
+        HardwareRegionDetector._snap_camera_island(
+            mask, w, h, only_if_jagged=True
+        )
+        after = int(cv2.connectedComponents((mask > 0).astype(np.uint8), 8)[0])
+        self.assertGreaterEqual(after - 1, 3)
+        self.assertEqual(before, after)
+
+    def test_prune_keeps_stacked_discrete_lenses(self) -> None:
+        from src.image_processing.region_detector import HardwareRegionDetector
+
+        h, w = 220, 180
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for cy in (40, 78, 116):
+            cv2.circle(mask, (48, cy), 14, 255, -1)
+        cv2.circle(mask, (78, 58), 6, 255, -1)
+        HardwareRegionDetector._prune_orphan_exclusions(mask, w, h)
+        n = int(cv2.connectedComponents((mask > 0).astype(np.uint8), 8)[0])
+        self.assertGreaterEqual(n - 1, 3)
+
+    def test_rebuild_keeps_discrete_openings_separate(self) -> None:
+        from src.image_processing.region_detector import HardwareRegionDetector
+
+        parts = []
+        for cy in (40.0, 78.0, 116.0):
+            parts.append(
+                HardwareRegionDetector._sample_circle(48.0, cy, 14.0, samples=32)
+            )
+        parts.append(
+            HardwareRegionDetector._sample_circle(78.0, 58.0, 6.0, samples=24)
+        )
+        gray = np.full((180, 140), 200, dtype=np.uint8)
+        for cy in (40, 78, 116):
+            cv2.circle(gray, (48, cy), 12, 40, -1)
+        cv2.circle(gray, (78, 58), 5, 220, -1)
+        rebuilt = HardwareRegionDetector.rebuild_camera_cutouts(parts, gray)
+        self.assertGreaterEqual(len(rebuilt), 3)
+        # Must not collapse the stack into one module AABB.
+        boxes = []
+        for c in rebuilt:
+            pts = np.asarray(c, np.float32).reshape(-1, 2)
+            boxes.append(
+                (
+                    float(pts[:, 0].max() - pts[:, 0].min()),
+                    float(pts[:, 1].max() - pts[:, 1].min()),
+                )
+            )
+        self.assertTrue(all(max(bw, bh) < 50 for bw, bh in boxes))
+
     def test_button_wrap_samples_body_only_inside_mask(self) -> None:
         h, w = 180, 120
         output = np.zeros((h, w, 3), dtype=np.uint8)

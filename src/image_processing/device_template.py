@@ -438,16 +438,54 @@ def classify_cutout_kind(
     )
     if compact_fp:
         return "button"
-    if near_side and cy > y_min + height * 0.28:
-        return "button"
+    # Cover-face disks on the left/right (vertical camera stacks, punch-hole
+    # cameras) are not buttons — only skinny rim hardware is.
     if top_half and not thin_button:
-        # Small round satellite near camera island → flash.
-        # Looser size so hi-res flash selections stay labeled flash (and
-        # therefore forced to a perfect SDF circle on paint/freeze).
-        if aspect < 1.55 and max(bw, bh) < min(width, height) * 0.16:
+        # Tiny satellites only. Lens size is relative to the cluster
+        # (see classify_cutout_kinds); a phone-wide fraction mis-tags
+        # every compact array as flash.
+        if aspect < 1.55 and max(bw, bh) < min(width, height) * 0.075:
             return "flash"
         return "camera"
     return "other"
+
+
+def classify_cutout_kinds(
+    contours: Sequence[np.ndarray],
+    cover_quad: np.ndarray,
+) -> List[str]:
+    """
+    Label a set of hardware contours together.
+
+    Flash vs camera is relative to the other cover-face openings in this
+    photo, not a brand or a phone-wide pixel table.
+    """
+    items = [np.asarray(c, dtype=np.float32).reshape(-1, 2) for c in contours]
+    kinds = [classify_cutout_kind(pts, cover_quad) for pts in items]
+    face = [
+        i
+        for i, kind in enumerate(kinds)
+        if kind in ("camera", "flash")
+    ]
+    if len(face) < 2:
+        return kinds
+    sizes: List[float] = []
+    aspects: List[float] = []
+    for i in face:
+        pts = items[i]
+        bw = float(pts[:, 0].max() - pts[:, 0].min())
+        bh = float(pts[:, 1].max() - pts[:, 1].min())
+        sizes.append(max(bw, bh))
+        aspects.append(max(bw, bh) / max(min(bw, bh), 1.0))
+    med = float(np.median(np.asarray(sizes, dtype=np.float32)))
+    if med < 4.0:
+        return kinds
+    for j, i in enumerate(face):
+        if aspects[j] <= 1.55 and sizes[j] < med * 0.72:
+            kinds[i] = "flash"
+        elif kinds[i] == "flash" and sizes[j] >= med * 0.72:
+            kinds[i] = "camera"
+    return kinds
 
 
 def build_cutout_specs(
@@ -479,11 +517,12 @@ def build_cutout_specs(
     specs: List[CutoutSpec] = []
     tags = list(shape_tags) if shape_tags is not None else []
     mild = float(np.clip(corner_frac if corner_frac > 0 else 0.16, 0.08, 0.28))
+    kinds = classify_cutout_kinds(list(contours), cover_quad)
     for idx, contour in enumerate(contours):
         pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
         if pts.shape[0] < 3:
             continue
-        kind = classify_cutout_kind(pts, cover_quad)
+        kind = kinds[idx] if idx < len(kinds) else classify_cutout_kind(pts, cover_quad)
         tag = ""
         if idx < len(tags):
             tag = str(tags[idx] or "").lower().strip()

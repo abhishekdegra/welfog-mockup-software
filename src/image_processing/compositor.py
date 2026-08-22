@@ -1690,17 +1690,38 @@ class Compositor:
             er, y_min, y_max, phone_h, side="right"
         )
 
-        # Photo is the source of truth. Silhouette 1px AA vs an inward
-        # percentile wall is NOT a button — that invented mid-body nubs.
-        buttons = self._photo_side_button_mask(
+        # Photo is the source of truth. A 1px AA sliver is not a key —
+        # the silhouette wall supplies real protrusions on low-contrast
+        # bezels (silver phones) without inventing geometry.
+        photo_btn = self._photo_side_button_mask(
             raw, phone_bgr, wall_l, wall_r, y_min, y_max
         )
-        found_any = buttons is not None and np.count_nonzero(buttons) >= 4
-        if not found_any:
-            buttons = self._silhouette_side_button_mask(
-                raw, el, er, wall_l, wall_r, y_min, y_max, phone_h
+        sil_btn = self._silhouette_side_button_mask(
+            raw, el, er, wall_l, wall_r, y_min, y_max, phone_h
+        )
+
+        def _usable_keys(mask: Optional[np.ndarray]) -> bool:
+            if mask is None or np.count_nonzero(mask) < 8:
+                return False
+            nlab, _, stt, _ = cv2.connectedComponentsWithStats(
+                (mask > 127).astype(np.uint8), connectivity=8
             )
-            found_any = buttons is not None and np.count_nonzero(buttons) >= 4
+            long_px = max(24, int(round(phone_h * 0.05)))
+            return any(
+                (
+                    int(stt[i, cv2.CC_STAT_WIDTH]) >= 2
+                    and int(stt[i, cv2.CC_STAT_HEIGHT]) >= 6
+                )
+                or int(stt[i, cv2.CC_STAT_HEIGHT]) >= long_px
+                for i in range(1, nlab)
+            )
+
+        buttons = None
+        if _usable_keys(photo_btn):
+            buttons = photo_btn
+        elif _usable_keys(sil_btn):
+            buttons = sil_btn
+        found_any = buttons is not None and np.count_nonzero(buttons) >= 8
         # Fallback for flush / low-contrast keys on other phones. Skip when
         # the photo lip already found real nubs — extra ridges invent ghosts.
         if not found_any:
@@ -1857,7 +1878,9 @@ class Compositor:
         y_hi = int(np.clip(y_hi, y_lo, max(h - 1, 0)))
         rail_w = max(3, int(round(min(h, w) * 0.018)))
         min_span = max(6, int(round(phone_h * 0.012)))
-        max_span = max(min_span + 4, int(round(phone_h * 0.22)))
+        # Volume rockers are often ~25–35% of body height. A tighter cap
+        # dropped the real key and left only a 1px AA sliver.
+        max_span = max(min_span + 4, int(round(phone_h * 0.36)))
         out = np.zeros((h, w), dtype=np.uint8)
 
         for side in ("left", "right"):
@@ -1889,7 +1912,10 @@ class Compositor:
             valid = np.isfinite(first_x) & np.isfinite(lip)
             if int(np.count_nonzero(valid[y_lo : y_hi + 1])) < 12:
                 continue
-            quiet_x = float(np.nanmedian(first_x[y_lo : y_hi + 1]))
+            # Physical keys shift the outer contour past the quiet case wall.
+            # Median-of-edge was pulled outward by long rockers, so only a 1px
+            # AA sliver remained — blocking the silhouette button fallback.
+            quiet_x = float(wall)
             quiet_lip = float(np.nanmedian(lip[y_lo : y_hi + 1]))
             if not np.isfinite(quiet_x) or not np.isfinite(quiet_lip):
                 continue
@@ -1909,12 +1935,10 @@ class Compositor:
                 else:
                     outward = float(first_x[y]) - quiet_x
                 ld = float(lip_dev[y])
-                # Real keys: outer contour moves and/or the lip tone changes.
-                # 1px silhouette AA with an unchanged photo lip is rejected.
-                if (
-                    (outward >= 0.55 and ld >= 6.0)
-                    or ld >= max(14.0, lip_thr)
-                ):
+                # Quiet edge is the inward wall, so long rockers no longer
+                # cancel their own protrusion. Lip-only still catches flush
+                # keys whose outer column equals the AA fringe.
+                if outward >= 1.0 or ld >= max(14.0, lip_thr):
                     hit[y] = True
             hit = Compositor._fill_bool_gaps(hit, max_gap=2)
             spans = Compositor._grow_side_button_spans(
@@ -1929,11 +1953,8 @@ class Compositor:
                     else:
                         outward = float(first_x[y]) - quiet_x
                     # Span grow merges nearby keys — paint only rows that
-                    # actually protrude, not the full vertical run.
-                    if (
-                        outward < 0.55
-                        and float(lip_dev[y]) < 6.0
-                    ):
+                    # actually protrude or change lip, not the full run.
+                    if outward < 0.55 and float(lip_dev[y]) < 6.0:
                         continue
                     x_out = int(first_x[y])
                     x_end = int(round(wall))
@@ -1996,7 +2017,7 @@ class Compositor:
         y_lo = int(np.clip(y_lo, 0, max(h - 1, 0)))
         y_hi = int(np.clip(y_hi, y_lo, max(h - 1, 0)))
         min_span = max(6, int(round(phone_h * 0.012)))
-        max_span = max(min_span + 4, int(round(phone_h * 0.16)))
+        max_span = max(min_span + 4, int(round(phone_h * 0.36)))
         out = np.zeros((h, w), dtype=np.uint8)
         found = False
         for side in ("left", "right"):
@@ -2016,8 +2037,8 @@ class Compositor:
                     if side == "left"
                     else (float(edge[y]) - quiet)
                 )
-                # Need a real bump past the typical edge, not 1px AA.
-                if outward >= 1.05:
+                # Need a real bump past the typical edge, not sub-pixel AA.
+                if outward >= 1.0:
                     hit[y] = True
             hit = Compositor._fill_bool_gaps(hit, max_gap=2)
             spans = Compositor._grow_side_button_spans(
@@ -2032,7 +2053,7 @@ class Compositor:
                         if side == "left"
                         else (float(edge[y]) - quiet)
                     )
-                    if outward < 1.05:
+                    if outward < 1.0:
                         continue
                     if side == "left":
                         x_out = int(np.floor(float(edge[y])))
@@ -2750,7 +2771,7 @@ class Compositor:
             comp = labels == label
             bw_c = int(stats[label, cv2.CC_STAT_WIDTH])
             bh_c = int(stats[label, cv2.CC_STAT_HEIGHT])
-            if bw_c > phone_w * 0.12 or bh_c > phone_h * 0.38:
+            if bw_c > phone_w * 0.12 or bh_c > phone_h * 0.45:
                 continue
             bezel_frac = float(np.count_nonzero(comp & (bezel > 127))) / float(
                 area
@@ -5085,10 +5106,9 @@ class Compositor:
                 r = float(params[2]) if len(params) >= 3 else 0.0
                 cx = float(params[0]) if len(params) >= 1 else 0.0
                 cy = float(params[1]) if len(params) >= 2 else 1e9
-                # Keep only compact top-of-phone flash disks. Oversized /
-                # rim-touching disks punched the top-left body beside the
-                # camera island (looked like a bald L around the module).
-                if not (0.5 < r <= short_img * 0.045 and cy <= height * 0.22):
+                # Satellites of the camera cluster — not "must sit in the
+                # top 22% of the frame" (vertical lens stacks live lower).
+                if not (0.5 < r <= short_img * 0.10):
                     continue
                 pm = getattr(self.cover_engine, "last_phone_mask", None)
                 if pm is None:
@@ -5111,7 +5131,14 @@ class Compositor:
                 keep.append(spec)
                 continue
             if kind in ("camera", "other") and geom == "circle":
-                bad_cams.append(spec)
+                params = list(getattr(spec, "params", []) or [])
+                r = float(params[2]) if len(params) >= 3 else 0.0
+                # Giant enclosing disks of a whole module — collapse later.
+                # Real lens openings stay separate on every layout.
+                if r > short_img * 0.14:
+                    bad_cams.append(spec)
+                    continue
+                keep.append(spec)
                 continue
             if (
                 kind in ("camera", "other")
@@ -5457,9 +5484,11 @@ class Compositor:
                 phone = to_bgr(self.phone_image)
                 pm = getattr(self.cover_engine, "last_phone_mask", None)
                 if pm is not None and np.count_nonzero(pm) > 64:
-                    from .mesh import AdaptiveMeshBuilder
+                    from .cover_surface import CoverSurfaceEngine
 
-                    quad = AdaptiveMeshBuilder._stable_quad_from_mask(pm)
+                    quad = CoverSurfaceEngine._canonical_hardware_quad(
+                        phone, None, pm
+                    )
                 else:
                     quad = (
                         self.control_mesh.corner_points()
@@ -6282,22 +6311,35 @@ class Compositor:
         # Split a cluster AABB into the real lens rings when the photo has
         # discrete cameras (not a raised island plate).
         try:
-            from .device_template import classify_cutout_kind
+            from .device_template import classify_cutout_kind, classify_cutout_kinds
             from .region_detector import HardwareRegionDetector
 
             if self.phone_image is not None and self.hardware_contours:
-                cover_quad = (
-                    self.control_mesh.corner_points()
-                    if self.control_mesh is not None
-                    else surface.mesh.corner_points()
+                cover_quad = CoverSurfaceEngine._canonical_hardware_quad(
+                    to_bgr(self.phone_image),
+                    (
+                        self.control_mesh.corner_points()
+                        if self.control_mesh is not None
+                        else surface.mesh.corner_points()
+                    ),
+                    getattr(surface, "phone_mask", None),
                 )
                 cam: List[np.ndarray] = []
                 other: List[np.ndarray] = []
-                for contour in self.hardware_contours:
+                kinds = classify_cutout_kinds(
+                    [
+                        np.asarray(c, dtype=np.float32).reshape(-1, 2)
+                        for c in self.hardware_contours
+                    ],
+                    cover_quad,
+                )
+                for contour, kind in zip(self.hardware_contours, kinds):
                     pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
-                    kind = classify_cutout_kind(pts, cover_quad)
                     if kind in ("camera", "flash"):
                         cam.append(pts)
+                    elif kind == "button":
+                        # Buttons wrap on their own mask — never a punched hole.
+                        continue
                     else:
                         other.append(pts)
                 if cam:
@@ -6320,9 +6362,15 @@ class Compositor:
                 gray = cv2.cvtColor(to_bgr(self.phone_image), cv2.COLOR_BGR2GRAY)
                 self.cutout_specs = build_cutout_specs(
                     self.hardware_contours,
-                    self.control_mesh.corner_points()
-                    if self.control_mesh is not None
-                    else surface.mesh.corner_points(),
+                    CoverSurfaceEngine._canonical_hardware_quad(
+                        to_bgr(self.phone_image),
+                        (
+                            self.control_mesh.corner_points()
+                            if self.control_mesh is not None
+                            else surface.mesh.corner_points()
+                        ),
+                        getattr(surface, "phone_mask", None),
+                    ),
                     w,
                     h,
                     phone_gray=gray,

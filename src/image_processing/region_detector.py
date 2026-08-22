@@ -710,6 +710,9 @@ class HardwareRegionDetector:
         HardwareRegionDetector._refine_camera_to_dark_plate(
             phone, full_mask, quad
         )
+        HardwareRegionDetector._clip_face_openings_to_cover(
+            full_mask, quad, image_w, image_h
+        )
 
         # Dense / circular contours → smooth overlay & editable cutouts.
         contours = HardwareRegionDetector._smooth_exclusion_contours(full_mask)
@@ -754,12 +757,32 @@ class HardwareRegionDetector:
             blur, mask, scores, width, top_height, circles
         )
         circles = circles + satellites
-        # Prefer a real raised square/rounded plate when visible — this is what
-        # production mockups punch, not a soft union of lens circles.
-        plate = HardwareRegionDetector._detect_square_camera_plate(
-            blur, width, top_height, circles
-        )
-        if plate is not None:
+        # Discrete rings on a flat back must stay separate openings. A raised
+        # plate (Redmi-style island) still merges; cover-colored gaps do not.
+        discrete_face = False
+        if len(circles) >= 2:
+            lens_xyr = [
+                (float(x), float(y), float(r)) for x, y, r in circles
+            ]
+            xs = [c[0] for c in lens_xyr]
+            ys = [c[1] for c in lens_xyr]
+            rs = [c[2] for c in lens_xyr]
+            discrete_face = HardwareRegionDetector._lenses_sit_on_cover_face(
+                gray,
+                lens_xyr,
+                min(x - r for x, r in zip(xs, rs)),
+                min(y - r for y, r in zip(ys, rs)),
+                max(x + r for x, r in zip(xs, rs)),
+                max(y + r for y, r in zip(ys, rs)),
+            )
+        plate = None
+        if not discrete_face:
+            plate = HardwareRegionDetector._detect_square_camera_plate(
+                blur, width, top_height, circles
+            )
+        if discrete_face:
+            pass
+        elif plate is not None:
             x1, y1, x2, y2 = plate
             corner = max(3, int(min(x2 - x1, y2 - y1) * 0.14))
             HardwareRegionDetector._rounded_rectangle(
@@ -778,15 +801,16 @@ class HardwareRegionDetector:
             gray, mask, scores, width, height
         )
 
-        HardwareRegionDetector._merge_camera_cluster(
-            mask, width, top_height, circles if plate is None else []
-        )
-        # Tightening dissolves clean plate corners into jagged freeforms —
-        # only run when we fell back to circle/blob unions.
-        if plate is None:
-            HardwareRegionDetector._tighten_to_hardware(
-                mask, gray, top_height, circles
+        if not discrete_face:
+            HardwareRegionDetector._merge_camera_cluster(
+                mask, width, top_height, circles if plate is None else []
             )
+            # Tightening dissolves clean plate corners into jagged freeforms —
+            # only run when we fell back to circle/blob unions.
+            if plate is None:
+                HardwareRegionDetector._tighten_to_hardware(
+                    mask, gray, top_height, circles
+                )
         HardwareRegionDetector._prune_orphan_exclusions(
             mask, width, height
         )
@@ -839,6 +863,17 @@ class HardwareRegionDetector:
                 if center_x < 0.07 and y > top_height * 0.38:
                     continue
                 if y > top_height * 0.92:
+                    continue
+                # Rounded case corners look circular to Hough and sit on the
+                # rectified frame origin. Unioning them with nearby lenses
+                # paints one blob over the whole array.
+                if (
+                    (x - radius) <= 1
+                    and (y - radius) <= 1
+                ) or (
+                    (x + radius) >= (width - 2)
+                    and (y - radius) <= 1
+                ):
                     continue
                 # Reject circles whose interior looks like plain cover.
                 if not HardwareRegionDetector._circle_looks_like_hardware(
@@ -1157,6 +1192,10 @@ class HardwareRegionDetector:
         keep = np.zeros(count, dtype=bool)
         for label in range(1, count):
             x, y, w, h, area = stats[label]
+            # Speckles glued to the analysis-frame edge are not hardware.
+            on_frame = y <= 1 or x <= 1 or (x + w) >= (width - 1)
+            if on_frame and area < 180 and max(w, h) <= 22:
+                continue
             cx, cy = float(cents[label][0]), float(cents[label][1])
             touches_side = x <= edge or (x + w) >= (width - edge)
             aspect = max(w, h) / max(min(w, h), 1)
@@ -1187,7 +1226,50 @@ class HardwareRegionDetector:
                     cam_label = label
         if cam_label > 0:
             keep[cam_label] = True
-            # Keep small satellites overlapping / near the camera island.
+            # Discrete lens arrays are several compact upper circles.
+            # Keeping only the largest (plus satellites within its own
+            # radius) deleted the rest of the stack.
+            HardwareRegionDetector._keep_clustered_upper_openings(
+                keep, stats, cents, cam_label, top_band
+            )
+        # If nothing classified, keep the largest component only.
+        if not np.any(keep[1:]):
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            keep[largest] = True
+        for label in range(1, count):
+            if not keep[label]:
+                mask[labels == label] = 0
+
+    @staticmethod
+    def _keep_clustered_upper_openings(
+        keep: np.ndarray,
+        stats: np.ndarray,
+        cents: np.ndarray,
+        cam_label: int,
+        top_band: int,
+    ) -> None:
+        """
+        Keep every opening in the same upper cluster as the primary camera.
+
+        A raised island is one blob (unchanged). Separate lenses / flash on a
+        flat back are several compact circles — they must stay together.
+        """
+        count = int(stats.shape[0])
+        members: List[int] = []
+        radii: List[float] = []
+        for label in range(1, count):
+            _x, _y, bw, bh, area = stats[label]
+            cy = float(cents[label][1])
+            if cy > top_band or area < 24:
+                continue
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            fill = float(area) / max(float(bw * bh), 1.0)
+            compact = aspect <= 1.55 and fill >= 0.55
+            if compact or label == cam_label:
+                members.append(label)
+                radii.append(0.5 * float(max(bw, bh)))
+        if len(members) <= 1:
+            # Single island: keep nearby smaller satellites (flash / mic).
             cx0, cy0 = float(cents[cam_label][0]), float(cents[cam_label][1])
             cam_r = 0.5 * max(stats[cam_label][2], stats[cam_label][3])
             for label in range(1, count):
@@ -1199,13 +1281,60 @@ class HardwareRegionDetector:
                 cx, cy = float(cents[label][0]), float(cents[label][1])
                 if ((cx - cx0) ** 2 + (cy - cy0) ** 2) ** 0.5 <= cam_r * 1.35:
                     keep[label] = True
-        # If nothing classified, keep the largest component only.
-        if not np.any(keep[1:]):
-            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-            keep[largest] = True
+            return
+        link = max(14.0, float(np.median(radii)) * 2.85)
+        parent = list(range(len(members)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i, li in enumerate(members):
+            xi, yi = float(cents[li][0]), float(cents[li][1])
+            ri = radii[i]
+            for j in range(i + 1, len(members)):
+                lj = members[j]
+                xj, yj = float(cents[lj][0]), float(cents[lj][1])
+                dist = ((xi - xj) ** 2 + (yi - yj) ** 2) ** 0.5
+                if dist <= link + 0.35 * (ri + radii[j]):
+                    ri_i, rj_i = find(i), find(j)
+                    if ri_i != rj_i:
+                        parent[rj_i] = ri_i
+        groups: dict = {}
+        for i, li in enumerate(members):
+            groups.setdefault(find(i), []).append(i)
+
+        def _gscore(idxs: List[int]) -> float:
+            labs = [members[k] for k in idxs]
+            area = float(sum(int(stats[lab][4]) for lab in labs))
+            has_cam = 1.25 if cam_label in labs else 1.0
+            return area * has_cam * (1.0 + 0.12 * len(idxs))
+
+        best = max(groups.values(), key=_gscore)
+        for k in best:
+            keep[members[k]] = True
+        xs = [float(cents[members[k]][0]) for k in best]
+        ys = [float(cents[members[k]][1]) for k in best]
+        rs = [radii[k] for k in best]
+        cx0 = float(np.mean(xs))
+        cy0 = float(np.mean(ys))
+        reach = max(rs) * 2.2 + 0.55 * max(
+            max(xs) - min(xs), max(ys) - min(ys)
+        )
+        cluster_area = max(int(stats[members[k]][4]) for k in best)
         for label in range(1, count):
-            if not keep[label]:
-                mask[labels == label] = 0
+            if keep[label]:
+                continue
+            area = int(stats[label][4])
+            if area < 16 or area > cluster_area * 0.85:
+                continue
+            if float(cents[label][1]) > top_band:
+                continue
+            cx, cy = float(cents[label][0]), float(cents[label][1])
+            if ((cx - cx0) ** 2 + (cy - cy0) ** 2) ** 0.5 <= reach:
+                keep[label] = True
 
     @staticmethod
     def _snap_camera_island(
@@ -1244,6 +1373,19 @@ class HardwareRegionDetector:
                 cam_score = score
                 cam_label = label
         if cam_label < 0:
+            return
+        # Two or more compact upper circles = discrete lenses on a flat back.
+        # Absorbing them into one AABB is the rectangular hole on S-style shots.
+        circular_n = 0
+        for label in range(1, count):
+            x, y, bw, bh, area = stats[label]
+            if float(cents[label][1]) > top_band or area < 80:
+                continue
+            aspect = max(bw, bh) / max(min(bw, bh), 1)
+            fill = float(area) / max(float(bw * bh), 1.0)
+            if aspect <= 1.35 and fill >= 0.70:
+                circular_n += 1
+        if circular_n >= 2:
             return
         x, y, w, h, area = stats[cam_label]
         if only_if_jagged:
@@ -1344,6 +1486,18 @@ class HardwareRegionDetector:
                 cam_score = score
                 cam_label = label
         if cam_label < 0:
+            return
+        # Discrete lenses on a flat back must not be replaced by one plate.
+        circular_n = 0
+        for label in range(1, count):
+            x0, y0, cw, ch, area = stats[label]
+            if float(cents[label][1]) > top_band or area < 80:
+                continue
+            aspect = max(cw, ch) / max(min(cw, ch), 1)
+            fill = float(area) / max(float(cw * ch), 1.0)
+            if aspect <= 1.35 and fill >= 0.70:
+                circular_n += 1
+        if circular_n >= 2:
             return
         x, y, bw, bh, _ = stats[cam_label]
         # Search slightly inside the current hole for the dark plate.
@@ -3273,6 +3427,60 @@ class HardwareRegionDetector:
             phone = to_bgr(phone_image)
             gray = cv2.cvtColor(phone, cv2.COLOR_BGR2GRAY)
 
+        # Already-separate compact openings must not be union-Houghed into
+        # one plate (that rebuilt a rectangular hole around discrete lenses).
+        if HardwareRegionDetector._parts_are_discrete_openings(parts):
+            finished: List[np.ndarray] = []
+            for pts in parts:
+                one = HardwareRegionDetector._rebuild_camera_from_lenses(
+                    [pts], gray
+                )
+                seed_area = float(
+                    cv2.contourArea(
+                        np.asarray(pts, np.float32).reshape(-1, 1, 2)
+                    )
+                )
+                if one:
+                    cands = []
+                    for item in one:
+                        ip = np.asarray(item, np.float32).reshape(-1, 2)
+                        ia = float(cv2.contourArea(ip.reshape(-1, 1, 2)))
+                        if ia <= seed_area * 1.08 and ia >= 12:
+                            cands.append((ia, ip))
+                    if cands:
+                        biggest = max(t[0] for t in cands)
+                        compact = [
+                            t for t in cands if t[0] >= biggest * 0.48
+                        ]
+                        disks = [
+                            t
+                            for t in compact
+                            if HardwareRegionDetector._looks_like_true_disk(
+                                t[1]
+                            )
+                        ]
+                        pool = disks or compact
+                        # Prefer the tight ring over the enclosing blob.
+                        picked = min(pool, key=lambda t: t[0])[1]
+                        if gray is not None:
+                            picked = HardwareRegionDetector._shrink_disk_to_lens(
+                                gray, picked
+                            )
+                        finished.append(picked)
+                        continue
+                polished = HardwareRegionDetector._perfect_one_contour(
+                    pts, gray, lock_bounds=False
+                )
+                if polished is not None and len(polished) >= 3:
+                    finished.append(polished)
+                else:
+                    finished.append(pts)
+            if finished:
+                finished = HardwareRegionDetector._drop_nested_openings(
+                    finished
+                )
+                return [np.asarray(c, np.float32).reshape(-1, 1, 2) for c in finished]
+
         # 1) Lens Hough first. Snap-to-silhouette used to win with the
         # cluster AABB and paint a rectangular hole around discrete lenses.
         rebuilt = HardwareRegionDetector._rebuild_camera_from_lenses(
@@ -3417,6 +3625,229 @@ class HardwareRegionDetector:
         return out if len(out) == len(parts) else []
 
     @staticmethod
+    def _parts_are_discrete_openings(parts: List[np.ndarray]) -> bool:
+        """
+        True when detect already produced separate openings.
+
+        A module plate plus nested holes is one parent bbox containing the
+        rest — those still rebuild as a single island.
+        """
+        if len(parts) < 2:
+            return False
+        boxes = []
+        for part in parts:
+            pts = np.asarray(part, dtype=np.float32).reshape(-1, 2)
+            if pts.shape[0] < 3:
+                continue
+            boxes.append(
+                (
+                    float(pts[:, 0].min()),
+                    float(pts[:, 1].min()),
+                    float(pts[:, 0].max()),
+                    float(pts[:, 1].max()),
+                )
+            )
+        if len(boxes) < 2:
+            return False
+        for i, a in enumerate(boxes):
+            contained = 0
+            for j, b in enumerate(boxes):
+                if i == j:
+                    continue
+                if (
+                    b[0] >= a[0] - 2
+                    and b[1] >= a[1] - 2
+                    and b[2] <= a[2] + 2
+                    and b[3] <= a[3] + 2
+                ):
+                    contained += 1
+            if contained >= len(boxes) - 1:
+                return False
+        return True
+
+    @staticmethod
+    def _drop_nested_openings(parts: List[np.ndarray]) -> List[np.ndarray]:
+        """Drop glint disks that sit inside a larger lens opening."""
+        items = [np.asarray(p, np.float32).reshape(-1, 2) for p in parts]
+        items = [p for p in items if p.shape[0] >= 3]
+        if len(items) < 2:
+            return items
+        meta = []
+        for pts in items:
+            (cx, cy), radius = cv2.minEnclosingCircle(pts)
+            area = float(cv2.contourArea(pts.reshape(-1, 1, 2)))
+            meta.append((area, float(cx), float(cy), float(radius), pts))
+        meta.sort(key=lambda t: -t[0])
+        kept: List[np.ndarray] = []
+        kept_meta: List[Tuple[float, float, float]] = []
+        for area, cx, cy, radius, pts in meta:
+            nested = False
+            for kx, ky, kr in kept_meta:
+                dist = ((cx - kx) ** 2 + (cy - ky) ** 2) ** 0.5
+                if dist + radius * 0.35 <= kr * 1.05 and area < kr * kr * 1.6:
+                    nested = True
+                    break
+            if nested:
+                continue
+            kept.append(pts)
+            kept_meta.append((cx, cy, radius))
+        return kept if kept else items
+
+    @staticmethod
+    def _shrink_disk_to_lens(
+        gray: np.ndarray, pts: np.ndarray
+    ) -> np.ndarray:
+        """
+        Shrink an enclosing disk onto the dark lens / bright flash core.
+
+        Oversized Hough hits include adjacent cover; contrast vs the ring
+        peaks on the real opening.
+        """
+        pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        (cx, cy), radius = cv2.minEnclosingCircle(pts)
+        cx, cy, radius = HardwareRegionDetector._refine_circle(
+            gray, float(cx), float(cy), float(radius)
+        )
+        best_r = float(radius)
+        best_s = -1.0
+        ix, iy = int(round(cx)), int(round(cy))
+        for scale in (1.0, 0.92, 0.84, 0.76, 0.68, 0.60):
+            rr = float(radius) * scale
+            if rr < 4.0:
+                break
+            ir = max(2, int(round(rr)))
+            if not HardwareRegionDetector._circle_looks_like_hardware(
+                gray, ix, iy, ir
+            ):
+                continue
+            yy, xx = np.ogrid[-ir : ir + 1, -ir : ir + 1]
+            disk = xx * xx + yy * yy <= ir * ir
+            h, w = gray.shape[:2]
+            y0, y1 = max(0, iy - ir), min(h, iy + ir + 1)
+            x0, x1 = max(0, ix - ir), min(w, ix + ir + 1)
+            patch = gray[y0:y1, x0:x1].astype(np.float32)
+            dy0, dx0 = y0 - (iy - ir), x0 - (ix - ir)
+            local = disk[dy0 : dy0 + patch.shape[0], dx0 : dx0 + patch.shape[1]]
+            if np.count_nonzero(local) < 8:
+                continue
+            interior = float(np.median(patch[local]))
+            ry = max(ir + 2, int(ir * 1.55))
+            y0r, y1r = max(0, iy - ry), min(h, iy + ry + 1)
+            x0r, x1r = max(0, ix - ry), min(w, ix + ry + 1)
+            surround = gray[y0r:y1r, x0r:x1r].astype(np.float32)
+            yy, xx = np.ogrid[y0r - iy : y1r - iy, x0r - ix : x1r - ix]
+            ring = (xx * xx + yy * yy <= (ir * 1.55) ** 2) & (
+                xx * xx + yy * yy > (ir * 1.08) ** 2
+            )
+            if np.count_nonzero(ring) < 8:
+                continue
+            exterior = float(np.median(surround[ring]))
+            score = abs(interior - exterior) - 0.15 * rr
+            if score > best_s:
+                best_s = score
+                best_r = rr
+        if best_s < 0:
+            return pts
+        return HardwareRegionDetector._sample_circle(
+            cx, cy, best_r, samples=48
+        ).reshape(-1, 2)
+
+    @staticmethod
+    def _clip_face_openings_to_cover(
+        mask: np.ndarray,
+        quad: np.ndarray,
+        width: int,
+        height: int,
+    ) -> None:
+        """
+        Camera holes live on the cover face, not the case rim.
+
+        Rim-hugging disks (corner fillets warped into the mask) are clipped
+        to an inset of the cover quad. Thin side buttons are left on the rim.
+        """
+        binary = (mask > 32).astype(np.uint8)
+        if np.count_nonzero(binary) == 0:
+            return
+        cover = np.zeros((height, width), dtype=np.uint8)
+        pts = np.round(order_points(quad)).astype(np.int32)
+        cv2.fillConvexPoly(cover, pts, 255)
+        inset = max(3, int(round(min(width, height) * 0.012)))
+        inner = cv2.erode(
+            cover,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (inset * 2 + 1, inset * 2 + 1)
+            ),
+        )
+        q = order_points(quad)
+        qx0 = float(q[:, 0].min())
+        qx1 = float(q[:, 0].max())
+        cover_w = max(qx1 - qx0, 1.0)
+        rim_band = max(6.0, 0.08 * cover_w)
+        count, labels, stats, _cents = cv2.connectedComponentsWithStats(
+            binary, 8
+        )
+        for label in range(1, count):
+            x, y, bw, bh, area = stats[label]
+            if area < 16:
+                continue
+            on_cover_rim = (
+                float(x) <= qx0 + rim_band
+                or float(x + bw) >= qx1 - rim_band
+            )
+            skinny = bw <= max(12, int(cover_w * 0.10)) and bh >= bw * 1.4
+            if on_cover_rim and skinny:
+                continue
+            comp = labels == label
+            outside = comp & (inner == 0)
+            if np.count_nonzero(outside) == 0:
+                continue
+            if float(np.count_nonzero(outside)) / float(area) > 0.22:
+                mask[comp] = 0
+            else:
+                mask[outside] = 0
+
+    @staticmethod
+    def _module_plate_encloses(
+        gray: np.ndarray,
+        lenses: List[Tuple[float, float, float]],
+        bx1: float,
+        by1: float,
+        bx2: float,
+        by2: float,
+    ) -> bool:
+        """
+        True when a raised camera plate contains the lens cluster.
+
+        Distinguishes a Redmi-style island (one hole) from discrete rings
+        whose union bbox is tall but has no plate.
+        """
+        if gray is None or len(lenses) < 2:
+            return False
+        h, w = gray.shape[:2]
+        top_h = int(min(h, max(int(h * 0.58), int(np.ceil(by2)) + 8)))
+        circles = [
+            (int(round(x)), int(round(y)), max(2, int(round(r))))
+            for x, y, r in lenses
+        ]
+        plate = HardwareRegionDetector._detect_square_camera_plate(
+            gray, w, top_h, circles
+        )
+        if plate is None:
+            return False
+        x1, y1, x2, y2 = plate
+        med_d = 2.0 * float(np.median([c[2] for c in lenses]))
+        if min(x2 - x1, y2 - y1) < med_d * 1.8:
+            return False
+        n_in = 0
+        for x, y, r in lenses:
+            if (x1 - 0.25 * r) <= x <= (x2 + 0.25 * r) and (
+                y1 - 0.25 * r
+            ) <= y <= (y2 + 0.25 * r):
+                n_in += 1
+        need = min(len(lenses), max(2, int(np.ceil(0.7 * len(lenses)))))
+        return n_in >= need
+
+    @staticmethod
     def _lenses_sit_on_cover_face(
         gray: np.ndarray,
         lenses: List[Tuple[float, float, float]],
@@ -3504,8 +3935,13 @@ class HardwareRegionDetector:
         blur = cv2.GaussianBlur(roi, (0, 0), 1.15)
         # Lens radii relative to the user cutout — works across phone models.
         r_min = max(4, int(min(bw, bh) * 0.08))
-        r_max = max(r_min + 2, int(min(bw, bh) * 0.28))
-        min_dist = max(6, int(min(bw, bh) * 0.16))
+        # Stacked discrete lenses: the cluster is tall/narrow and each
+        # opening is ~the short side. A 0.28 cap only fitted square islands.
+        short, long = min(bw, bh), max(bw, bh)
+        aspect = long / max(short, 1.0)
+        r_frac = 0.52 if (aspect >= 1.65 or len(parts) == 1) else 0.32
+        r_max = max(r_min + 2, int(short * r_frac))
+        min_dist = max(6, int(short * 0.16))
         circles = cv2.HoughCircles(
             blur,
             cv2.HOUGH_GRADIENT,
@@ -3548,7 +3984,7 @@ class HardwareRegionDetector:
         # Deduplicate near-duplicates.
         found.sort(key=lambda c: -c[2])
         unique: List[Tuple[float, float, float]] = []
-        max_r = 0.32 * min(bw, bh)
+        max_r = short * r_frac
         for cx, cy, radius in found:
             if radius > max_r:
                 continue
@@ -3590,15 +4026,20 @@ class HardwareRegionDetector:
                     cx, cy, radius * 1.06, samples=48
                 )
             )
-        elif HardwareRegionDetector._lenses_sit_on_cover_face(
-            gray, lenses, bx1, by1, bx2, by2
+        elif (
+            HardwareRegionDetector._lenses_sit_on_cover_face(
+                gray, lenses, bx1, by1, bx2, by2
+            )
+            and not HardwareRegionDetector._module_plate_encloses(
+                gray, lenses, bx1, by1, bx2, by2
+            )
         ):
-            # Discrete rings on a flat back (S23-style) — punch each lens,
+            # Discrete rings on a flat back — punch each lens,
             # never a rectangular cluster hole.
             for cx, cy, radius in lenses:
                 out.append(
                     HardwareRegionDetector._sample_circle(
-                        cx, cy, radius * 1.08, samples=48
+                        cx, cy, radius * 1.02, samples=48
                     )
                 )
         else:
@@ -4574,6 +5015,10 @@ class HardwareRegionDetector:
         """Build a full exclusion mask from authoritative CutoutSpecs."""
         mask = np.zeros((height, width), dtype=np.uint8)
         for spec in specs:
+            kind = str(getattr(spec, "kind", "") or "")
+            # Side keys are wrapped on a separate mask, not punched as holes.
+            if kind == "button":
+                continue
             HardwareRegionDetector.paint_from_cutout_spec(
                 mask, spec, width, height
             )
