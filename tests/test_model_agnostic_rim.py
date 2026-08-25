@@ -920,6 +920,97 @@ class ModelAgnosticRimTests(unittest.TestCase):
         self.assertGreater(len(dest_left), 40)
         self.assertGreaterEqual(min(dest_left), 0.98)
 
+    def test_product_rim_gate_corners_use_path_coverage_aa(self) -> None:
+        """Corner rim is the existing path with coverage AA, not binary stairs."""
+        from src.image_processing.mesh import ControlMesh
+
+        mask = _rounded_rect_mask(400, 220, 40, 20, 180, 380, 28)
+        quad = np.array(
+            [[40.0, 20.0], [180.0, 20.0], [180.0, 380.0], [40.0, 380.0]],
+            dtype=np.float32,
+        )
+        mesh = ControlMesh.from_quad(quad, 9, 7)
+        gate = Compositor()._product_rim_gate(mesh, mask, mask.shape)
+        self.assertIsNotNone(gate)
+        body = mask > 127
+        iso = gate >= 0.5
+        inter = float(np.count_nonzero(iso & body))
+        union = float(np.count_nonzero(iso | body))
+        self.assertGreater(inter / max(union, 1.0), 0.97)
+        dist_in = cv2.distanceTransform(body.astype(np.uint8), cv2.DIST_L2, 5)
+        self.assertGreaterEqual(float(gate[dist_in >= 6.0].min()), 0.97)
+        left = [
+            float(gate[y, 40])
+            for y in range(140, 260)
+            if mask[y, 40] > 127
+        ]
+        self.assertGreaterEqual(min(left), 0.98)
+        patches = (
+            gate[20:52, 40:72],
+            gate[20:52, 148:180],
+            gate[348:380, 40:72],
+            gate[348:380, 148:180],
+        )
+        aa_counts = [
+            int(np.count_nonzero((p > 0.12) & (p < 0.88))) for p in patches
+        ]
+        for n in aa_counts:
+            self.assertGreater(n, 12)
+        self.assertGreater(min(aa_counts), int(max(aa_counts) * 0.40))
+
+        def _left_xs(arr: np.ndarray, y0: int, y1: int) -> np.ndarray:
+            xs = []
+            for y in range(y0, y1):
+                row = arr[y].astype(np.float32)
+                over = np.where(row >= 0.5)[0]
+                if not over.size:
+                    xs.append(np.nan)
+                    continue
+                i = int(over.min())
+                if i <= 0:
+                    xs.append(0.0)
+                    continue
+                a = float(row[i - 1])
+                b = float(row[i])
+                t = (0.5 - a) / max(b - a, 1e-6)
+                xs.append(float(i - 1) + float(np.clip(t, 0.0, 1.0)))
+            return np.asarray(xs, dtype=np.float32)
+
+        def _kink(xs: np.ndarray) -> float:
+            d = np.diff(xs)
+            d = d[np.isfinite(d)]
+            if d.size < 3:
+                return 0.0
+            return float(np.sum(np.abs(np.diff(d))))
+
+        bin_xs = _left_xs(mask.astype(np.float32) / 255.0, 20, 48)
+        gate_xs = _left_xs(gate, 20, 48)
+        self.assertLess(_kink(gate_xs), _kink(bin_xs) * 0.75)
+
+    def test_finalize_keeps_corner_coverage_aa(self) -> None:
+        """Final raster must not snap rounded corners back to binary stairs."""
+        h, w = 200, 120
+        body = _rounded_rect_mask(h, w, 20, 16, 100, 184, 22)
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[body > 0] = (40, 42, 48)
+        output = phone.copy()
+        output[body > 0] = (20, 30, 180)
+        out = Compositor._finalize_body_boundary_raster(output, phone, body)
+        self.assertLess(float(np.mean(out[100, 60])), 80.0)
+        self.assertGreater(float(np.mean(out[2, 2])), 250.0)
+        patches = (
+            out[:40, :40],
+            out[:40, -40:],
+            out[-40:, :40],
+            out[-40:, -40:],
+        )
+        aa_counts = []
+        for p in patches:
+            gray = p.mean(axis=2)
+            aa_counts.append(int(np.count_nonzero((gray > 40.0) & (gray < 230.0))))
+            self.assertGreater(aa_counts[-1], 8)
+        self.assertGreater(min(aa_counts), int(max(aa_counts) * 0.35))
+
     def test_finalize_does_not_paste_studio_onto_body_rim(self) -> None:
         h, w = 80, 60
         body = np.zeros((h, w), dtype=np.uint8)

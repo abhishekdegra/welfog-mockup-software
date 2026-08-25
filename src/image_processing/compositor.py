@@ -8154,6 +8154,29 @@ class Compositor:
         )
 
     @staticmethod
+    def _corner_weight_from_silhouette(body: np.ndarray) -> np.ndarray:
+        """1 near the four outer corners, 0 along straight mid-sides."""
+        from .mesh import _corner_proximity_map
+
+        on = np.asarray(body)
+        if on.dtype != np.bool_ and float(np.max(on)) > 1.5:
+            on = on > 127
+        else:
+            on = on.astype(bool)
+        h, w = on.shape[:2]
+        ys, xs = np.where(on)
+        if xs.size < 16:
+            return np.zeros((h, w), dtype=np.float32)
+        return _corner_proximity_map(
+            (h, w),
+            x0=float(xs.min()),
+            y0=float(ys.min()),
+            x1=float(xs.max()),
+            y1=float(ys.max()),
+            corner_frac=0.22,
+        )
+
+    @staticmethod
     def _rasterize_outer_boundary_aa(
         output: np.ndarray,
         phone_bgr: np.ndarray,
@@ -8262,16 +8285,15 @@ class Compositor:
                 )
             mid_force = np.clip(cw0, 0.0, 1.0) < 0.16
         g = np.where(mid_force & (dist_in >= 1.5), np.maximum(g, 0.97), g)
-        # Do NOT stamp the binary body mask onto the float gate. That copied
-        # AABB/threshold stairs past the real rounded rim (over-wrap).
-        # Never zero gate on photo-silhouette body — bright rim is often
-        # border-connected to the studio card but must stay wrap-covered.
-        g = np.where(body_on, np.maximum(g, 0.97), g)
-        # Drop gate only on pure studio OUTSIDE the silhouette.
-        g = np.where(studio_px & ~body_on, 0.0, g)
-        g = np.where(g >= 0.92, 1.0, g)
+        # Mid-sides stay opaque wrap on the photo body. Corner pockets keep
+        # the float path gate — stamping binary body_on here re-drew the
+        # rounded rim as 1px stairs.
+        g = np.where(mid_force & body_on, np.maximum(g, 0.97), g)
+        g = np.where(studio_px & ~body_on & mid_force, 0.0, g)
+        g = np.where(mid_force & (g >= 0.92), 1.0, g)
         # Clip stray wrap outside the photo silhouette (~0.55px AA band).
-        far = (~body_on) & (dist_out > 0.55)
+        # Corners: only drop empty gate, never a binary dist_out snap.
+        far = mid_force & (~body_on) & (dist_out > 0.55)
         if tip_mask is not None and np.count_nonzero(tip_mask) >= 4:
             tm0 = tip_mask
             if tm0.shape[:2] != (h, w):
@@ -8282,6 +8304,7 @@ class Compositor:
                 )
             far = far & ~(tm0 > 127)
         g = np.where(far, 0.0, g)
+        g = np.where((~mid_force) & (g < 0.02) & (~body_on), 0.0, g)
         g = np.clip(g, 0.0, 1.0)
 
         blended = out_f * g[:, :, np.newaxis] + studio_rgb.reshape(1, 1, 3) * (
@@ -9092,19 +9115,17 @@ class Compositor:
         exact = Compositor._exact_coverage_aa(binary, scale=16)
         pts = AdaptiveMeshBuilder.outer_contour_polyline(binary, smooth=False)
         cov = exact
+        cov_poly = None
         if pts is not None and pts.shape[0] >= 16:
             raw_pts = pts.astype(np.float32)
             sm = AdaptiveMeshBuilder._smooth_closed_polyline(raw_pts, window=7)
             delta = sm - raw_pts
             mag = np.linalg.norm(delta, axis=1, keepdims=True)
             ys0, xs0 = np.where(on)
-            phone_short = float(
-                min(int(xs0.max()) - int(xs0.min()) + 1, int(ys0.max()) - int(ys0.min()) + 1)
-            )
-            # Mid-sides stay tight (0.4px). Corner stairs round using a
-            # fraction of THIS phone's short side — not a model table.
+            # Mid-sides stay tight (0.4px). Corner stairs are eased by at most
+            # ~0.85px so the reconstructed path keeps this phone's radius.
             cap_mid = 0.40
-            cap_c = float(max(1.6, 0.014 * phone_short))
+            cap_c = 0.85
             cw0 = _corner_proximity_map(
                 (h, w),
                 x0=float(xs0.min()),
@@ -9123,17 +9144,8 @@ class Compositor:
             cov_poly = _fill_closed_polyline_aa(
                 pts, (h, w), scale=16, expand_px=0.0
             )
-            if cov_poly is not None and float(np.max(cov_poly)) > 0.05:
-                dist_in0 = cv2.distanceTransform(
-                    on.astype(np.uint8), cv2.DIST_L2, 5
-                )
-                # Interior only — polyline must never expand past the photo rim.
-                deep = on & (dist_in0 >= 3.0)
-                cov = np.where(
-                    deep,
-                    np.maximum(exact, np.minimum(cov_poly, 1.0)),
-                    exact,
-                )
+            if cov_poly is None or float(np.max(cov_poly)) < 0.05:
+                cov_poly = None
         if cov is None or float(np.max(cov)) < 0.05:
             q = _sharp_quad_from_mesh(mesh)
             if (h, w) != (dest_h, dest_w) and q is not None:
@@ -9170,6 +9182,19 @@ class Compositor:
             (1 - on.astype(np.uint8)), cv2.DIST_L2, 5
         ).astype(np.float32)
         mid = cw < 0.16
+        corner = cw >= 0.18
+        if cov_poly is not None:
+            # Rasterize the existing corner path with coverage AA. Interior
+            # stays opaque; mid-sides keep exact/wall treatment below.
+            corner_rim = corner & (
+                (dist_in < 3.5) | ((~on) & (dist_out <= 1.75))
+            )
+            cov = np.where(corner_rim, np.clip(cov_poly, 0.0, 1.0), cov)
+            cov = np.where(
+                on & (dist_in >= 3.0),
+                np.maximum(cov, np.minimum(cov_poly, 1.0)),
+                cov,
+            )
         # Deep interior stays opaque (Chaikin must not punch white holes).
         cov = np.where(on & (dist_in >= 8.0), 1.0, cov)
         cov = np.where(mid & on & (dist_in >= 1.0), 1.0, cov)
@@ -9180,9 +9205,15 @@ class Compositor:
         wall_face = Compositor._straight_mid_wall_face(on)
         if np.any(wall_face):
             cov = np.where(wall_face, 1.0, cov)
-        # Outside the binary silhouette: exact-AA sub-pixel band only.
-        cov = np.where(on, cov, exact)
-        cov = np.where((~on) & (dist_out > 0.65), 0.0, cov)
+        # Outside the binary silhouette: exact-AA on mid-sides only.
+        # Corners already hold the path-coverage ramp.
+        cov = np.where(mid & (~on), exact, cov)
+        cov = np.where(mid & (~on) & (dist_out > 0.65), 0.0, cov)
+        cov = np.where(
+            corner & (~on) & (cov < 0.02) & (dist_out > 1.75),
+            0.0,
+            cov,
+        )
         # Studio card is never wrap, even in corner AA. White phones are
         # not border-connected to the card so they stay covered.
         # CRITICAL: do not zero gate on silhouette body pixels — the bright
@@ -9199,7 +9230,8 @@ class Compositor:
                     )
                     > 0
                 )
-            cov = np.where(pl & (~on), 0.0, cov)
+            cov = np.where(pl & (~on) & mid, 0.0, cov)
+            cov = np.where(pl & (~on) & corner & (cov < 0.04), 0.0, cov)
         # Interior studio wedges at rounded corners are not border-connected
         # to the card edge — zero gate there so wrap cannot bleed past the rim.
         if self.phone_image is not None:
@@ -9217,6 +9249,7 @@ class Compositor:
                 & (sat_w <= 0.10)
                 & (dist_out <= 8.0)
                 & (dist_out > 0.55)
+                & (cov < 0.08)
             )
             cov = np.where(wedge, 0.0, cov)
         cov = np.clip(cov, 0.0, 1.0).astype(np.float32)
@@ -9243,7 +9276,8 @@ class Compositor:
             wall_face_d = Compositor._straight_mid_wall_face(body_up)
             if np.any(wall_face_d):
                 cov = np.where(wall_face_d, 1.0, cov)
-            cov = np.where(dist_out_d > 0.65, 0.0, cov)
+            cw_d = Compositor._corner_weight_from_silhouette(body_up)
+            cov = np.where((dist_out_d > 0.65) & (cw_d < 0.18), 0.0, cov)
             if self.phone_image is not None:
                 pb_d = to_bgr(self.phone_image)
                 if pb_d.shape[:2] != (dest_h, dest_w):
@@ -9261,6 +9295,7 @@ class Compositor:
                     & (sat_d <= 0.10)
                     & (dist_out_d <= 10.0)
                     & (dist_out_d > 1.70)
+                    & (cov < 0.08)
                 )
                 cov = np.where(wedge_d, 0.0, cov)
             cov = np.clip(cov, 0.0, 1.0).astype(np.float32)
@@ -9478,8 +9513,11 @@ class Compositor:
             dist_out_full = cv2.distanceTransform(
                 (~body_on).astype(np.uint8), cv2.DIST_L2, 5
             ).astype(np.float32)
+            cw_clip = Compositor._corner_weight_from_silhouette(body_on)
+            # Mid-sides: clip to the photo wall. Corner path coverage must
+            # not be snapped back to binary stairs.
             mask = np.where(
-                (~body_on) & (dist_out_full > 0.55),
+                (~body_on) & (dist_out_full > 0.55) & (cw_clip < 0.18),
                 0.0,
                 mask,
             )
@@ -10193,6 +10231,12 @@ class Compositor:
                 (~on).astype(np.uint8), cv2.DIST_L2, 5
             ).astype(np.float32)
             allow = on | (dist_out <= 0.55)
+            if gate_f is not None and float(np.max(gate_f)) > 0.05:
+                gf = np.clip(gate_f.astype(np.float32), 0.0, 1.0)
+                if gf.shape[:2] != (h, w):
+                    gf = cv2.resize(gf, (w, h), interpolation=cv2.INTER_LINEAR)
+                cw_allow = Compositor._corner_weight_from_silhouette(on)
+                allow = allow | ((cw_allow >= 0.18) & (gf > 0.02))
             if tip_vm is not None and np.count_nonzero(tip_vm) >= 4:
                 tclip = tip_vm > 127
                 if tclip.shape[:2] != (h, w):
@@ -10670,25 +10714,43 @@ class Compositor:
         # Float coverage from the photo contour (sub-pixel AA, no grow).
         cov = Compositor._exact_coverage_aa(body * 255, scale=12)
         pts = AdaptiveMeshBuilder.outer_contour_polyline(body * 255, smooth=False)
+        cw_f = Compositor._corner_weight_from_silhouette(body)
+        corner_f = cw_f >= 0.18
         if pts is not None and pts.shape[0] >= 16:
             raw_pts = pts.astype(np.float32)
             sm = AdaptiveMeshBuilder._smooth_closed_polyline(raw_pts, window=5)
             delta = sm - raw_pts
             mag = np.linalg.norm(delta, axis=1, keepdims=True)
-            short = float(min(h, w))
-            cap = float(max(0.55, 0.006 * short))
+            cap = 0.85
             pts_s = raw_pts + delta * np.minimum(1.0, cap / np.maximum(mag, 1e-6))
             poly = _fill_closed_polyline_aa(
-                pts_s, (h, w), scale=12, expand_px=0.0
+                pts_s, (h, w), scale=16, expand_px=0.0
             )
             if poly is not None and float(np.max(poly)) > 0.05:
                 on = body > 0
                 dist_in0 = cv2.distanceTransform(
                     on.astype(np.uint8), cv2.DIST_L2, 5
                 )
+                dist_out0 = cv2.distanceTransform(
+                    (~on).astype(np.uint8), cv2.DIST_L2, 5
+                ).astype(np.float32)
                 cov = np.where(on & (dist_in0 >= 2.0), 1.0, cov)
-                cov = np.where(on, np.maximum(cov, np.minimum(poly, 1.0)), cov)
-                cov = np.where(~on, np.minimum(cov, poly), cov)
+                # Mid-sides: never expand past the photo rim.
+                cov = np.where(
+                    on & ~corner_f,
+                    np.maximum(cov, np.minimum(poly, 1.0)),
+                    cov,
+                )
+                cov = np.where(
+                    (~on) & ~corner_f,
+                    np.minimum(cov, poly),
+                    cov,
+                )
+                # Corners: the existing path is the silhouette (coverage AA).
+                corner_rim = corner_f & (
+                    (dist_in0 < 3.5) | ((~on) & (dist_out0 <= 1.75))
+                )
+                cov = np.where(corner_rim, np.clip(poly, 0.0, 1.0), cov)
         if np.any(tip):
             tip_aa = Compositor._exact_coverage_aa(
                 tip.astype(np.uint8) * 255, scale=8
@@ -10698,7 +10760,7 @@ class Compositor:
             (1 - (body > 0).astype(np.uint8)), cv2.DIST_L2, 5
         ).astype(np.float32)
         cov = np.where(
-            (~(body > 0)) & (~tip) & (dist_out > 0.50),
+            (~(body > 0)) & (~tip) & (dist_out > 0.50) & ~corner_f,
             0.0,
             cov,
         )
@@ -10793,7 +10855,8 @@ class Compositor:
         # Studio card only — never the silhouette face. Left bezel AA is
         # often border-connected to the card; pasting plate there punched
         # pale notches while the darker right rim stayed wrap-covered.
-        studio_out = studio & ~(body > 0) & ~tip
+        path_aa = corner_f & (cov > 0.04) & ~tip
+        studio_out = studio & ~(body > 0) & ~tip & ~path_aa
         if np.any(studio_out):
             out = np.where(studio_out[:, :, np.newaxis], plate, out)
         # Refresh wrap mask after studio purge for AA / seal steps.
@@ -10803,6 +10866,8 @@ class Compositor:
         is_wrap = is_wrap & ~hole_core
 
         # --- Soft coverage AA on exterior band only (wrap RGB, not empty) ---
+        # Corner AA is already in the float gate composite. Re-blending the
+        # path band here would fade it twice. Only fill the outside halo.
         soft = (
             (cov > 0.04)
             & (cov < 0.96)
@@ -10832,6 +10897,43 @@ class Compositor:
             w3 = cov[:, :, np.newaxis]
             blended = wrap_rgb * w3 + plate * (1.0 - w3)
             out = np.where(soft[:, :, np.newaxis], blended, out)
+
+        # Corner pockets: rasterize the existing path with coverage AA.
+        # Sample solid wrap from inside the body (not the already-mixed rim)
+        # so this pass is idempotent and does not fade twice.
+        corner_rim = (
+            corner_f
+            & ~tip
+            & ~cut_protect
+            & ~hole_core
+            & (cov > 0.02)
+            & (cov < 0.98)
+        )
+        if np.any(corner_rim):
+            ink_c = (
+                (body > 0)
+                & ~tip
+                & ~hole_core
+                & (dist_in >= 2.0)
+                & (cov >= 0.96)
+                & (out.mean(axis=2) > 10.0)
+                & (np.abs(out - plate).max(axis=2) > 8.0)
+            )
+            wrap_c = out.copy()
+            if np.any(ink_c):
+                ink_f = ink_c.astype(np.float32)
+                wt = cv2.GaussianBlur(ink_f, (0, 0), 1.15)
+                for ch in range(3):
+                    num = cv2.GaussianBlur(out[:, :, ch] * ink_f, (0, 0), 1.15)
+                    fill_ch = np.where(
+                        wt > 1e-3, num / np.maximum(wt, 1e-3), out[:, :, ch]
+                    )
+                    wrap_c[:, :, ch] = np.where(
+                        corner_rim, fill_ch, wrap_c[:, :, ch]
+                    )
+            w3c = cov[:, :, np.newaxis]
+            blended_c = wrap_c * w3c + plate * (1.0 - w3c)
+            out = np.where(corner_rim[:, :, np.newaxis], blended_c, out)
 
         # Final chrome sweep on outer sil column (small kernel only).
         gray_o = out.mean(axis=2)
@@ -10867,6 +10969,7 @@ class Compositor:
             & ~tip
             & ~cut_protect
             & (dist_out > 0.55)
+            & ~path_aa
             & (
                 (np.abs(out - plate).max(axis=2) > 8.0)
                 | (out.mean(axis=2) < 170.0)
@@ -10918,11 +11021,14 @@ class Compositor:
             out = np.clip(out * (1.0 + crest[:, :, np.newaxis]), 0.0, 255.0)
 
         # Final authority: studio card pixels are always the phone plate.
-        studio_out = studio & ~(body > 0) & ~tip
+        # Corner path-coverage AA is the silhouette here — do not snap it
+        # back to the binary body mask (that reintroduced zig-zag corners).
+        studio_out = studio & ~(body > 0) & ~tip & ~path_aa
         if np.any(studio_out):
             out = np.where(studio_out[:, :, np.newaxis], plate, out)
-        # Absolute exterior kill — nothing outside the photo body/tips.
-        exterior = ~(body > 0) & ~tip & (dist_out > 0.35)
+        # Absolute exterior kill — nothing outside the photo body/tips,
+        # except the corner path AA band.
+        exterior = ~(body > 0) & ~tip & (dist_out > 0.35) & ~path_aa
         if np.any(exterior):
             out = np.where(exterior[:, :, np.newaxis], plate, out)
         # Straight mid-side nubs are photo AA / segmentation noise, not the
@@ -10989,6 +11095,10 @@ class Compositor:
                     tm.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
                 )
             keep = keep | (tm > 127)
+        # Corner pockets: finalize owns path-coverage AA. Do not snap those
+        # pixels back to the binary silhouette before that pass.
+        cw_p = Compositor._corner_weight_from_silhouette(body)
+        keep = keep | ((cw_p >= 0.18) & (dist_out <= 2.0))
         # Camera interiors are restored by the cutout pass. Do NOT keep a
         # dilated camera halo — that leaked wrap past the top silhouette.
         purge = (~keep) & (dist_out > 0)
