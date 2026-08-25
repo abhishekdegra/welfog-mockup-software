@@ -546,6 +546,175 @@ class MaterialRenderingEngine:
         return result
 
     @staticmethod
+    def _cutout_lip_widths(
+        solid: np.ndarray,
+        frame_short: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Per-opening inner/outer lip width from that opening's own size.
+
+        Total rim is ~8% of the cutout short side, clamped to 5–12%.
+        Nearby openings keep independent widths.
+        """
+        del frame_short
+        h, w = solid.shape[:2]
+        outer_map = np.full((h, w), np.inf, dtype=np.float32)
+        inner_map = np.zeros((h, w), dtype=np.float32)
+        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
+        wrote_outer = False
+        for lab in range(1, nlab):
+            if int(stats[lab, cv2.CC_STAT_AREA]) < 8:
+                continue
+            char = float(
+                min(
+                    int(stats[lab, cv2.CC_STAT_WIDTH]),
+                    int(stats[lab, cv2.CC_STAT_HEIGHT]),
+                )
+            )
+            total = float(np.clip(char * 0.085, char * 0.05, char * 0.12))
+            total = float(np.clip(total, 2.0, 12.0))
+            outer = float(total * 0.62)
+            inner = float(total * 0.38)
+            sel = (labels == lab).astype(np.uint8)
+            inner_map[sel > 0] = inner
+            rad = int(np.ceil(outer * 1.35)) + 1
+            ksz = 2 * rad + 1
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+            halo = cv2.dilate(sel, k)
+            outer_map = np.where(
+                halo > 0, np.minimum(outer_map, outer), outer_map
+            )
+            wrote_outer = True
+        if wrote_outer:
+            outer_map = np.where(
+                np.isfinite(outer_map), outer_map, 0.0
+            ).astype(np.float32)
+        else:
+            outer_map = np.zeros((h, w), dtype=np.float32)
+        return outer_map, inner_map
+
+    @staticmethod
+    def apply_molded_cutout_lip(
+        image: np.ndarray,
+        hole: np.ndarray,
+        wrap_gate: Optional[np.ndarray] = None,
+        lighting: Optional[LightingProfile] = None,
+        *,
+        shade_inner: bool = True,
+        shade_outer: bool = True,
+    ) -> np.ndarray:
+        """
+        Molded case lip from the 0.5 iso of the selected cutout path.
+
+        Crest sits on the contour and falls off over a 5–12% offset — a
+        quarter-round of cover material, not a blurred halo or painted ring.
+        """
+        lighting = lighting or LightingProfile("Studio")
+        result = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+        if result.ndim == 2:
+            result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+        module = np.clip(np.asarray(hole, dtype=np.float32), 0.0, 1.0)
+        if module.max() > 1.05:
+            module = module / 255.0
+        if float(np.max(module)) < 0.05:
+            return result
+        h, w = result.shape[:2]
+        if module.shape[:2] != (h, w):
+            module = cv2.resize(module, (w, h), interpolation=cv2.INTER_LINEAR)
+        wrap = np.ones((h, w), dtype=np.float32)
+        if wrap_gate is not None:
+            wrap = np.clip(np.asarray(wrap_gate, dtype=np.float32), 0.0, 1.0)
+            if wrap.max() > 1.05:
+                wrap = wrap / 255.0
+            if wrap.shape[:2] != (h, w):
+                wrap = cv2.resize(wrap, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        solid = (module >= 0.50).astype(np.uint8)
+        if int(np.count_nonzero(solid)) < 8:
+            return result
+        ys, xs = np.where(solid > 0)
+        bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+        outer_map, inner_map = MaterialRenderingEngine._cutout_lip_widths(
+            solid, float(min(h, w))
+        )
+        max_outer = float(max(np.max(outer_map), 1.0))
+        margin = int(np.ceil(max_outer * 3.0)) + 4
+        dist_out = MaterialRenderingEngine._subpixel_outside_distance(
+            module, bbox, margin=margin
+        )
+        dist_in = MaterialRenderingEngine._subpixel_inside_distance(
+            module, bbox, margin=margin
+        )
+
+        outer_w = np.maximum(outer_map, 1e-3)
+        inner_w = np.maximum(inner_map, 1e-3)
+        t_out = np.clip(dist_out / outer_w, 0.0, 1.0)
+        t_in = np.clip(dist_in / inner_w, 0.0, 1.0)
+        # Crest ON the path (t=0), fade to the case over the offset.
+        # sin(πt) peaked mid-band and read as a detached glowing ring.
+        h_out = (0.5 * (1.0 + np.cos(np.pi * t_out))).astype(np.float32)
+        h_in = (0.5 * (1.0 + np.cos(np.pi * t_in))).astype(np.float32)
+        outer_lip = (
+            h_out
+            * (dist_out > 0.0)
+            * (dist_out <= outer_map)
+            * (solid == 0).astype(np.float32)
+            * (wrap > 0.35).astype(np.float32)
+        ).astype(np.float32)
+        inner_lip = (
+            h_in
+            * (dist_in > 0.0)
+            * (dist_in <= inner_map)
+            * solid.astype(np.float32)
+        ).astype(np.float32)
+        if not shade_outer:
+            outer_lip = np.zeros_like(outer_lip)
+        if not shade_inner:
+            inner_lip = np.zeros_like(inner_lip)
+        lip = np.maximum(outer_lip, inner_lip)
+        if float(np.max(lip)) < 0.02:
+            return result
+
+        signed = dist_out - dist_in
+        gx = cv2.Sobel(signed, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(signed, cv2.CV_32F, 0, 1, ksize=3)
+        gn = np.sqrt(gx * gx + gy * gy) + 1e-6
+        nx, ny = gx / gn, gy / gn
+        dx, dy = lighting.direction
+        length = max(float(np.hypot(dx, dy)), 1e-6)
+        lx, ly = -dx / length, -dy / length
+        ndot = np.clip(lx * nx + ly * ny, -1.0, 1.0)
+        hi = float(max(0.70, getattr(lighting, "highlight_scale", 1.0) or 1.0))
+        # Multiplicative, cover-coloured: highlight facing the key, shadow
+        # opposite. No additive white/grey catch (that was the glow).
+        gain = (1.0 + 0.16 * hi * ndot * lip).astype(np.float32)
+        mixed = np.clip(result * gain[:, :, np.newaxis], 0.0, 1.0)
+        lift = np.clip(ndot, 0.0, 1.0) * lip * (0.06 * hi)
+        mixed = np.clip(
+            mixed + result * lift[:, :, np.newaxis], 0.0, 1.0
+        )
+        if shade_inner and float(np.max(inner_lip)) > 0.02:
+            # Thin inner wall of cover material (case thickness), not a fill.
+            sample = (
+                (dist_out > 0.35)
+                & (dist_out <= np.maximum(outer_map, 0.35))
+                & (solid == 0)
+            )
+            if np.any(sample):
+                cover_rgb = np.median(result[sample], axis=0).astype(np.float32)
+            else:
+                cover_rgb = np.median(
+                    result[solid == 0], axis=0
+                ).astype(np.float32)
+            wall = (
+                inner_lip * np.clip(1.0 - t_in * 1.35, 0.0, 1.0) * 0.42
+            ).astype(np.float32)
+            wall3 = wall[:, :, np.newaxis]
+            wall_rgb = cover_rgb[np.newaxis, np.newaxis, :] * gain[:, :, np.newaxis]
+            mixed = mixed * (1.0 - wall3) + wall_rgb * wall3
+        return np.clip(mixed, 0.0, 1.0)
+
+    @staticmethod
     def apply_camera_bump(
         design: np.ndarray,
         mask: np.ndarray,
@@ -562,133 +731,26 @@ class MaterialRenderingEngine:
         moulded lip on the WRAP just outside the user's cutout path — same
         design colour/texture as the cover, works for any cutout shape.
         """
-        lighting = lighting or LightingProfile("Studio")
+        del phone, lens_mask
         coverage = np.clip(mask.astype(np.float32), 0.0, 1.0)
         module = np.clip(module_mask.astype(np.float32), 0.0, 1.0)
-        if float(np.max(module)) < 0.05:
-            return design, coverage
-
-        # Never put design inside the cutout — only shade the border ridge.
-        new_mask = coverage.copy()
-        result = np.clip(design.astype(np.float32), 0.0, 1.0).copy()
-        h, w = coverage.shape[:2]
-        short = float(min(h, w))
-
-        # Soft coverage is the shape authority (circle / pill / path AA).
-        # Binary threshold only seeds the ROI — distance uses float module.
-        hole = (module > 0.50).astype(np.uint8)
-        outside = (1 - hole).astype(np.uint8)
-        if int(np.count_nonzero(hole)) < 16 or int(np.count_nonzero(outside)) < 16:
-            return result, new_mask
-
-        ys, xs = np.where(hole > 0)
-        cut_short = float(min(xs.max() - xs.min() + 1, ys.max() - ys.min() + 1))
-        # Subtle manufactured lip — proportional to cutout, never a thick blob.
-        ridge_w = float(
-            np.clip(max(3.2, cut_short * 0.065, short * 0.0065), 3.2, short * 0.020)
+        if module.max() > 1.05:
+            module = module / 255.0
+        wrap = coverage
+        if wrap_mask is not None:
+            wm = np.clip(np.asarray(wrap_mask, dtype=np.float32), 0.0, 1.0)
+            if wm.max() > 1.05:
+                wm = wm / 255.0
+            wrap = np.maximum(coverage, wm)
+        result = MaterialRenderingEngine.apply_molded_cutout_lip(
+            design,
+            module,
+            wrap,
+            lighting=lighting,
+            shade_inner=False,
+            shade_outer=True,
         )
-        dist_out = MaterialRenderingEngine._subpixel_outside_distance(
-            module, (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
-            margin=int(np.ceil(ridge_w * 3.0)) + 4,
-        )
-        # Light blur removes raster steps without moving the lip.
-        dist_out = cv2.GaussianBlur(dist_out, (0, 0), max(0.55, ridge_w * 0.12))
-
-        # Rounded lip profile: 0 at hole edge → peak mid → 0 into flat wrap.
-        t = np.clip(dist_out / ridge_w, 0.0, 1.0)
-        ridge = np.sin(np.pi * t).astype(np.float32)
-        # Soft module keeps AA fringe out of the ridge (no white chips).
-        ridge = ridge * (1.0 - np.clip(module, 0.0, 1.0)) * new_mask
-        ridge = cv2.GaussianBlur(ridge, (0, 0), max(0.35, ridge_w * 0.05))
-        if float(np.max(ridge)) < 0.02:
-            return result, new_mask
-
-        # Normals from the sub-pixel distance profile, so curved corners get
-        # the exact same clean shading as the straight edges.
-        amp = 1.18
-        slope = (np.pi * amp) * np.cos(np.pi * t)
-        slope = slope * (t > 0.0).astype(np.float32) * (t < 1.0).astype(np.float32)
-        dgx = cv2.Sobel(dist_out, cv2.CV_32F, 1, 0, ksize=3) * 0.25
-        dgy = cv2.Sobel(dist_out, cv2.CV_32F, 0, 1, ksize=3) * 0.25
-        dnorm = np.sqrt(dgx * dgx + dgy * dgy) + 1e-6
-        ux, uy = dgx / dnorm, dgy / dnorm
-        gx = -slope * ux
-        gy = -slope * uy
-        n_sigma = max(0.70, ridge_w * 0.14)
-        gx = cv2.GaussianBlur(gx, (0, 0), n_sigma)
-        gy = cv2.GaussianBlur(gy, (0, 0), n_sigma)
-        gnorm = np.sqrt(gx * gx + gy * gy + 1.0)
-        nx = gx / gnorm
-        ny = gy / gnorm
-        nz = 1.0 / gnorm
-
-        dx, dy = lighting.direction
-        length = max(float(np.hypot(dx, dy)), 1e-6)
-        lx, ly = -dx / length, -dy / length
-        l_up = 0.76 + 0.06 * lighting.softness
-        l_side = float(np.sqrt(max(1.0 - l_up * l_up, 1e-4)))
-        Lx, Ly, Lz = lx * l_side, ly * l_side, l_up
-
-        # Studio profile can be muted by zeroed sliders — keep a floor so the
-        # moulded lip still reads on dark artwork.
-        hi = float(max(0.85, getattr(lighting, "highlight_scale", 1.0) or 1.0))
-        gate = np.clip(ridge * 1.95, 0.0, 1.0)
-        diffuse = np.clip(nx * Lx + ny * Ly + nz * Lz, 0.0, 1.0)
-        lit = np.clip((diffuse - Lz) / max(1.0 - Lz, 1e-3), 0.0, 1.0)
-        dim = np.clip((Lz - diffuse) / max(Lz, 1e-3), 0.0, 1.0)
-
-        sheen = lit * gate * (0.95 * hi)
-        sheen = cv2.GaussianBlur(sheen, (0, 0), max(0.40, ridge_w * 0.08))
-        result = MaterialRenderingEngine._soft_specular_lift(
-            result, sheen, preserve_chroma=True, white_mix=0.035
-        )
-
-        hx, hy, hz = Lx, Ly, Lz + 1.0
-        hn = max(float(np.sqrt(hx * hx + hy * hy + hz * hz)), 1e-6)
-        hx, hy, hz = hx / hn, hy / hn, hz / hn
-        power = 7.5 + 9.0 * (1.0 - lighting.softness)
-        ndh = np.clip(nx * hx + ny * hy + nz * hz, 0.0, 1.0)
-        base_spec = float(hz) ** power
-        spec = np.clip(
-            (ndh ** power - base_spec) / max(1.0 - base_spec, 1e-4), 0.0, 1.0
-        )
-        gloss = spec * gate
-        gloss = cv2.GaussianBlur(gloss, (0, 0), max(0.75, ridge_w * 0.16))
-        gloss = np.clip(gloss * (1.15 * hi), 0.0, 1.0)
-        if float(np.max(gloss)) > 1e-4:
-            result = MaterialRenderingEngine._soft_specular_lift(
-                result, gloss, preserve_chroma=False
-            )
-
-        wrap_only = (1.0 - np.clip(module, 0.0, 1.0)) * new_mask
-        shade = cv2.GaussianBlur(dim * gate, (0, 0), max(0.50, ridge_w * 0.09))
-        ao = np.clip(shade * 0.22, 0.0, 0.26)
-        result = np.clip(result * (1.0 - ao[:, :, np.newaxis]), 0.0, 1.0)
-
-        outer_shadow = np.clip(
-            (dist_out - ridge_w * 0.55) / max(ridge_w * 0.70, 1.0), 0.0, 1.0
-        )
-        outer_shadow = (1.0 - outer_shadow) * np.clip(
-            dist_out / max(ridge_w * 0.55, 1.0), 0.0, 1.0
-        )
-        outer_shadow = outer_shadow * wrap_only * 0.22
-        outer_shadow = cv2.GaussianBlur(
-            outer_shadow, (0, 0), max(0.7, ridge_w * 0.11)
-        )
-        shift_x = int(round(-lx * ridge_w * 0.22))
-        shift_y = int(round(-ly * ridge_w * 0.22))
-        if shift_x or shift_y:
-            matrix = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-            outer_shadow = cv2.warpAffine(
-                outer_shadow,
-                matrix,
-                (w, h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
-        result = np.clip(result * (1.0 - outer_shadow[:, :, np.newaxis]), 0.0, 1.0)
-        return np.clip(result, 0.0, 1.0), np.clip(new_mask, 0.0, 1.0)
+        return result, coverage
 
     @staticmethod
     def apply_side_button_relief(
@@ -977,6 +1039,41 @@ class MaterialRenderingEngine:
         # direction-dependent error that makes rounded corners shimmer under a
         # sharp specular.
         far = cv2.distanceTransform(outside, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        if scale > 1:
+            far = cv2.resize(far, (rw, rh), interpolation=cv2.INTER_AREA)
+        dist[y0:y3, x0:x3] = far / float(scale)
+        return dist
+
+    @staticmethod
+    def _subpixel_inside_distance(
+        coverage: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        *,
+        margin: int = 8,
+    ) -> np.ndarray:
+        """Sub-pixel distance from hole-interior pixels to the cutout edge."""
+        h, w = coverage.shape[:2]
+        x1, y1, x2, y2 = bbox
+        x0 = int(max(0, x1 - margin))
+        y0 = int(max(0, y1 - margin))
+        x3 = int(min(w, x2 + margin + 1))
+        y3 = int(min(h, y2 + margin + 1))
+        dist = np.zeros((h, w), dtype=np.float32)
+        rw, rh = x3 - x0, y3 - y0
+        if rw < 3 or rh < 3:
+            return dist
+        roi = np.clip(coverage[y0:y3, x0:x3].astype(np.float32), 0.0, 1.0)
+        scale = 4 if max(rw, rh) <= 900 else (2 if max(rw, rh) <= 2400 else 1)
+        if scale > 1:
+            big = cv2.resize(
+                roi, (rw * scale, rh * scale), interpolation=cv2.INTER_LINEAR
+            )
+        else:
+            big = roi
+        inside = (big > 0.5).astype(np.uint8)
+        if int(np.count_nonzero(inside)) < 4:
+            return dist
+        far = cv2.distanceTransform(inside, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         if scale > 1:
             far = cv2.resize(far, (rw, rh), interpolation=cv2.INTER_AREA)
         dist[y0:y3, x0:x3] = far / float(scale)

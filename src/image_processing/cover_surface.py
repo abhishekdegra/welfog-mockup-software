@@ -90,6 +90,72 @@ class CoverSurfaceEngine:
 
     ANALYSIS_LONG_EDGE = 900
 
+    @staticmethod
+    def _absorb_fresh_hardware(
+        region: PrintableRegion,
+        fresh_excl: np.ndarray,
+        fresh_contours: Optional[List[np.ndarray]],
+    ) -> None:
+        """
+        Keep stored cutouts as the exact geometry source; add new hardware.
+
+        A saved model holds the shapes the user selected, so replacing them
+        with a fresh detection discarded that geometry (and any opening the
+        detector cannot see on this photo). Freshly found hardware that the
+        stored set does not already cover is still added, so buttons and
+        speakers missing from an older template still get holes.
+        """
+        stored = region.exclusion_mask
+        if stored is None or int(np.count_nonzero(stored)) == 0:
+            region.exclusion_mask = fresh_excl
+            region.hardware_contours = list(fresh_contours or [])
+            return
+        stored_hard = (stored > 96).astype(np.uint8) * 255
+        n_stored, stored_lab, stored_stats, _ = (
+            cv2.connectedComponentsWithStats(
+                (stored_hard > 0).astype(np.uint8), connectivity=8
+            )
+        )
+        merged = stored.copy()
+        added: List[np.ndarray] = []
+        for contour in fresh_contours or []:
+            pts = np.asarray(contour, dtype=np.float32).reshape(-1, 2)
+            if pts.shape[0] < 3:
+                continue
+            probe = np.zeros(stored.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(
+                probe, [np.round(pts).astype(np.int32).reshape(-1, 1, 2)], 255
+            )
+            area = int(np.count_nonzero(probe))
+            if area <= 0:
+                continue
+            overlap = int(
+                np.count_nonzero(cv2.bitwise_and(probe, stored_hard))
+            )
+            if float(overlap) >= 0.35 * float(area):
+                continue
+            # Same hardware detected at a different size still counts as a
+            # duplicate; adding it would ring an existing cutout.
+            duplicate = False
+            hit = probe > 0
+            for lab in range(1, n_stored):
+                lab_area = int(stored_stats[lab, cv2.CC_STAT_AREA])
+                if lab_area <= 0:
+                    continue
+                inside = int(np.count_nonzero(hit & (stored_lab == lab)))
+                if float(inside) >= 0.50 * float(lab_area):
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            merged = cv2.max(merged, cv2.bitwise_and(fresh_excl, probe))
+            added.append(pts.reshape(-1, 1, 2).astype(np.float32))
+        region.exclusion_mask = merged
+        if added:
+            region.hardware_contours = (
+                list(region.hardware_contours or []) + added
+            )
+
     def __init__(
         self,
         template_cache: Optional[TemplateCache] = None,
@@ -142,10 +208,9 @@ class CoverSurfaceEngine:
                     )
                 )
                 if np.count_nonzero(fresh_excl) > 0:
-                    # Live photo hardware is canonical. OR-ing a cached island
-                    # AABB with discrete lenses rebuilt a rectangular hole.
-                    region.exclusion_mask = fresh_excl
-                    region.hardware_contours = fresh_contours
+                    CoverSurfaceEngine._absorb_fresh_hardware(
+                        region, fresh_excl, fresh_contours
+                    )
                     region.confidence = min(
                         1.0, region.confidence * 0.7 + hw_conf * 0.3
                     )
@@ -250,8 +315,9 @@ class CoverSurfaceEngine:
                     ),
                 )
                 if np.count_nonzero(fresh_excl2) > 0:
-                    region.exclusion_mask = fresh_excl2
-                    region.hardware_contours = fresh_contours2
+                    CoverSurfaceEngine._absorb_fresh_hardware(
+                        region, fresh_excl2, fresh_contours2
+                    )
                     if region.printable_mask is not None:
                         hard = (
                             (region.exclusion_mask > 96).astype(np.uint8) * 255

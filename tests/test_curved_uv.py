@@ -80,22 +80,28 @@ def test_remap_grid_shape_and_corners_move():
 
 
 def test_source_points_curved_differs_from_flat():
+    params = CurvedUVParams(rim_uv=0.07, bevel_strength=1.0, enabled=True)
+    # Dense enough that some verts sit inside the rim band (not only on the
+    # unit-square edge, which must stay inside the artwork).
     flat = MeshWarper.source_points(
-        (400, 300), 9, 7, target_aspect=0.55, fit_mode="fill"
+        (400, 300), 21, 15, target_aspect=0.55, fit_mode="fill"
     )
     curved = MeshWarper.source_points(
         (400, 300),
-        9,
-        7,
+        21,
+        15,
         target_aspect=0.55,
         fit_mode="fill",
-        curved_uv=CurvedUVParams(rim_uv=0.07, bevel_strength=1.0, enabled=True),
+        curved_uv=params,
     )
     assert flat.shape == curved.shape
-    # Rim verts move; interior stays close.
+    assert float(curved[:, 0].min()) >= -1e-3
+    assert float(curved[:, 1].min()) >= -1e-3
+    assert float(curved[:, 0].max()) <= 300.0 + 1e-3
+    assert float(curved[:, 1].max()) <= 400.0 + 1e-3
+    # Rim-band verts move; interior stays close.
     assert not np.allclose(flat, curved, atol=0.5)
-    # Centre vertex nearly unchanged.
-    mid = (9 // 2) * 7 + (7 // 2)
+    mid = (21 // 2) * 15 + (15 // 2)
     assert np.allclose(flat[mid], curved[mid], atol=2.0)
 
 

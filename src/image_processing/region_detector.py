@@ -3427,9 +3427,37 @@ class HardwareRegionDetector:
             phone = to_bgr(phone_image)
             gray = cv2.cvtColor(phone, cv2.COLOR_BGR2GRAY)
 
+        def _pack(items: List[np.ndarray]) -> List[np.ndarray]:
+            cleaned = HardwareRegionDetector._finalize_camera_openings(
+                items, gray
+            )
+            return [
+                np.asarray(c, np.float32).reshape(-1, 1, 2) for c in cleaned
+            ]
+
         # Already-separate compact openings must not be union-Houghed into
         # one plate (that rebuilt a rectangular hole around discrete lenses).
         if HardwareRegionDetector._parts_are_discrete_openings(parts):
+            # Overlapping enclosing disks (one per lens) Hough the same
+            # strongest ring when processed one-at-a-time and drop the
+            # middle opening. Cluster Hough once, then keep disks.
+            union = HardwareRegionDetector._rebuild_camera_from_lenses(
+                parts, gray
+            )
+            if union and HardwareRegionDetector._parts_are_discrete_openings(
+                union
+            ):
+                finished_u: List[np.ndarray] = []
+                for item in union:
+                    ip = np.asarray(item, np.float32).reshape(-1, 2)
+                    if gray is not None:
+                        ip = HardwareRegionDetector._shrink_disk_to_lens(
+                            gray, ip
+                        )
+                    finished_u.append(ip)
+                packed = _pack(finished_u)
+                if len(packed) >= 2:
+                    return packed
             finished: List[np.ndarray] = []
             for pts in parts:
                 one = HardwareRegionDetector._rebuild_camera_from_lenses(
@@ -3476,10 +3504,7 @@ class HardwareRegionDetector:
                 else:
                     finished.append(pts)
             if finished:
-                finished = HardwareRegionDetector._drop_nested_openings(
-                    finished
-                )
-                return [np.asarray(c, np.float32).reshape(-1, 1, 2) for c in finished]
+                return _pack(finished)
 
         # 1) Lens Hough first. Snap-to-silhouette used to win with the
         # cluster AABB and paint a rectangular hole around discrete lenses.
@@ -3490,7 +3515,7 @@ class HardwareRegionDetector:
             # Smaller-than-seed is always OK (tight rings / island).
             # Larger is rejected so Hough cannot balloon past the detect box.
             if HardwareRegionDetector._rebuilt_agrees_with_user(parts, rebuilt):
-                return [c.reshape(-1, 1, 2) for c in rebuilt]
+                return _pack(rebuilt)
             r = np.vstack(
                 [np.asarray(p, np.float32).reshape(-1, 2) for p in rebuilt]
             )
@@ -3502,12 +3527,12 @@ class HardwareRegionDetector:
             uw = float(u[:, 0].max() - u[:, 0].min())
             uh = float(u[:, 1].max() - u[:, 1].min())
             if rw * rh <= uw * uh * 1.02 and len(rebuilt) >= 1:
-                return [c.reshape(-1, 1, 2) for c in rebuilt]
+                return _pack(rebuilt)
 
         # 2) Dynamic: each user selection → photo silhouette when irregular.
         snapped = HardwareRegionDetector._snap_parts_to_photo(parts, gray)
         if snapped:
-            return [c.reshape(-1, 1, 2) for c in snapped]
+            return _pack(snapped)
 
         # 3) Per-contour circle/stadium polish (flash / simple pills).
         finished: List[np.ndarray] = []
@@ -3516,10 +3541,10 @@ class HardwareRegionDetector:
                 pts, gray, lock_bounds=True
             )
             if polished is not None and len(polished) >= 3:
-                finished.append(polished.reshape(-1, 1, 2))
+                finished.append(polished)
             else:
-                finished.append(pts.reshape(-1, 1, 2))
-        return finished
+                finished.append(pts)
+        return _pack(finished)
 
     @staticmethod
     def _rebuilt_agrees_with_user(
@@ -3664,6 +3689,149 @@ class HardwareRegionDetector:
             if contained >= len(boxes) - 1:
                 return False
         return True
+
+    @staticmethod
+    def _merge_overlapping_openings(parts: List[np.ndarray]) -> List[np.ndarray]:
+        """Collapse near-duplicate lens disks; keep the tighter contour."""
+        items = [
+            np.asarray(p, np.float32).reshape(-1, 2)
+            for p in parts
+            if len(np.asarray(p).reshape(-1, 2)) >= 3
+        ]
+        if len(items) < 2:
+            return items
+        circles = []
+        for pts in items:
+            (cx, cy), radius = cv2.minEnclosingCircle(pts)
+            area = float(cv2.contourArea(pts.reshape(-1, 1, 2)))
+            disk = HardwareRegionDetector._looks_like_true_disk(pts)
+            circles.append(
+                (area, float(cx), float(cy), float(radius), disk, pts)
+            )
+        used = [False] * len(circles)
+        kept_idx: List[int] = []
+        for i in sorted(range(len(circles)), key=lambda k: circles[k][0]):
+            if used[i]:
+                continue
+            used[i] = True
+            kept_idx.append(i)
+            area, cx, cy, radius, disk, _pts = circles[i]
+            if not disk:
+                continue
+            for j, other in enumerate(circles):
+                if used[j]:
+                    continue
+                _aj, ox, oy, orr, od, _op = other
+                if not od:
+                    continue
+                dist = float(((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5)
+                if dist <= 0.50 * (radius + orr) or dist <= 0.45 * max(
+                    radius, orr
+                ):
+                    used[j] = True
+        kept = [circles[i] for i in kept_idx]
+        kept.sort(key=lambda t: (t[2], t[1]))
+        return [t[5] for t in kept]
+
+    @staticmethod
+    def _drop_ghost_cluster_disks(parts: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        Drop a Hough ghost that sits between real stacked lenses.
+
+        A false circle on the cover, tangent to two true openings, punches a
+        white hole through valid artwork. Isolated dual/quad cameras overlap
+        at most one peer at this threshold and are kept.
+        """
+        items = [
+            np.asarray(p, np.float32).reshape(-1, 2)
+            for p in parts
+            if len(np.asarray(p).reshape(-1, 2)) >= 3
+        ]
+        if len(items) < 3:
+            return items
+        meta = []
+        for pts in items:
+            (cx, cy), radius = cv2.minEnclosingCircle(pts)
+            meta.append(
+                (
+                    float(cx),
+                    float(cy),
+                    float(radius),
+                    HardwareRegionDetector._looks_like_true_disk(pts),
+                    pts,
+                )
+            )
+        disks = [i for i, m in enumerate(meta) if m[3]]
+        if len(disks) < 3:
+            return items
+        drop = set()
+        for i in disks:
+            cx, cy, radius, _d, _p = meta[i]
+            n_ov = 0
+            for j in disks:
+                if i == j:
+                    continue
+                ox, oy, orr, _od, _op = meta[j]
+                dist = float(((cx - ox) ** 2 + (cy - oy) ** 2) ** 0.5)
+                if dist < 0.90 * (radius + orr):
+                    n_ov += 1
+            if n_ov >= 2:
+                drop.add(i)
+        if not drop or len(drop) >= len(disks):
+            return items
+        return [meta[i][4] for i in range(len(meta)) if i not in drop]
+
+    @staticmethod
+    def _drop_false_hardware_disks(
+        parts: List[np.ndarray],
+        gray: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Drop compact disks that are not a lens/flash contrast ring."""
+        items = [
+            np.asarray(p, np.float32).reshape(-1, 2)
+            for p in parts
+            if len(np.asarray(p).reshape(-1, 2)) >= 3
+        ]
+        if not items or gray is None or gray.size == 0:
+            return items
+        kept: List[np.ndarray] = []
+        for pts in items:
+            if not HardwareRegionDetector._looks_like_true_disk(pts):
+                kept.append(pts)
+                continue
+            (cx, cy), radius = cv2.minEnclosingCircle(pts)
+            ix = int(np.clip(round(float(cx)), 0, gray.shape[1] - 1))
+            iy = int(np.clip(round(float(cy)), 0, gray.shape[0] - 1))
+            ir = max(2, int(round(float(radius))))
+            if HardwareRegionDetector._circle_looks_like_hardware(
+                gray, ix, iy, ir
+            ):
+                kept.append(pts)
+        return kept if kept else items
+
+    @staticmethod
+    def _finalize_camera_openings(
+        parts: List[np.ndarray],
+        gray: Optional[np.ndarray],
+    ) -> List[np.ndarray]:
+        """Merge duplicates, drop ghosts, keep real detected geometry."""
+        items = [
+            np.asarray(p, np.float32).reshape(-1, 2)
+            for p in parts
+            if len(np.asarray(p).reshape(-1, 2)) >= 3
+        ]
+        if not items:
+            return []
+        items = HardwareRegionDetector._merge_overlapping_openings(items)
+        items = HardwareRegionDetector._drop_ghost_cluster_disks(items)
+        items = HardwareRegionDetector._drop_nested_openings(items)
+        if gray is not None:
+            filtered = HardwareRegionDetector._drop_false_hardware_disks(
+                items, gray
+            )
+            if filtered:
+                items = filtered
+        return items
 
     @staticmethod
     def _drop_nested_openings(parts: List[np.ndarray]) -> List[np.ndarray]:

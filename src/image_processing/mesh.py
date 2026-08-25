@@ -401,6 +401,7 @@ class AdaptiveMeshBuilder:
         *,
         corner_only: bool = False,
         corner_span: int = 3,
+        poles_only: bool = False,
     ) -> None:
         """
         Pull boundary verts outward when geometric arcs sit inset of the rim.
@@ -411,6 +412,9 @@ class AdaptiveMeshBuilder:
 
         ``corner_only``: only move verts near the four mesh corners so mid-side
         snaps (and side-button zones) stay put.
+
+        ``poles_only``: top and bottom rows only. Left/right midsides (side
+        buttons) are left on their existing snaps.
         """
         if mesh is None or mask is None or np.count_nonzero(mask) == 0:
             return
@@ -427,7 +431,12 @@ class AdaptiveMeshBuilder:
         max_push = max(8.0, short * 0.08)
 
         allowed: Optional[set] = None
-        if corner_only and mesh.rows >= 2 and mesh.cols >= 2:
+        if poles_only and mesh.rows >= 2 and mesh.cols >= 2:
+            allowed = set()
+            for col in range(mesh.cols):
+                allowed.add(mesh.index(0, col))
+                allowed.add(mesh.index(mesh.rows - 1, col))
+        elif corner_only and mesh.rows >= 2 and mesh.cols >= 2:
             boundary = list(mesh.boundary_indices())
             n = len(boundary)
             corner_ids = {
@@ -1244,6 +1253,10 @@ class AdaptiveMeshBuilder:
         Manufactured covers have nearly straight long edges; residual zig-zags
         from silhouette noise make wrap look fake. Corner verts stay put so
         rounded corners survive.
+
+        Top/bottom rows are not chord-flattened: near-corner samples sit on
+        the fillet, so a chord between them cuts the silhouette pole off and
+        the warp then smears artwork across that cap.
         """
         if mesh.rows < 5 and mesh.cols < 5:
             return
@@ -1260,16 +1273,33 @@ class AdaptiveMeshBuilder:
                         grid[row, col] = (
                             grid[row, col] * (1.0 - blend) + target * blend
                         )
-            if mesh.cols >= 5:
-                for row in (0, mesh.rows - 1):
-                    p0 = grid[row, 1]
-                    p1 = grid[row, mesh.cols - 2]
-                    for col in range(2, mesh.cols - 2):
-                        t = (col - 1) / max(mesh.cols - 3, 1)
-                        target = p0 * (1.0 - t) + p1 * t
-                        grid[row, col] = (
-                            grid[row, col] * (1.0 - blend) + target * blend
-                        )
+        mesh.points = grid.reshape(-1, 2).astype(np.float32)
+
+    @staticmethod
+    def _snap_poles_to_mask(mesh: ControlMesh, mask: np.ndarray) -> None:
+        """
+        Place top/bottom mesh rows on the silhouette at each vertex column.
+
+        Does not move left/right midsides (side-button geometry stays put).
+        """
+        if mesh is None or mask is None or mesh.rows < 2 or mesh.cols < 2:
+            return
+        binary = (mask > 127).astype(np.uint8)
+        if int(np.count_nonzero(binary)) < 64:
+            binary = (mask > 0).astype(np.uint8)
+        if int(np.count_nonzero(binary)) < 64:
+            return
+        height, width = binary.shape[:2]
+        grid = mesh.points.reshape(mesh.rows, mesh.cols, 2)
+        for col in range(mesh.cols):
+            x_top = int(np.clip(round(float(grid[0, col, 0])), 0, width - 1))
+            ys = np.flatnonzero(binary[:, x_top])
+            if ys.size:
+                grid[0, col, 1] = float(ys.min())
+            x_bot = int(np.clip(round(float(grid[mesh.rows - 1, col, 0])), 0, width - 1))
+            ys = np.flatnonzero(binary[:, x_bot])
+            if ys.size:
+                grid[mesh.rows - 1, col, 1] = float(ys.max())
         mesh.points = grid.reshape(-1, 2).astype(np.float32)
 
     @staticmethod
@@ -1681,31 +1711,41 @@ class MeshWarper:
         if int(np.count_nonzero(body)) < 64:
             return map_x, map_y, coverage
         cov = (coverage > 0).astype(np.uint8)
-        need = (body > 0) & (cov == 0)
         mx = map_x.copy()
         my = map_y.copy()
+        # Valid samples only — rasterize uses -1 sentinels; 0,0 is a real texel.
+        valid = (cov > 0) & (mx >= 0.0) & (my >= 0.0)
+        cov = valid.astype(np.uint8)
+        need = (body > 0) & (cov == 0)
         if np.any(need) and int(np.count_nonzero(cov)) > 32:
+            dist = cv2.distanceTransform(
+                (1 - cov).astype(np.uint8), cv2.DIST_L2, 5
+            )
             wgt = cov.astype(np.float32)
-            for _ in range(10):
-                den = cv2.GaussianBlur(wgt, (0, 0), 1.35)
-                nx = cv2.GaussianBlur(mx * wgt, (0, 0), 1.35) / np.maximum(
-                    den, 1e-4
-                )
-                ny = cv2.GaussianBlur(my * wgt, (0, 0), 1.35) / np.maximum(
-                    den, 1e-4
-                )
-                fill = need & (den > 0.08)
-                if not np.any(fill):
-                    break
-                mx = np.where(fill, nx, mx)
-                my = np.where(fill, ny, my)
-                wgt = np.where(fill, 1.0, wgt)
-                need = (body > 0) & (wgt < 0.5)
-        sealed = (body > 0).astype(np.uint8) * 255
-        # Fill holes on the silhouette, but never keep mesh coverage that
-        # sits outside the real phone body (AABB / selection over-wrap).
-        coverage = np.maximum(coverage.astype(np.uint8), sealed)
-        coverage = np.where(body > 0, coverage, 0).astype(np.uint8)
+            den = cv2.GaussianBlur(wgt, (0, 0), 1.15)
+            nx = cv2.GaussianBlur(mx * wgt, (0, 0), 1.15) / np.maximum(
+                den, 1e-4
+            )
+            ny = cv2.GaussianBlur(my * wgt, (0, 0), 1.15) / np.maximum(
+                den, 1e-4
+            )
+            # Close 1–2px triangle pinholes only. Filling the whole rounded
+            # cap from the last mesh row stretched one artwork row into a
+            # smear band (and invented dark polygons at the corners).
+            fill = (
+                need
+                & (den > 0.08)
+                & (dist <= 2.25)
+                & (nx >= 0.0)
+                & (ny >= 0.0)
+            )
+            mx = np.where(fill, nx, mx)
+            my = np.where(fill, ny, my)
+            cov = np.where(fill, np.uint8(1), cov)
+        # Never mark body pixels as covered without a real dest→source sample.
+        coverage = np.where(body > 0, cov.astype(np.uint8) * 255, 0).astype(
+            np.uint8
+        )
         mx = np.where(body > 0, mx, 0.0)
         my = np.where(body > 0, my, 0.0)
         return mx.astype(np.float32), my.astype(np.float32), coverage
@@ -1803,6 +1843,72 @@ class MeshWarper:
         return clamped
 
     @staticmethod
+    def silhouette_uv_maps(
+        target_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Dest→UV from the printable silhouette, not a sparse warp mesh.
+
+        Mesh-row parametric UV bunches at rounded poles (Δv≈0.05 over a few
+        dest pixels), so remap minifies dozens of artwork rows into a smear
+        band and triangle cracks invent dark polygons. Body pixels instead
+        map through the silhouette AABB: uniform scale of the original art,
+        clipped to the real phone outline. No OOB samples, no edge stretch.
+        """
+        mask = np.asarray(target_mask)
+        if mask.ndim > 2:
+            mask = mask[:, :, 0]
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+        map_u = np.full((h, w), -1.0, dtype=np.float32)
+        map_v = np.full((h, w), -1.0, dtype=np.float32)
+        coverage = np.zeros((h, w), dtype=np.uint8)
+        body = mask > 127
+        if int(np.count_nonzero(body)) < 16:
+            return map_u, map_v, coverage
+        ys, xs = np.where(body)
+        x0 = float(xs.min())
+        x1 = float(xs.max())
+        y0 = float(ys.min())
+        y1 = float(ys.max())
+        span_x = max(x1 - x0, 1e-6)
+        span_y = max(y1 - y0, 1e-6)
+        yy, xx = np.indices((h, w), dtype=np.float32)
+        u = np.clip((xx - x0) / span_x, 0.0, 1.0)
+        v = np.clip((yy - y0) / span_y, 0.0, 1.0)
+        map_u = np.where(body, u, map_u).astype(np.float32)
+        map_v = np.where(body, v, map_v).astype(np.float32)
+        coverage = np.where(body, np.uint8(255), np.uint8(0))
+        return map_u, map_v, coverage
+
+    @staticmethod
+    def _bilinear_densify_grid(src: np.ndarray, factor: int) -> np.ndarray:
+        """Densify an (rows, cols, ch) vertex grid, preserving corner verts.
+
+        ``cv2.resize`` uses pixel-center mapping and insets the boundary, so
+        the dense mesh no longer reaches the silhouette poles.
+        """
+        src = np.asarray(src, dtype=np.float32)
+        rows, cols = int(src.shape[0]), int(src.shape[1])
+        factor = max(1, int(factor))
+        if factor <= 1 or rows < 2 or cols < 2:
+            return src.copy()
+        nr = (rows - 1) * factor + 1
+        nc = (cols - 1) * factor + 1
+        i = np.arange(nr, dtype=np.float32) / float(factor)
+        j = np.arange(nc, dtype=np.float32) / float(factor)
+        i0 = np.minimum(np.floor(i).astype(np.int32), rows - 2)
+        j0 = np.minimum(np.floor(j).astype(np.int32), cols - 2)
+        fi = (i - i0.astype(np.float32))[:, None, None]
+        fj = (j - j0.astype(np.float32))[None, :, None]
+        tl = src[i0][:, j0]
+        tr = src[i0][:, j0 + 1]
+        bl = src[i0 + 1][:, j0]
+        br = src[i0 + 1][:, j0 + 1]
+        top = tl * (1.0 - fj) + tr * fj
+        bot = bl * (1.0 - fj) + br * fj
+        return (top * (1.0 - fi) + bot * fi).astype(np.float32)
+
+    @staticmethod
     def rasterize_vertex_maps(
         destination_mesh: ControlMesh,
         vertex_values: np.ndarray,
@@ -1829,20 +1935,11 @@ class MeshWarper:
         if rows >= 2 and cols >= 2 and factor > 1:
             src_p = dest.reshape(rows, cols, 2)
             src_v = values.reshape(rows, cols, 2)
-            nr = (rows - 1) * factor + 1
-            nc = (cols - 1) * factor + 1
-            dense_p = np.empty((nr, nc, 2), dtype=np.float32)
-            dense_v = np.empty((nr, nc, 2), dtype=np.float32)
-            for k in range(2):
-                dense_p[:, :, k] = cv2.resize(
-                    src_p[:, :, k], (nc, nr), interpolation=cv2.INTER_LINEAR
-                )
-                dense_v[:, :, k] = cv2.resize(
-                    src_v[:, :, k], (nc, nr), interpolation=cv2.INTER_LINEAR
-                )
+            dense_p = MeshWarper._bilinear_densify_grid(src_p, factor)
+            dense_v = MeshWarper._bilinear_densify_grid(src_v, factor)
             dest = dense_p.reshape(-1, 2)
             values = dense_v.reshape(-1, 2)
-            rows, cols = nr, nc
+            rows, cols = int(dense_p.shape[0]), int(dense_p.shape[1])
         def _idx(row: int, col: int) -> int:
             return row * cols + col
         for row in range(rows - 1):
@@ -1952,21 +2049,16 @@ class MeshWarper:
             coverage > 0 if coverage is not None
             else np.ones(mx.shape, dtype=bool)
         )
-        if interp == int(cv2.INTER_LINEAR):
-            interp = int(cv2.INTER_LANCZOS4)
-        elif interp == int(cv2.INTER_CUBIC):
-            interp = int(cv2.INTER_LANCZOS4)
         x_hi = float(max(dw, 1)) - 1.001
         y_hi = float(max(dh, 1)) - 1.001
         if np.any(covered):
-            # Soft edge pull: only recover UV that barely left the artwork.
-            # Hard clamp of the whole rim to the last texel caused the
-            # stretched "sheet" band at the phone perimeter.
+            # Recover only sub-pixel rounding past the last texel. Pulling
+            # a pixel or more repeats the artwork edge and smears the rim.
             mx_c = np.clip(mx, 0.0, x_hi)
             my_c = np.clip(my, 0.0, y_hi)
             near = (
-                (np.abs(mx - mx_c) <= 1.25)
-                & (np.abs(my - my_c) <= 1.25)
+                (np.abs(mx - mx_c) <= 0.51)
+                & (np.abs(my - my_c) <= 0.51)
             )
             mx = np.where(covered & near, mx_c, mx)
             my = np.where(covered & near, my_c, my)
@@ -1980,23 +2072,28 @@ class MeshWarper:
         )
         if coverage is not None:
             a = warped[:, :, 3]
-            # Fill empty covered samples from neighbours — never invent a
-            # solid black rim by forcing alpha on empty UV.
-            need = covered & (a < 8)
+            # Close raster pinholes only. Spreading neighbour ink across a
+            # larger unmapped cap invented the stretched/blurred top band.
             good = covered & (a >= 8)
+            need = covered & (a < 8)
+            if np.any(need) and np.any(good):
+                dist = cv2.distanceTransform(
+                    (~good).astype(np.uint8), cv2.DIST_L2, 5
+                )
+                need = need & (dist <= 2.75)
             if np.any(need) and np.any(good):
                 ink = good.astype(np.float32)
-                for _ in range(6):
-                    den = cv2.GaussianBlur(ink, (0, 0), 1.1)
+                for _ in range(3):
+                    den = cv2.GaussianBlur(ink, (0, 0), 0.9)
                     fill_a = cv2.GaussianBlur(
-                        a.astype(np.float32) * ink, (0, 0), 1.1
+                        a.astype(np.float32) * ink, (0, 0), 0.9
                     ) / np.maximum(den, 1e-4)
-                    fill = need & (den > 0.08)
+                    fill = need & (den > 0.12)
                     if not np.any(fill):
                         break
                     for c in range(3):
                         ch = warped[:, :, c].astype(np.float32)
-                        num = cv2.GaussianBlur(ch * ink, (0, 0), 1.1)
+                        num = cv2.GaussianBlur(ch * ink, (0, 0), 0.9)
                         warped[:, :, c] = np.where(
                             fill, num / np.maximum(den, 1e-4), ch
                         ).astype(np.uint8)
@@ -2004,7 +2101,7 @@ class MeshWarper:
                         np.uint8
                     )
                     ink = np.where(fill, 1.0, ink)
-                    need = covered & (a < 8)
+                    need = covered & (a < 8) & (dist <= 2.75)
             warped[:, :, 3] = np.where(covered, a, np.uint8(0)).astype(np.uint8)
         return warped
 

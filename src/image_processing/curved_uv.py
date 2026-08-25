@@ -145,11 +145,11 @@ def remap_uv(
     sdf, nx, ny = rounded_rect_sdf(float(u), float(v), radii)
     rim = p.rim_uv
 
-    # Outside / on the boundary: pin to edge sample.
+    # Outside / on the boundary: stay on the unit-square edge.
+    # Pushing UV past 0/1 requested pixels outside the artwork and the
+    # sampler invented a stretched rim from those out-of-bounds hits.
     if sdf <= 0.0:
-        # Slight outward push so outer verts still pull wrap bleed.
-        push = rim * p.bevel_strength
-        return float(u) + nx * push, float(v) + ny * push
+        return float(np.clip(u, 0.0, 1.0)), float(np.clip(v, 0.0, 1.0))
 
     if sdf >= rim:
         # Flat back — mild inset so the face doesn't fight the wrap band.
@@ -164,7 +164,10 @@ def remap_uv(
     wrap = rim * p.bevel_strength * (1.0 - float(np.cos(theta)))
     # Soften mid-rim to avoid a hard kink at the flat junction.
     wrap *= 0.35 + 0.65 * (t ** 0.85)
-    return float(u) + nx * wrap, float(v) + ny * wrap
+    return (
+        float(np.clip(u + nx * wrap, 0.0, 1.0)),
+        float(np.clip(v + ny * wrap, 0.0, 1.0)),
+    )
 
 
 def remap_grid(
@@ -194,8 +197,8 @@ def remap_grid(
         for col in range(cols):
             u = float(u_s[col])
             uu, vv = remap_uv(u, v, params)
-            pts[idx, 0] = uu
-            pts[idx, 1] = vv
+            pts[idx, 0] = float(np.clip(uu, 0.0, 1.0))
+            pts[idx, 1] = float(np.clip(vv, 0.0, 1.0))
             idx += 1
     return pts
 

@@ -681,6 +681,35 @@ class ModelAgnosticRimTests(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(snapped[80:120, 42:50])), 0)
         self.assertEqual(int(np.count_nonzero(snapped[20:40])), 0)
 
+    def test_composite_does_not_cut_studio_through_button(self) -> None:
+        """Bright outer lip must wrap, not become a white vertical seam."""
+        h, w = 160, 100
+        output = np.full((h, w, 3), 255, dtype=np.uint8)
+        output[:, 40:] = (28, 48, 88)
+        output[50:90, 36:40] = (8, 8, 8)
+        wrap_src = np.zeros((h, w, 3), dtype=np.float32)
+        wrap_src[:, 40:] = (28 / 255.0, 48 / 255.0, 88 / 255.0)
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[:, 40:] = (50, 50, 50)
+        phone[50:90, 36:40] = (80, 78, 76)
+        phone[50:90, 36] = (210, 208, 205)
+        tips = np.zeros((h, w), dtype=np.uint8)
+        tips[50:90, 36:40] = 255
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[:, 40:] = 255
+        out = Compositor()._composite_side_button_layer(
+            output,
+            phone,
+            tips,
+            phone_mask=body,
+            wrap_src=wrap_src,
+        )
+        btn = out[50:90, 36:40].astype(np.float32)
+        col_mean = btn.mean(axis=(0, 2))
+        self.assertTrue(np.all(col_mean < 140.0))
+        self.assertGreater(float(btn[:, :, 2].mean()), float(btn[:, :, 0].mean()))
+        self.assertTrue(np.array_equal(out[:, 40:], output[:, 40:]))
+
     def test_silhouette_fallback_needs_real_bump_not_aa(self) -> None:
         h = 200
         el = np.full(h, 40.0, dtype=np.float32)
@@ -695,21 +724,18 @@ class ModelAgnosticRimTests(unittest.TestCase):
         )
         self.assertTrue(out is None or int(np.count_nonzero(out)) == 0)
 
-    def test_hard_hole_weight_keeps_sdf_ramp(self) -> None:
-        """Inset punch keeps a soft ramp and opens only deep inside the hole."""
+    def test_hard_hole_weight_follows_iso_not_halo(self) -> None:
+        """Punch tracks the 0.5 iso with ~1px AA — not a 3px feather halo."""
         yy, xx = np.mgrid[0:80, 0:80].astype(np.float32)
         dist = np.hypot(xx - 40.0, yy - 40.0) - 18.0
         excl = np.clip(0.5 - dist / 3.0, 0.0, 1.0)
         hole = Compositor._hard_hole_weight(excl)
-        mid = int(np.count_nonzero((hole > 0.08) & (hole < 0.92)))
-        self.assertGreater(mid, 40)
-        # Punch is inset vs painted coverage — solid hole area shrinks.
-        self.assertLess(
-            int(np.count_nonzero(hole > 0.50)),
-            int(np.count_nonzero(excl > 0.50)),
-        )
-        # Deep center still fully open.
         self.assertGreater(float(hole[40, 40]), 0.95)
+        self.assertLess(float(hole[40, 40 + 18 + 4]), 0.08)
+        ring = (hole > 0.08) & (hole < 0.92)
+        self.assertGreater(int(np.count_nonzero(ring)), 20)
+        dist_iso = np.abs(np.hypot(xx - 40.0, yy - 40.0) - 18.0)
+        self.assertLess(float(np.mean(dist_iso[ring])), 1.35)
 
     def test_button_wrap_replaces_black_voids_from_body_print(self) -> None:
         h, w = 160, 100
@@ -789,6 +815,23 @@ class ModelAgnosticRimTests(unittest.TestCase):
         sealed = Compositor._seal_body_row_spans(mask)
         self.assertGreater(int(sealed[60, 36]), 127)
         self.assertEqual(int(sealed[10, 10]), 0)
+
+    def test_interior_specular_band_stays_in_wrap_body(self) -> None:
+        """Bright highlight on a silver back is not studio and must wrap."""
+        h, w = 200, 140
+        body = _rounded_rect_mask(h, w, 30, 20, 110, 180, 16)
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[body > 0] = (188, 190, 192)
+        # Specular stripe across the top face (inside the silhouette).
+        phone[38, 50:90] = (248, 248, 250)
+        punched = body.copy()
+        punched[38, 50:90] = 0
+        sealed = Compositor._seal_body_row_spans(punched)
+        restored = Compositor()._subtract_studio_plate_from_body(sealed, phone)
+        self.assertGreater(int(np.count_nonzero(restored[38, 50:90])), 30)
+        self.assertEqual(int(restored[10, 10]), 0)
+        # AABB studio wedges stay empty.
+        self.assertEqual(int(restored[20, 30]), 0)
 
     def test_left_button_nubs_do_not_become_the_body_wall(self) -> None:
         """False left strips between keys must leave the body mask."""
@@ -1015,6 +1058,271 @@ class ModelAgnosticRimTests(unittest.TestCase):
             8.0,
         )
         self.assertGreater(float(wrapped[70:120, 46].mean()), float(inner.mean()))
+
+    def test_straighten_sides_does_not_chord_the_poles(self) -> None:
+        from src.image_processing.mesh import AdaptiveMeshBuilder, ControlMesh
+
+        quad = np.array(
+            [[20.0, 10.0], [180.0, 10.0], [180.0, 390.0], [20.0, 390.0]],
+            dtype=np.float32,
+        )
+        mesh = ControlMesh.from_quad(quad, 11, 9)
+        # Pole sits higher than the near-corner samples (rounded cap).
+        grid = mesh.points.reshape(mesh.rows, mesh.cols, 2)
+        grid[0, 4, 1] = 10.0
+        grid[0, 1, 1] = 18.0
+        grid[0, 7, 1] = 18.0
+        mesh.points = grid.reshape(-1, 2)
+        AdaptiveMeshBuilder._straighten_sides(mesh, passes=2)
+        pole_y = float(mesh.points.reshape(mesh.rows, mesh.cols, 2)[0, 4, 1])
+        self.assertLess(pole_y, 12.0)
+
+    def test_snap_poles_reaches_silhouette_extrema(self) -> None:
+        from src.image_processing.mesh import AdaptiveMeshBuilder, ControlMesh
+
+        mask = _rounded_rect_mask(200, 120, 20, 15, 100, 185, 18)
+        quad = AdaptiveMeshBuilder._aabb_quad_from_mask(mask)
+        mesh = ControlMesh.from_quad(quad, 9, 7)
+        grid = mesh.points.reshape(mesh.rows, mesh.cols, 2)
+        grid[0, :, 1] += 8.0
+        grid[-1, :, 1] -= 8.0
+        mesh.points = grid.reshape(-1, 2)
+        AdaptiveMeshBuilder._snap_poles_to_mask(mesh, mask)
+        ys, _ = np.where(mask > 127)
+        top = float(mesh.points.reshape(mesh.rows, mesh.cols, 2)[0, :, 1].min())
+        bot = float(mesh.points.reshape(mesh.rows, mesh.cols, 2)[-1, :, 1].max())
+        self.assertLessEqual(abs(top - float(ys.min())), 1.5)
+        self.assertLessEqual(abs(bot - float(ys.max())), 1.5)
+
+    def test_seal_maps_does_not_stretch_into_large_gaps(self) -> None:
+        """A missing rounded-cap band must not inherit the last mesh UV row."""
+        from src.image_processing.mesh import MeshWarper
+
+        h, w = 50, 40
+        map_x = np.full((h, w), -1.0, dtype=np.float32)
+        map_y = np.full((h, w), -1.0, dtype=np.float32)
+        coverage = np.zeros((h, w), dtype=np.uint8)
+        # Mesh stops 8px below the body top.
+        coverage[16:44, 6:34] = 255
+        map_x[coverage > 0] = 20.0
+        map_y[coverage > 0] = 10.0
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[8:44, 6:34] = 255
+        mx, my, cov = MeshWarper.seal_maps_to_mask(map_x, map_y, coverage, body)
+        self.assertEqual(int(np.count_nonzero(cov[body == 0])), 0)
+        # The far cap (more than ~2px from the mesh) stays unsampled.
+        self.assertEqual(int(cov[9, 20]), 0)
+        self.assertLess(float(mx[9, 20]), 0.0)
+        # Pinhole-adjacent body just above the mesh may seal.
+        self.assertGreater(int(np.count_nonzero(cov[body > 0])), 100)
+
+    def test_rebuild_overlapping_enclosing_disks_keep_all_lenses(self) -> None:
+        """Per-seed Hough used to pick the same ring twice and drop the middle."""
+        from src.image_processing.region_detector import HardwareRegionDetector
+
+        gray = np.full((220, 160), 190, dtype=np.uint8)
+        centres = (48, 92, 136)
+        parts = []
+        for cy in centres:
+            cv2.circle(gray, (50, cy), 14, 30, -1)
+            # Overlapping enclosing disk like an inflated detect blob.
+            parts.append(
+                HardwareRegionDetector._sample_circle(50.0, float(cy), 28.0, samples=40)
+            )
+        cv2.circle(gray, (82, 70), 6, 230, -1)
+        parts.append(
+            HardwareRegionDetector._sample_circle(82.0, 70.0, 8.0, samples=24)
+        )
+        rebuilt = HardwareRegionDetector.rebuild_camera_cutouts(parts, gray)
+        self.assertGreaterEqual(len(rebuilt), 3)
+        cys = []
+        for c in rebuilt:
+            pts = np.asarray(c, np.float32).reshape(-1, 2)
+            cys.append(float(pts[:, 1].mean()))
+            bw = float(pts[:, 0].max() - pts[:, 0].min())
+            bh = float(pts[:, 1].max() - pts[:, 1].min())
+            self.assertLess(max(bw, bh), 44.0)
+        cys.sort()
+        spans = [cys[i + 1] - cys[i] for i in range(len(cys) - 1)]
+        self.assertGreaterEqual(sum(1 for s in spans if s > 20.0), 2)
+
+    def test_silhouette_uv_covers_body_without_oob(self) -> None:
+        from src.image_processing.mesh import MeshWarper
+
+        mask = _rounded_rect_mask(200, 120, 20, 15, 100, 185, 16)
+        map_u, map_v, cov = MeshWarper.silhouette_uv_maps(mask)
+        body = mask > 127
+        self.assertEqual(int(np.count_nonzero(cov[body] == 0)), 0)
+        self.assertGreaterEqual(float(map_u[body].min()), 0.0)
+        self.assertLessEqual(float(map_u[body].max()), 1.0)
+        self.assertGreaterEqual(float(map_v[body].min()), 0.0)
+        self.assertLessEqual(float(map_v[body].max()), 1.0)
+        self.assertEqual(int(np.count_nonzero(cov[~body])), 0)
+        # Center column v increases with dest y (no pole bunching).
+        ys, xs = np.where(body)
+        cx = int(round(0.5 * (float(xs.min()) + float(xs.max()))))
+        col = body[:, cx]
+        v_col = map_v[col, cx]
+        self.assertGreater(float(v_col[-1] - v_col[0]), 0.85)
+        dv = np.diff(v_col)
+        self.assertGreater(float(dv.min()), -1e-6)
+        # First/last 8 body rows must not collapse onto a single UV.
+        top = v_col[:8]
+        bot = v_col[-8:]
+        self.assertGreater(float(top.max() - top.min()), 0.02)
+        self.assertGreater(float(bot.max() - bot.min()), 0.02)
+
+    def test_bilinear_densify_preserves_grid_corners(self) -> None:
+        from src.image_processing.mesh import MeshWarper
+
+        src = np.array(
+            [
+                [[10.0, 20.0], [90.0, 22.0]],
+                [[12.0, 80.0], [88.0, 78.0]],
+            ],
+            dtype=np.float32,
+        )
+        dense = MeshWarper._bilinear_densify_grid(src, 4)
+        self.assertEqual(tuple(dense.shape), (5, 5, 2))
+        np.testing.assert_allclose(dense[0, 0], src[0, 0], atol=1e-5)
+        np.testing.assert_allclose(dense[0, -1], src[0, -1], atol=1e-5)
+        np.testing.assert_allclose(dense[-1, 0], src[-1, 0], atol=1e-5)
+        np.testing.assert_allclose(dense[-1, -1], src[-1, -1], atol=1e-5)
+
+    def test_rebuild_merges_duplicate_lens_and_drops_stack_ghost(self) -> None:
+        from src.image_processing.region_detector import HardwareRegionDetector
+
+        gray = np.full((220, 160), 190, dtype=np.uint8)
+        centres = (48, 92, 136)
+        parts = []
+        for cy in centres:
+            cv2.circle(gray, (50, cy), 14, 30, -1)
+            parts.append(
+                HardwareRegionDetector._sample_circle(50.0, float(cy), 28.0, samples=40)
+            )
+        # Duplicate of the top lens after shrink.
+        parts.append(
+            HardwareRegionDetector._sample_circle(50.2, 47.5, 13.5, samples=40)
+        )
+        # Ghost between middle and bottom, shifted toward the wall.
+        parts.append(
+            HardwareRegionDetector._sample_circle(34.0, 114.0, 20.0, samples=40)
+        )
+        cv2.circle(gray, (82, 70), 6, 230, -1)
+        parts.append(
+            HardwareRegionDetector._sample_circle(82.0, 70.0, 8.0, samples=24)
+        )
+        rebuilt = HardwareRegionDetector.rebuild_camera_cutouts(parts, gray)
+        self.assertGreaterEqual(len(rebuilt), 3)
+        self.assertLessEqual(len(rebuilt), 5)
+        cxs = []
+        cys = []
+        for c in rebuilt:
+            pts = np.asarray(c, np.float32).reshape(-1, 2)
+            cxs.append(float(pts[:, 0].mean()))
+            cys.append(float(pts[:, 1].mean()))
+            bw = float(pts[:, 0].max() - pts[:, 0].min())
+            bh = float(pts[:, 1].max() - pts[:, 1].min())
+            self.assertLess(max(bw, bh), 44.0)
+        # Wall-shifted ghost must not survive.
+        self.assertFalse(any(x < 42.0 and 100.0 < y < 130.0 for x, y in zip(cxs, cys)))
+        # Duplicate top lens collapsed to one opening near y=48.
+        topish = [y for y in cys if y < 70.0]
+        self.assertLessEqual(len(topish), 2)
+
+    def test_camera_bump_maps_follow_independent_scaled_contours(self) -> None:
+        """Rim module is each selected cutout, scaled to dest, never one plate."""
+        from src.image_processing.region_detector import HardwareRegionDetector
+
+        h, w = 200, 160
+        phone = np.full((h, w, 3), 180, dtype=np.uint8)
+        excl = np.zeros((h, w), dtype=np.uint8)
+        contours = []
+        for cy in (48, 92, 136):
+            cv2.circle(excl, (50, cy), 14, 255, -1)
+            contours.append(
+                HardwareRegionDetector._sample_circle(50.0, float(cy), 14.0, samples=36)
+            )
+        cv2.circle(excl, (88, 60), 6, 255, -1)
+        contours.append(
+            HardwareRegionDetector._sample_circle(88.0, 60.0, 6.0, samples=24)
+        )
+        comp = Compositor()
+        comp.phone_image = phone
+        comp.hardware_contours = contours
+        dest_h, dest_w = h * 2, w * 2
+        excl_d = cv2.resize(excl, (dest_w, dest_h), interpolation=cv2.INTER_NEAREST)
+        module, _, _ = comp._camera_bump_exclusion_maps(excl_d, phone)
+        self.assertIsNotNone(module)
+        solid = (module > 0.50).astype(np.uint8)
+        n = int(cv2.connectedComponents(solid, 8)[0])
+        self.assertGreaterEqual(n - 1, 3)
+        self.assertLessEqual(n - 1, 5)
+
+    def test_sanitize_skips_normal_lens_circles(self) -> None:
+        from src.image_processing.device_template import CutoutSpec
+
+        def _circle_contour(cx, cy, r, w=300.0, h=400.0):
+            pts = []
+            for i in range(24):
+                a = 2.0 * np.pi * i / 24.0
+                pts.append([ (cx + r * np.cos(a)) / w, (cy + r * np.sin(a)) / h ])
+            return pts
+
+        comp = Compositor()
+        comp.phone_image = np.zeros((400, 300, 3), dtype=np.uint8)
+        specs = [
+            CutoutSpec(
+                kind="camera",
+                contour=_circle_contour(80.0, 70.0, 16.0),
+                geom="circle",
+                params=[80.0, 70.0, 16.0],
+                shape_tag="",
+            ),
+            CutoutSpec(
+                kind="camera",
+                contour=_circle_contour(80.0, 120.0, 16.0),
+                geom="circle",
+                params=[80.0, 120.0, 16.0],
+                shape_tag="",
+            ),
+            CutoutSpec(
+                kind="flash",
+                contour=_circle_contour(120.0, 70.0, 5.0),
+                geom="circle",
+                params=[120.0, 70.0, 5.0],
+                shape_tag="",
+            ),
+        ]
+        comp.cutout_specs = specs
+        before = [tuple(s.params) for s in specs]
+        comp._ensure_sanitized_camera_exclusions()
+        self.assertEqual(len(comp.cutout_specs), 3)
+        self.assertEqual([tuple(s.params) for s in comp.cutout_specs], before)
+
+    def test_snap_flush_key_does_not_extrude_into_body(self) -> None:
+        """A 1–2px locator stays a photo nub — not a generic inward face strip."""
+        h, w = 200, 120
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[:, 40:] = 255
+        tips = np.zeros((h, w), dtype=np.uint8)
+        tips[80:140, 39:41] = 255
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[:, 40:] = (70, 70, 72)
+        phone[80:140, 39:44] = (50, 48, 46)
+        snapped = Compositor()._snap_button_mask_to_device_surface(
+            tips, body, phone
+        )
+        n, _, st, _ = cv2.connectedComponentsWithStats(
+            (snapped > 127).astype(np.uint8), connectivity=8
+        )
+        self.assertGreaterEqual(n - 1, 1)
+        self.assertGreater(int(np.count_nonzero(snapped[80:140, 39:40])), 10)
+        # Must not invent a thick rectangle on the body face.
+        self.assertEqual(int(np.count_nonzero(snapped[80:140, 41:50])), 0)
+        self.assertEqual(int(np.count_nonzero(snapped[20:40])), 0)
+        widths = [int(st[i, cv2.CC_STAT_WIDTH]) for i in range(1, n)]
+        self.assertTrue(all(ww <= 3 for ww in widths))
 
 
 if __name__ == "__main__":

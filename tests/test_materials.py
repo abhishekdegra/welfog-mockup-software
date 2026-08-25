@@ -125,7 +125,7 @@ class MaterialEngineTests(unittest.TestCase):
         # Ridge just outside the cutout still has wrap coverage + shading.
         self.assertGreater(float(new_mask[60, 14]), 0.5)
         # Design chroma preserved on the ridge (not bleached white).
-        ridge = shaded[58:63, 12:17]
+        ridge = shaded[58:63, 16:19]
         self.assertGreater(float(ridge[:, :, 2].mean()), 0.20)
         self.assertLess(float(ridge.max()), 0.95)
 
@@ -155,7 +155,7 @@ class MaterialEngineTests(unittest.TestCase):
         # Walk the top-left corner arc a couple of pixels outside the hole and
         # check the shading has no high-frequency jitter (aliasing signature).
         cx, cy = x1 + radius, y1 + radius
-        offset = 4.0
+        offset = 1.25
         angles = np.linspace(np.pi, 1.5 * np.pi, 220)
         xs = cx + (radius + offset) * np.cos(angles)
         ys = cy + (radius + offset) * np.sin(angles)
@@ -176,6 +176,105 @@ class MaterialEngineTests(unittest.TestCase):
         # And the corner should be lit in the same range as the straight edge.
         edge = lift[int(y1 + 0.5 * (y2 - y1)), int(x1 - offset)]
         self.assertGreater(float(np.max(arc)), 0.25 * float(edge) - 1e-6)
+
+    def test_molded_lip_follows_independent_shapes_and_stays_thin(self) -> None:
+        """One renderer: pill + circle keep their own contours; lip is thin."""
+        h, w = 240, 180
+        design = np.full((h, w, 3), (0.08, 0.04, 0.28), np.float32)
+        hole_u8 = np.zeros((h, w), np.uint8)
+        cv2.ellipse(hole_u8, (55, 110), (18, 62), 0, 0, 360, 255, -1)
+        cv2.circle(hole_u8, (108, 70), 8, 255, -1)
+        hole = hole_u8.astype(np.float32) / 255.0
+        wrap = (1.0 - (hole > 0.5).astype(np.float32))
+        out = MaterialRenderingEngine.apply_molded_cutout_lip(
+            design, hole, wrap, LIGHTING["Studio"],
+            shade_inner=True, shade_outer=True,
+        )
+        lift = np.abs(out - design).max(axis=2)
+        # Lip exists around both openings (≈1px outside the painted edge).
+        self.assertGreater(float(lift[110, 55 - 19]), 0.004)
+        self.assertGreater(float(lift[70, 108 + 9]), 0.004)
+        # Far from either opening the wrap is unchanged.
+        self.assertLess(float(lift[200, 160]), 0.002)
+        # Lip does not become a bulky ring: 6px out is nearly flat.
+        self.assertLess(float(lift[110, 55 - 25]), float(lift[110, 55 - 19]))
+        # Interior of the pill is not flooded with wrap-colored fill.
+        self.assertLess(float(np.mean(lift[110, 55])), 0.12)
+
+    def test_nearby_flash_keeps_its_own_thin_lip(self) -> None:
+        """A small circle beside a large pill must not inherit a fat halo."""
+        h, w = 200, 160
+        design = np.full((h, w, 3), (0.07, 0.04, 0.30), np.float32)
+        hole_u8 = np.zeros((h, w), np.uint8)
+        cv2.ellipse(hole_u8, (50, 100), (20, 70), 0, 0, 360, 255, -1)
+        cv2.circle(hole_u8, (86, 100), 8, 255, -1)
+        hole = hole_u8.astype(np.float32) / 255.0
+        wrap = (1.0 - (hole > 0.5).astype(np.float32))
+        out = MaterialRenderingEngine.apply_molded_cutout_lip(
+            design, hole, wrap, LIGHTING["Studio"],
+            shade_inner=False, shade_outer=True,
+        )
+        lift = np.abs(out - design).max(axis=2)
+        # 1px outside the flash: readable lip.
+        self.assertGreater(float(lift[100, 86 + 9]), 0.003)
+        # 5px outside the flash: gone — not a capsule-width ring.
+        self.assertLess(float(lift[100, 86 + 14]), 0.003)
+
+    def test_molded_lip_follows_every_cutout_shape(self) -> None:
+        """Circle, square, pill, diamond and triangle share one geometry path."""
+        h, w = 180, 180
+
+        def _lip_hugs(mask_u8: np.ndarray) -> None:
+            hole = mask_u8.astype(np.float32) / 255.0
+            design = np.full((h, w, 3), (0.10, 0.06, 0.32), np.float32)
+            wrap = (1.0 - (hole > 0.5).astype(np.float32))
+            out = MaterialRenderingEngine.apply_molded_cutout_lip(
+                design, hole, wrap, LIGHTING["Studio"],
+                shade_inner=True, shade_outer=True,
+            )
+            lift = np.abs(out - design).max(axis=2)
+            solid = (mask_u8 > 127).astype(np.uint8)
+            dist_out = cv2.distanceTransform(
+                (1 - solid), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+            )
+            dist_in = cv2.distanceTransform(
+                solid, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+            )
+            near = ((dist_out > 0.15) & (dist_out < 8.0)) | (
+                (dist_in > 0.15) & (dist_in < 3.0)
+            )
+            far = (dist_out > 10.0) & (wrap > 0.5)
+            self.assertGreater(float(np.max(lift[near])), 0.006)
+            self.assertLess(float(np.max(lift[far])), 0.003)
+
+        circle = np.zeros((h, w), np.uint8)
+        cv2.circle(circle, (90, 90), 28, 255, -1)
+        _lip_hugs(circle)
+
+        square = np.zeros((h, w), np.uint8)
+        cv2.rectangle(square, (50, 50), (130, 130), 255, -1)
+        _lip_hugs(square)
+
+        rrect = np.zeros((h, w), np.uint8)
+        HardwareRegionDetector._paint_rounded_rect_aa(
+            rrect, 48.0, 55.0, 132.0, 125.0, 18.0, expand_px=0.0, aa=1.2
+        )
+        _lip_hugs(rrect)
+
+        pill = np.zeros((h, w), np.uint8)
+        cv2.ellipse(pill, (90, 90), (22, 58), 0, 0, 360, 255, -1)
+        _lip_hugs(pill)
+
+        diamond = np.zeros((h, w), np.uint8)
+        pts = np.array([[90, 40], [140, 90], [90, 140], [40, 90]], np.int32)
+        cv2.fillConvexPoly(diamond, pts, 255)
+        _lip_hugs(diamond)
+
+        tri = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(
+            tri, np.array([[90, 38], [145, 140], [35, 140]], np.int32), 255
+        )
+        _lip_hugs(tri)
 
     def test_stabilize_wrap_texture_reduces_cutout_border_streaks(self) -> None:
         """Tangential re-blend should lower high-frequency warp tear at arcs."""

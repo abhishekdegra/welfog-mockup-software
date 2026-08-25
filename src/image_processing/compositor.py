@@ -1801,6 +1801,12 @@ class Compositor:
         ) > 0
         stem = orphan & near_tip & (dist_in <= 2.0)
         tips = (tips | stem) & (dist_in <= 2.5) & ~cam_bin
+        # A detection cue is only a locator. Grow it to the key's full photo
+        # protrusion component, otherwise the wrap gets a 1px sliver that
+        # renders as a vertical spike instead of a button surface.
+        tips = self._claim_full_raw_button_protrusions(
+            tips, raw, body, cam_bin
+        )
         # Keep each key on its photo device contour. Do not claim raw AA
         # fringe — that rebuilt 1px studio nicks into fake side bumps.
         snapped = self._snap_button_mask_to_device_surface(
@@ -2198,13 +2204,11 @@ class Compositor:
         raw_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Map each detected button onto real device pixels.
+        Keep each key as the photo protrusion outside the body wall.
 
-        Wrap follows the photo contour of the key (outer device lip plus
-        the visible side-face up to the body wall). Studio-white pixels are
-        never added. A short inward band on the same rows covers the side
-        face the photo actually shows — scale is a fraction of the frame,
-        not a model size.
+        Detected pixels that sit past the wall are the physical button.
+        Filling a generic inward ``face_px`` strip invented a thick
+        rectangle, notched the body, and split wrap at the wall.
         """
         if tip_mask is None or np.count_nonzero(tip_mask) < 4:
             return np.zeros(body.shape[:2], dtype=np.uint8)
@@ -2220,18 +2224,16 @@ class Compositor:
                 > 127
             )
         body_b = body > 127
-        raw_b = None
-        if raw_mask is not None:
-            raw_b = raw_mask > 127
-            if raw_b.shape[:2] != (h, w):
-                raw_b = (
-                    cv2.resize(
-                        (raw_mask > 127).astype(np.uint8) * 255,
-                        (w, h),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    > 127
+        raw_b = body_b.copy()
+        if raw_mask is not None and np.count_nonzero(raw_mask) >= 64:
+            raw_u = raw_mask
+            if raw_u.shape[:2] != (h, w):
+                raw_u = cv2.resize(
+                    raw_mask.astype(np.uint8),
+                    (w, h),
+                    interpolation=cv2.INTER_NEAREST,
                 )
+            raw_b = raw_u > 127
         plate = self._studio_plate_pixels(phone_bgr)
         if plate.shape[:2] != (h, w):
             plate = (
@@ -2243,7 +2245,12 @@ class Compositor:
                 > 0
             )
         device = ~plate
+        # Bright metal / white keys are still the physical button. The studio
+        # plate heuristic must not delete detected tip pixels.
+        device = device | tips
         out = np.zeros((h, w), dtype=np.uint8)
+        # Exact detected contour outside the body wall.
+        out[(tips & ~body_b)] = 255
         nlab, labels, stats, _ = cv2.connectedComponentsWithStats(
             tips.astype(np.uint8) * 255, connectivity=8
         )
@@ -2259,14 +2266,47 @@ class Compositor:
             y1 = min(h, y0 + bh)
             for y in range(y0, y1):
                 seed_row = labels[y] == lab
-                if raw_b is not None:
-                    keep = seed_row & raw_b[y]
+                owned = device[y] & (raw_b[y] | seed_row) & ~body_b[y]
+                xs = np.where(owned)[0]
+                bxs = np.where(body_b[y] & device[y])[0]
+                if left:
+                    if len(xs) == 0 and not np.any(seed_row):
+                        continue
+                    wall = int(bxs.min()) if len(bxs) else (
+                        int(xs.min()) if len(xs) else -1
+                    )
+                    if wall < 0:
+                        continue
+                    x_out = int(xs.min()) if len(xs) else wall
+                    seed_xs = np.where(seed_row & device[y])[0]
+                    if seed_xs.size:
+                        x_out = min(x_out, int(seed_xs.min()))
+                    if x_out < wall:
+                        sl = slice(x_out, wall)
+                        keep = (device[y, sl] | seed_row[sl]) & (
+                            raw_b[y, sl] | seed_row[sl]
+                        )
+                        out[y, sl] = np.where(keep, 255, out[y, sl])
                 else:
-                    keep = seed_row & device[y] & ~plate[y]
-                if np.any(keep):
-                    out[y, keep] = 255
+                    if len(xs) == 0 and not np.any(seed_row):
+                        continue
+                    wall = int(bxs.max()) if len(bxs) else (
+                        int(xs.max()) if len(xs) else -1
+                    )
+                    if wall < 0:
+                        continue
+                    x_out = int(xs.max()) if len(xs) else wall
+                    seed_xs = np.where(seed_row & device[y])[0]
+                    if seed_xs.size:
+                        x_out = max(x_out, int(seed_xs.max()))
+                    if x_out > wall:
+                        sl = slice(wall + 1, x_out + 1)
+                        keep = (device[y, sl] | seed_row[sl]) & (
+                            raw_b[y, sl] | seed_row[sl]
+                        )
+                        out[y, sl] = np.where(keep, 255, out[y, sl])
         if int(np.count_nonzero(out)) < 4:
-            kept = (tips & device).astype(np.uint8) * 255
+            kept = (tips & ~body_b).astype(np.uint8) * 255
             return kept if int(np.count_nonzero(kept)) >= 4 else out
         return out
 
@@ -2354,13 +2394,9 @@ class Compositor:
         # bottom drip). Interior device pixels stay — including silver phones.
         body = self._strip_studio_overflow_mask(body, to_bgr(self.phone_image))
         body = self._snap_wrap_mask_to_photo_rim(body, to_bgr(self.phone_image))
-        device = CoverSurfaceEngine._device_pixels_from_photo(
-            to_bgr(self.phone_image), rim_edges=False
+        body = self._subtract_studio_plate_from_body(
+            body, to_bgr(self.phone_image)
         )
-        if device.shape[:2] == body.shape[:2]:
-            clipped = cv2.bitwise_and(body, device)
-            if np.count_nonzero(clipped) >= 64:
-                body = clipped
 
         # Final authority: photo silhouette is the wrap body (tips excluded).
         # Inward wall / device clips must not leave a silver/white rim gap.
@@ -2397,14 +2433,12 @@ class Compositor:
             body = ((sil > 127) & ~tip_out).astype(np.uint8) * 255
             # Silhouette detectors include a 1–2px AA/studio halo. Physical
             # phone pixels are the printable surface — never the card.
-            # rim_edges=False: Canny AA on the studio must not become wrap.
-            device = CoverSurfaceEngine._device_pixels_from_photo(
-                to_bgr(self.phone_image), rim_edges=False
+            # Only border-connected studio is removed. Interior specular on
+            # silver phones used to match the card threshold and punched a
+            # hole through the top face (horizontal seam / missing wrap).
+            body = self._subtract_studio_plate_from_body(
+                body, to_bgr(self.phone_image)
             )
-            if device.shape[:2] == body.shape[:2]:
-                clipped = cv2.bitwise_and(body, device)
-                if np.count_nonzero(clipped) >= 64:
-                    body = clipped
             body = self._snap_wrap_mask_to_photo_rim(
                 body, to_bgr(self.phone_image)
             )
@@ -2426,13 +2460,10 @@ class Compositor:
         sealed = self._seal_body_row_spans(body)
         if np.count_nonzero(sealed) >= 64:
             body = sealed
-        device_fill = CoverSurfaceEngine._device_pixels_from_photo(
-            to_bgr(self.phone_image), rim_edges=False
+        # Seal fills highlight cracks; only drop true studio card pixels.
+        body = self._subtract_studio_plate_from_body(
+            body, to_bgr(self.phone_image)
         )
-        if device_fill.shape[:2] == body.shape[:2]:
-            clipped = cv2.bitwise_and(body, device_fill)
-            if np.count_nonzero(clipped) >= 64:
-                body = clipped
         # Re-assert deep silhouette interior (incl. top-left face beside the
         # camera). Outer AA may be device-clipped, but true body pixels must
         # remain in the wrap mask — cutouts subtract later, not here.
@@ -2456,8 +2487,23 @@ class Compositor:
             body, self._canonical_side_button_mask()
         )
         # Same geometry shave on every straight side (left and right). Photo
-        # AA / segmentation nicks are not the case edge; keys are not used.
-        body = Compositor._shave_straight_wall_nubs_from_body(body)
+        # AA / segmentation nicks are not the case edge. Genuine keys are
+        # already on `_side_button_validated_mask` and must not be deleted.
+        _, protect = Compositor._sides_with_buttons(
+            self._canonical_side_button_mask(), body, body.shape[:2]
+        )
+        state = Compositor._silhouette_wall_state(body)
+        if state is not None:
+            nubs = Compositor._straight_wall_nub_mask(
+                state, body.shape, eps=0.50, protect=protect
+            )
+            if np.any(nubs):
+                shaved = body.copy()
+                shaved[nubs] = 0
+                if np.count_nonzero(shaved) >= 64:
+                    body = shaved
+        else:
+            body = Compositor._shave_straight_wall_nubs_from_body(body)
         # Do not re-clip with a strict device mask here — that carved white
         # under-wrap gaps along the left/bottom chrome. Silhouette + tip
         # split above is the printable authority; studio purge is finalize.
@@ -2469,9 +2515,9 @@ class Compositor:
         # Buttons stay on `_side_button_validated_mask` only. Never OR
         # synthetic capsules into the body wrap (that painted fake nubs).
 
-        # Topology quad from the photo body (ROI scale only — not the silhouette).
-        # Tight AABB ignores thin studio spikes so UV aspect matches the phone,
-        # not an oversized selection rectangle.
+        # Wrap mesh spans the photo body. Tight AABB ignores 1px studio
+        # spikes so pole verts do not lock onto jagged extrema; coverage
+        # still uses the silhouette mask (silhouette UV), not this quad.
         quad = AdaptiveMeshBuilder._tight_aabb_quad_from_mask(body)
         if quad is None:
             quad = AdaptiveMeshBuilder._stable_quad_from_mask(body)
@@ -3352,6 +3398,19 @@ class Compositor:
             )
         if not np.any(valid):
             return design, mask, alpha
+        # Reserve only true outward protrusions (outside the body wall).
+        # Side-face overlap keeps the body wrap so keys cannot flash the
+        # original bezel if the isolated layer misses a pixel.
+        body_on = np.zeros(valid.shape, dtype=bool)
+        if phone_mask is not None and np.count_nonzero(phone_mask) >= 64:
+            pm = phone_mask
+            if pm.shape[:2] != (h, w):
+                pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
+            body_on = pm > 127
+        protr = valid & ~body_on
+        if np.any(protr):
+            alpha = np.where(protr, 0.0, alpha)
+            mask = np.where(protr, 0.0, mask)
         return design, mask, alpha
 
     def _limit_side_button_blobs(
@@ -5321,11 +5380,8 @@ class Compositor:
             geom = str(getattr(spec, "geom", "") or "")
             if tag:
                 continue
-            if kind in ("camera", "other") and geom == "circle":
-                needs = True
-                break
             params = list(getattr(spec, "params", []) or [])
-            if geom == "circle" and len(params) >= 3 and float(params[2]) > short_img * 0.06:
+            if geom == "circle" and len(params) >= 3 and float(params[2]) > short_img * 0.14:
                 needs = True
                 break
             if (
@@ -6310,11 +6366,20 @@ class Compositor:
         self.hardware_contours = surface.hardware_contours
         # Split a cluster AABB into the real lens rings when the photo has
         # discrete cameras (not a raised island plate).
+        #
+        # Only for freshly detected geometry. Stored model cutouts are the
+        # shapes the user selected (position, size, rotation, corner radius),
+        # so re-deriving them here replaced them with Hough circles and lost
+        # openings the detector could not see.
         try:
             from .device_template import classify_cutout_kind, classify_cutout_kinds
             from .region_detector import HardwareRegionDetector
 
-            if self.phone_image is not None and self.hardware_contours:
+            if (
+                self.phone_image is not None
+                and self.hardware_contours
+                and not bool(getattr(surface, "from_template", False))
+            ):
                 cover_quad = CoverSurfaceEngine._canonical_hardware_quad(
                     to_bgr(self.phone_image),
                     (
@@ -6775,7 +6840,7 @@ class Compositor:
         # Scale phone wrap mask into printable if needed for clip fidelity.
         if printable is None and wrap_mask is not None:
             printable = self._scaled_mask(wrap_mask, phone.shape[:2])
-        interpolation = cv2.INTER_LANCZOS4
+        interpolation = cv2.INTER_LINEAR
         settings_snapshot = dict(self.settings)
         result = self._composite(
             phone,
@@ -6893,6 +6958,26 @@ class Compositor:
             else cv2.INTER_AREA
         )
         return cv2.resize(mask, (width, height), interpolation=interp)
+
+    def _subtract_studio_plate_from_body(
+        self, body: np.ndarray, phone_bgr: np.ndarray
+    ) -> np.ndarray:
+        """
+        Drop wrap pixels on the studio card, keep interior phone highlights.
+
+        ``_device_pixels_from_photo`` treats any bright low-sat texel as
+        card, so specular bands on silver backs became holes in the wrap.
+        """
+        if body is None or phone_bgr is None:
+            return body
+        plate = self._studio_plate_pixels(phone_bgr)
+        if plate.shape[:2] != body.shape[:2]:
+            return body
+        out = body.copy()
+        out[plate] = 0
+        if np.count_nonzero(out) >= 64:
+            return out
+        return body
 
     @staticmethod
     def _strip_studio_overflow_mask(
@@ -7476,8 +7561,11 @@ class Compositor:
                 depth_den = float(max(wall - x_out, 1))
                 for x in txs:
                     xi = int(x)
-                    pix = _pick_wrap(y, 2 * wall - xi - 1)
-                    t_out = float(wall - xi) / depth_den
+                    # Always sample on the body — mirroring a pixel that sat
+                    # on/inside the wall looked into studio (vertical cut).
+                    sample_x = int(max(wall, 2 * wall - xi - 1))
+                    pix = _pick_wrap(y, sample_x)
+                    t_out = float(max(wall - xi, 0)) / depth_den
                     # Wall pixel matches body wrap (no dark seam). Outer lip
                     # keeps a mild highlight so the key still reads in relief.
                     shade = 1.0 + 0.035 * t_out + 0.02 * cap * t_out
@@ -7491,8 +7579,9 @@ class Compositor:
                 depth_den = float(max(x_out - wall, 1))
                 for x in txs:
                     xi = int(x)
-                    pix = _pick_wrap(y, 2 * wall - xi + 1)
-                    t_out = float(xi - wall) / depth_den
+                    sample_x = int(min(wall, 2 * wall - xi + 1))
+                    pix = _pick_wrap(y, sample_x)
+                    t_out = float(max(xi - wall, 0)) / depth_den
                     shade = 1.0 + 0.035 * t_out + 0.02 * cap * t_out
                     painted = np.clip(pix * shade, 0.0, 255.0)
                     if float(np.mean(painted)) < 18.0 and ref_rgb is not None:
@@ -7705,9 +7794,9 @@ class Compositor:
             if pm.shape[:2] != (h, w):
                 pm = cv2.resize(pm, (w, h), interpolation=cv2.INTER_NEAREST)
             pm_u8 = (pm > 127).astype(np.uint8) * 255
-            # Body wall stays continuous. Only wrap the key pixels that sit
-            # past that wall — detection may also mark bezel columns.
-            tips = tips & ~(pm_u8 > 127)
+            # Body wall stays continuous underneath. The isolated layer paints
+            # the full validated key (outward nub + visible side face).
+            # Stripping body pixels here collapsed flush keys to a 1px spike.
             body = pm_u8 > 127
         else:
             body = ~tips
@@ -7769,32 +7858,16 @@ class Compositor:
             left_side = (
                 float(t_xs.mean()) <= float(b_xs.mean()) if t_xs.size else True
             )
-            paint, _, studio_bgr = Compositor._button_photo_wrap_alpha(
+            paint, _, _studio_bgr = Compositor._button_photo_wrap_alpha(
                 tip_comp,
                 tips,
                 body,
                 phone,
                 left_side=left_side,
             )
-            dropped = tip_comp & ~paint
-            if np.any(dropped):
-                # Outer photo-AA snaps to studio. Inner dropped pixels sit on
-                # the body junction — wrap them or they read as a dark seam.
-                inner = np.zeros_like(dropped)
-                for yy in range(y0, y1):
-                    txs = np.where(tip_comp[yy])[0]
-                    if txs.size == 0:
-                        continue
-                    mid = 0.5 * (float(txs.min()) + float(txs.max()))
-                    if left_side:
-                        inner[yy, int(np.ceil(mid)) : int(txs.max()) + 1] = True
-                    else:
-                        inner[yy, int(txs.min()) : int(np.floor(mid)) + 1] = True
-                wrap_inner = dropped & inner & tip_comp
-                aa_drop = dropped & ~wrap_inner
-                if np.any(aa_drop):
-                    result[aa_drop] = studio_bgr
-                paint = paint | wrap_inner
+            # Wrap the photo contour only. Do not stamp studio into dropped
+            # pixels — that cut a white/black vertical seam through the key.
+            # Quiet-bezel AA stays as the existing composite (studio card).
             if not np.any(paint):
                 continue
             result = Compositor._wrap_validated_button_surface(
@@ -9280,22 +9353,40 @@ class Compositor:
 
         # 1. Sample the original artwork once through dest→UV maps. Pan/zoom
         # only updates the crop window; geometry maps stay cached.
-        # Linear UV: curved bevel foreshortening fattens/distorts the photo.
-        # Wrap still follows the phone silhouette via the destination mesh.
-        # Curved rim UV so the print wraps the case sides like the old cover.
+        # Linear parametric UV: dest mesh already follows the phone silhouette.
+        # Curved rim remapping piled many dest rows onto the first artwork
+        # rows and produced the stretched/polygonal cap.
         curved = CurvedUVParams(
             rim_uv=min(float(s.get("rim_uv", 5.5)) / 100.0, 0.022),
             bevel_strength=min(
                 float(s.get("bevel_strength", 92.0)) / 100.0, 0.38
             ),
             corner_radii=self.corner_radii,
-            enabled=True,
+            enabled=False,
         )
         self.curved_uv_params = curved
 
-        map_u, map_v, uv_cov, uv_table = self._destination_uv_maps(
-            mesh, (h, w), self.curved_uv_params
-        )
+        pm_seal = None
+        if self._phone_wrap_mask is not None:
+            pm_seal = self._scaled_mask(self._phone_wrap_mask, (h, w))
+        elif getattr(self.cover_engine, "last_phone_mask", None) is not None:
+            pm_seal = self._scaled_mask(
+                self.cover_engine.last_phone_mask, (h, w)
+            )
+        # Wrap UV from the real body silhouette. Mesh-triangle UV bunches at
+        # rounded poles and leaves uncovered dest pixels that remap as dark
+        # polygons / stretched first-row texels.
+        used_silhouette_uv = False
+        if pm_seal is not None and np.count_nonzero(pm_seal) > 64:
+            map_u, map_v, uv_cov = MeshWarper.silhouette_uv_maps(pm_seal)
+            uv_table = MeshWarper.parametric_uv(
+                mesh.rows, mesh.cols, self.curved_uv_params
+            )
+            used_silhouette_uv = True
+        else:
+            map_u, map_v, uv_cov, uv_table = self._destination_uv_maps(
+                mesh, (h, w), self.curved_uv_params
+            )
         # Artwork cover window follows the detected phone silhouette, never
         # an oversized/tilted selection cage that only contains the phone.
         center, crop_w, crop_h = MeshWarper.sampling_window(
@@ -9317,14 +9408,11 @@ class Compositor:
             crop_h,
             float(s.get('rotation', 0.0)),
         )
-        pm_seal = None
-        if self._phone_wrap_mask is not None:
-            pm_seal = self._scaled_mask(self._phone_wrap_mask, (h, w))
-        elif getattr(self.cover_engine, "last_phone_mask", None) is not None:
-            pm_seal = self._scaled_mask(
-                self.cover_engine.last_phone_mask, (h, w)
-            )
-        if pm_seal is not None and np.count_nonzero(pm_seal) > 64:
+        if (
+            not used_silhouette_uv
+            and pm_seal is not None
+            and np.count_nonzero(pm_seal) > 64
+        ):
             map_x, map_y, uv_cov = MeshWarper.seal_maps_to_mask(
                 map_x, map_y, uv_cov, pm_seal
             )
@@ -9597,17 +9685,10 @@ class Compositor:
         lighting = LIGHTING.get(self.lighting_name)
         contact = None
 
-        # 4b. Camera bump ridge on the wrap, just outside the punched hole.
+        # Visual moulded lip is applied once after show-through from the
+        # current cutout iso. Shading the wrap here first made a second
+        # blurred ring around the same path.
         if bump_module is not None:
-            design, mask = MaterialRenderingEngine.apply_camera_bump(
-                design,
-                mask,
-                phone,
-                bump_module,
-                np.zeros_like(mask),
-                wrap_mask=wrap_mask,
-                lighting=lighting,
-            )
             if material.opacity >= 0.90 and opacity >= 0.90:
                 content = np.clip(design_alpha, 0.0, 1.0)
                 solid = np.clip(mask, 0.0, 1.0)
@@ -10468,13 +10549,8 @@ class Compositor:
         output = self._soft_phone_through_cutouts(
             output, phone_bgr, exclusion_mask, tip_mask=tip_vm
         )
-        # Manufactured plastic lip — covers silver AA jaggies, follows hole shape.
+        # Single moulded-lip pass after show-through so the inner wall survives.
         output = self._apply_manufactured_cutout_rim(
-            output, phone_bgr, exclusion_mask, tip_mask=tip_vm
-        )
-        # Rim paints a thin inward lip; re-assert deep cutout interiors are
-        # phone hardware so wrap cannot remain as blobs on the module.
-        output = self._soft_phone_through_cutouts(
             output, phone_bgr, exclusion_mask, tip_mask=tip_vm
         )
 
@@ -11298,42 +11374,51 @@ class Compositor:
         return mask
 
     @staticmethod
-    def _hard_hole_weight(excl_f: np.ndarray) -> np.ndarray:
+    def _iso_hole_coverage(
+        excl_f: np.ndarray,
+        *,
+        aa_px: float = 0.65,
+    ) -> np.ndarray:
         """
-        Float punch for wrap alpha — open the real cutout, leave only a
-        sub-pixel join for the manufactured lip. A large inset left wrap
-        painted on the camera module.
+        Wrap punch / phone show-through from the 0.5 iso of the selected path.
+
+        Sub-pixel SDF, ~1px AA. Binary distance-transform punch is already
+        solid at the first interior pixel and left a jagged hole with a
+        separate blend halo.
         """
-        hole = np.clip(excl_f.astype(np.float32), 0.0, 1.0)
+        hole = np.clip(np.asarray(excl_f, dtype=np.float32), 0.0, 1.0)
         if float(np.max(hole)) < 0.05:
             return hole
         solid = (hole >= 0.50).astype(np.uint8)
-        if int(np.count_nonzero(solid)) < 16:
+        if int(np.count_nonzero(solid)) < 8:
             return hole
+        ys, xs = np.where(solid > 0)
+        bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+        margin = 4
+        dist_out = MaterialRenderingEngine._subpixel_outside_distance(
+            hole, bbox, margin=margin
+        )
+        dist_in = MaterialRenderingEngine._subpixel_inside_distance(
+            hole, bbox, margin=margin
+        )
+        aa = max(0.50, float(aa_px))
+        signed = dist_in - dist_out
+        t = np.clip(0.5 + signed / (2.0 * aa), 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t)
         h, w = hole.shape[:2]
-        dist_in = cv2.distanceTransform(solid, cv2.DIST_L2, 5).astype(np.float32)
-        # Per-component inset — global module bbox made flash lips huge.
-        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
-        inset_map = np.zeros((h, w), dtype=np.float32)
-        for lab in range(1, nlab):
-            area = int(stats[lab, cv2.CC_STAT_AREA])
-            if area < 12:
-                continue
-            bw = int(stats[lab, cv2.CC_STAT_WIDTH])
-            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
-            cut_short = float(min(bw, bh))
-            inset = float(
-                np.clip(
-                    max(0.20, cut_short * 0.004, min(h, w) * 0.0003),
-                    0.20,
-                    cut_short * 0.012,
-                )
-            )
-            inset_map[labels == lab] = inset
-        punch = np.clip((dist_in - (inset_map - 0.15)) / 0.55, 0.0, 1.0)
-        punch = np.where(inset_map > 0.0, punch, 0.0)
-        punch = punch * punch * (3.0 - 2.0 * punch)
-        return np.clip(punch, 0.0, 1.0)
+        x0 = int(max(0, bbox[0] - margin))
+        y0 = int(max(0, bbox[1] - margin))
+        x3 = int(min(w, bbox[2] + margin + 1))
+        y3 = int(min(h, bbox[3] + margin + 1))
+        roi = np.zeros((h, w), dtype=bool)
+        roi[y0:y3, x0:x3] = True
+        t = np.where(roi, t, solid.astype(np.float32))
+        return t.astype(np.float32)
+
+    @staticmethod
+    def _hard_hole_weight(excl_f: np.ndarray) -> np.ndarray:
+        """Punch wrap at the selected cutout iso — not an inset SDF halo."""
+        return Compositor._iso_hole_coverage(excl_f, aa_px=0.65)
 
     def _camera_bump_exclusion_maps(
         self,
@@ -11341,7 +11426,11 @@ class Compositor:
         phone: np.ndarray,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Module coverage for the cutout rim — identical to the punched hole.
+        Canonical cutout coverage for the moulded rim.
+
+        The painted exclusion (selected circle / pill / path / …) is the
+        geometry source. Contours are not re-rasterized, so resize/rotate
+        keep the same shape identity.
         """
         del phone
         excl_f = np.clip(exclusion_mask.astype(np.float32) / 255.0, 0.0, 1.0)
@@ -11392,48 +11481,13 @@ class Compositor:
             cov = cov * (1.0 - np.clip(bf, 0.0, 1.0))
         if float(np.max(cov)) < 0.02:
             return output
-        # Phone only deep inside — outer chrome stays under wrap/rim.
-        solid0 = (cov >= 0.50).astype(np.uint8)
-        if int(np.count_nonzero(solid0)) >= 16:
-            dist_in = cv2.distanceTransform(solid0, cv2.DIST_L2, 5).astype(
-                np.float32
-            )
-            nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid0, 8)
-            inset_map = np.zeros((h, w), dtype=np.float32)
-            for lab in range(1, nlab):
-                if int(stats[lab, cv2.CC_STAT_AREA]) < 12:
-                    continue
-                cut_short = float(
-                    min(
-                        int(stats[lab, cv2.CC_STAT_WIDTH]),
-                        int(stats[lab, cv2.CC_STAT_HEIGHT]),
-                    )
-                )
-                inset = float(
-                    np.clip(
-                        max(0.31, cut_short * 0.0102, min(h, w) * 0.00054),
-                        0.31,
-                        cut_short * 0.0264,
-                    )
-                )
-                inset_map[labels == lab] = inset
-            # Phone glass only deep inside — thin soft join, not a thick ring.
-            cov = np.clip((dist_in - (inset_map - 0.22)) / 0.65, 0.0, 1.0)
-            cov = np.where(inset_map > 0.0, cov, 0.0)
+        cov = Compositor._iso_hole_coverage(cov, aa_px=0.65)
         t = np.clip(cov, 0.0, 1.0)
-        cov_s = t * t * (3.0 - 2.0 * t)
+        cov_s = t
         out_f = output.astype(np.float32)
         phone_f = phone_bgr.astype(np.float32)
         if phone_f.shape[:2] != (h, w):
             phone_f = cv2.resize(phone_f, (w, h), interpolation=cv2.INTER_LINEAR)
-        # Soft AA ring: don't pull bright chrome fringe into wrap.
-        # Deep inside the cutout: always show real camera hardware.
-        phone_gray = phone_f.mean(axis=2)
-        phone_sat = phone_f.max(axis=2) - phone_f.min(axis=2)
-        chrome_phone = (phone_gray > 95.0) & (phone_sat < 50.0)
-        soft_ring = (t > 0.05) & (t < 0.85)
-        cov_s = np.where(chrome_phone & soft_ring, cov_s * 0.08, cov_s)
-        cov_s = np.where(t >= 0.70, np.maximum(cov_s, 0.992), cov_s)
         w3 = cov_s[:, :, np.newaxis]
         blended = phone_f * w3 + out_f * (1.0 - w3)
         return np.clip(np.round(blended), 0, 255).astype(np.uint8)
@@ -11447,10 +11501,10 @@ class Compositor:
         tip_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Thin plastic lip around every cutout, sampled from surrounding wrap ink.
+        Thin plastic lip around every cutout, from the exact selected shape.
 
-        Follows the exact hole contour (any shape). Subtle depth only — no thick
-        opaque ring. Does not change hole size / geometry.
+        Same renderer as apply_molded_cutout_lip. Crest on the path iso,
+        5–12% offset, cover-coloured lighting — not a blurred halo.
         """
         if (
             output is None
@@ -11473,180 +11527,20 @@ class Compositor:
                     interpolation=cv2.INTER_NEAREST,
                 )
             hole = np.where(tm > 127, 0.0, hole)
-        solid = (hole >= 0.50).astype(np.uint8)
-        if int(np.count_nonzero(solid)) < 16:
+        if float(np.max(hole)) < 0.05:
             return output
-        short = float(min(h, w))
-        dist_out = cv2.distanceTransform(
-            (1 - solid), cv2.DIST_L2, 5
-        ).astype(np.float32)
-        dist_in = cv2.distanceTransform(solid, cv2.DIST_L2, 5).astype(np.float32)
-        # Soften binary distance stairs so circle lips stay round at zoom.
-        dist_out = cv2.GaussianBlur(dist_out, (0, 0), 0.28)
-        dist_in = cv2.GaussianBlur(dist_in, (0, 0), 0.22)
-
-        nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
-        ridge_map = np.zeros((h, w), dtype=np.float32)
-        inset_map = np.zeros((h, w), dtype=np.float32)
-        reach_map = np.zeros((h, w), dtype=np.float32)
-        for lab in range(1, nlab):
-            if int(stats[lab, cv2.CC_STAT_AREA]) < 12:
-                continue
-            cut_short = float(
-                min(
-                    int(stats[lab, cv2.CC_STAT_WIDTH]),
-                    int(stats[lab, cv2.CC_STAT_HEIGHT]),
-                )
-            )
-            # ~12% of original manufactured-rim thickness.
-            ridge_w = float(
-                np.clip(max(0.22, cut_short * 0.0066, short * 0.00054), 0.22, 1.08)
-            )
-            inset = float(
-                np.clip(
-                    max(0.24, cut_short * 0.0102, short * 0.00054),
-                    0.24,
-                    cut_short * 0.0264,
-                )
-            )
-            reach = float(
-                np.clip(max(0.35, cut_short * 0.0096, ridge_w * 1.25), 0.35, 1.44)
-            )
-            # Assign on component + a local exterior halo for maps.
-            x0 = max(0, int(stats[lab, cv2.CC_STAT_LEFT]) - int(reach) - 2)
-            y0 = max(0, int(stats[lab, cv2.CC_STAT_TOP]) - int(reach) - 2)
-            x1 = min(w, int(stats[lab, cv2.CC_STAT_LEFT] + stats[lab, cv2.CC_STAT_WIDTH] + reach + 2))
-            y1 = min(h, int(stats[lab, cv2.CC_STAT_TOP] + stats[lab, cv2.CC_STAT_HEIGHT] + reach + 2))
-            roi = (labels[y0:y1, x0:x1] == lab) | (
-                (solid[y0:y1, x0:x1] == 0) & (dist_out[y0:y1, x0:x1] <= reach)
-            )
-            ridge_map[y0:y1, x0:x1] = np.where(roi, ridge_w, ridge_map[y0:y1, x0:x1])
-            inset_map[y0:y1, x0:x1] = np.where(
-                labels[y0:y1, x0:x1] == lab, inset, inset_map[y0:y1, x0:x1]
-            )
-            reach_map[y0:y1, x0:x1] = np.where(roi, reach, reach_map[y0:y1, x0:x1])
-        ridge_w_ref = float(
-            max(0.35, np.median(ridge_map[ridge_map > 0]))
-            if np.any(ridge_map > 0)
-            else 0.4
+        wrap_gate = (1.0 - hole).astype(np.float32)
+        img = np.clip(output.astype(np.float32) / 255.0, 0.0, 1.0)
+        lighting = LIGHTING.get(self.lighting_name)
+        shaded = MaterialRenderingEngine.apply_molded_cutout_lip(
+            img,
+            hole,
+            wrap_gate,
+            lighting=lighting,
+            shade_inner=True,
+            shade_outer=True,
         )
-
-        # Soft AA lip: thin outside ridge + light inward chrome cover.
-        t_out = np.clip(dist_out / np.maximum(ridge_map, 1e-3), 0.0, 1.0)
-        outer_lip = (
-            np.sin(np.pi * t_out)
-            * (dist_out > 0.0)
-            * (dist_out <= ridge_map)
-            * (ridge_map > 0.0)
-        )
-        chrome_in = np.clip(1.0 - dist_in / np.maximum(inset_map, 1e-3), 0.0, 1.0)
-        chrome_in = np.where(solid > 0, chrome_in, 0.0)
-        fade = np.clip((inset_map - dist_in) / 0.75, 0.0, 1.0)
-        fade = fade * fade * (3.0 - 2.0 * fade)
-        chrome_in = chrome_in * fade * 0.32
-        out_f0 = output.astype(np.float32)
-        gray0 = out_f0.mean(axis=2)
-        sat0 = out_f0.max(axis=2) - out_f0.min(axis=2)
-        near_out = (solid == 0) & (dist_out <= reach_map) & (reach_map > 0.0)
-        bright_out = near_out & (gray0 > 105.0)
-        silver_out = near_out & (gray0 > 88.0) & (sat0 < 42.0)
-        chrome_out = np.clip(
-            1.0 - dist_out / np.maximum(reach_map, 1e-3), 0.0, 1.0
-        ).astype(np.float32)
-        chrome_out = np.where(bright_out | silver_out, chrome_out, 0.0)
-        chrome_out = chrome_out * chrome_out * (3.0 - 2.0 * chrome_out) * 0.28
-        chrome_cover = np.maximum(chrome_in, chrome_out)
-        # Soften leftover bright phone pixels at the rim↔lens soft join.
-        join_bright = (
-            (solid > 0)
-            & (gray0 > 95.0)
-            & (sat0 < 55.0)
-            & (dist_in <= (inset_map + 0.40))
-            & (inset_map > 0.0)
-        )
-        chrome_cover = np.maximum(
-            chrome_cover, join_bright.astype(np.float32) * 0.20
-        )
-        lip = np.clip(
-            np.maximum(outer_lip.astype(np.float32) * 0.55, chrome_cover),
-            0.0,
-            1.0,
-        )
-        lip = np.maximum(
-            lip,
-            (bright_out | silver_out | join_bright).astype(np.float32) * 0.16,
-        )
-        lip = cv2.GaussianBlur(lip, (0, 0), 0.22)
-        if float(np.max(lip)) < 0.02:
-            return output
-
-        # Sample wrap ink just outside the thin ridge (local cover color).
-        wrap_gate = (dist_out > ridge_map * 0.55) & (dist_out < ridge_map * 5.5) & (
-            ridge_map > 0.0
-        )
-        sat = out_f0.max(axis=2) - out_f0.min(axis=2)
-        wrap_px = wrap_gate & (gray0 >= 18.0) & (gray0 < 210.0) & (sat >= 6.0)
-        if not np.any(wrap_px):
-            wrap_px = wrap_gate & (gray0 >= 14.0) & (gray0 < 230.0)
-        if np.any(wrap_px):
-            base_rgb = np.median(out_f0[wrap_px], axis=0).astype(np.float32)
-        else:
-            # Neutral fallback from nearby mid-tone body pixels (no fixed brown).
-            body_px = (gray0 >= 20.0) & (gray0 < 200.0) & (sat >= 4.0)
-            if np.any(body_px):
-                base_rgb = np.median(out_f0[body_px], axis=0).astype(np.float32)
-            else:
-                base_rgb = np.median(out_f0.reshape(-1, 3), axis=0).astype(
-                    np.float32
-                )
-
-        ink = wrap_px.astype(np.float32)
-        ink_b = cv2.GaussianBlur(ink, (0, 0), max(0.55, ridge_w_ref * 0.7))
-        filled = np.empty_like(out_f0)
-        for ch in range(3):
-            num = cv2.GaussianBlur(
-                out_f0[:, :, ch] * ink, (0, 0), max(0.55, ridge_w_ref * 0.7)
-            )
-            filled[:, :, ch] = np.where(
-                ink_b > 1e-3, num / np.maximum(ink_b, 1e-3), base_rgb[ch]
-            )
-        # Prefer local wrap fill; only fall back to base where sampling is empty.
-        force_base = ink_b < 0.08
-        for ch in range(3):
-            filled[:, :, ch] = np.where(force_base, base_rgb[ch], filled[:, :, ch])
-
-        gx = cv2.Sobel(dist_out + dist_in * 0.15, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(dist_out + dist_in * 0.15, cv2.CV_32F, 0, 1, ksize=3)
-        gn = np.sqrt(gx * gx + gy * gy) + 1e-6
-        nx, ny = gx / gn, gy / gn
-        lit = np.clip(0.60 + 0.12 * (-0.60 * nx - 0.32 * ny), 0.0, 1.0)
-        shade = np.clip(0.60 + 0.12 * (0.60 * nx + 0.32 * ny), 0.0, 1.0)
-        # Very slight manufactured depth only.
-        bevel = (0.985 + 0.030 * lit - 0.025 * (1.0 - shade)).astype(np.float32)
-        bevel = cv2.GaussianBlur(bevel, (0, 0), max(0.20, ridge_w_ref * 0.12))
-        rim_rgb = filled * bevel[:, :, np.newaxis]
-        crest = np.sin(
-            np.pi * np.clip(dist_out / np.maximum(ridge_map, 1e-3), 0.0, 1.0)
-        )
-        crest = crest * outer_lip.astype(np.float32) * 0.018
-        crest = cv2.GaussianBlur(crest, (0, 0), 0.20)
-        rim_rgb = np.clip(
-            rim_rgb * (1.0 + crest[:, :, np.newaxis] * 0.06), 0.0, 255.0
-        )
-
-        a = np.clip(lip, 0.0, 1.0)[:, :, np.newaxis]
-        a = np.where(
-            chrome_cover[:, :, np.newaxis] > 0.35,
-            np.maximum(a, 0.22),
-            a,
-        )
-        a = np.where(
-            (bright_out | silver_out | join_bright)[:, :, np.newaxis],
-            np.maximum(a, 0.18),
-            a,
-        )
-        out_f = rim_rgb * a + out_f0 * (1.0 - a)
-        return np.clip(np.round(out_f), 0, 255).astype(np.uint8)
+        return np.clip(np.round(shaded * 255.0), 0, 255).astype(np.uint8)
 
     def _apply_studio_background(
         self,
