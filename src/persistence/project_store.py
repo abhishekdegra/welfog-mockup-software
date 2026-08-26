@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -319,7 +318,7 @@ class ProjectStore:
         ):
             compositor.auto_fit_design()
 
-        compositor.invalidate(clear_scaled=True)
+        compositor.invalidate(clear_scaled=False)
         logger.info(
             "Applied project (phone=%s design=%s)",
             phone_path, design_path,

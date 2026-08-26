@@ -1381,6 +1381,12 @@ class MainWindow(QMainWindow):
             return
 
         self._render_token += 1
+        edit_mesh = bool(self.edit_region_btn.isChecked())
+        if edit_mesh:
+            self.progress_bar.setVisible(False)
+            if self.compositor.phone_image is not None:
+                self.canvas.set_image(self.compositor.phone_image)
+            return
         self.render_thread.request(self.PREVIEW_MAX, self._render_token)
 
     def _on_rendered(self, image, token: int, elapsed_ms: float) -> None:

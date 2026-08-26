@@ -291,10 +291,14 @@ class MeshGeometryTests(unittest.TestCase):
         output = compositor2.export()
 
         # Full exclusion cores (camera cutout + buttons) must match the phone —
-        # cover design never fills inside the cutout border.
+        # cover design never fills inside the cutout opening. A thin moulded
+        # rim of wrap sits on the selected path, so compare the inset core.
         excl = compositor2.exclusion_mask
         self.assertIsNotNone(excl)
-        core = excl >= 200
+        core = (excl >= 200).astype(np.uint8)
+        core = cv2.erode(
+            core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        ) > 0
         difference = np.abs(
             output.astype(np.int16) - phone.astype(np.int16)
         )[core]

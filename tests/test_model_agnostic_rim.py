@@ -593,8 +593,8 @@ class ModelAgnosticRimTests(unittest.TestCase):
             phone_mask=body,
             wrap_src=wrap_src,
         )
-        self.assertGreater(float(out[50:90, 25].mean()), 240.0)
-        self.assertLess(float(out[50:90, 26].mean()), 80.0)
+        # Validated contour is wrapped continuously (including the outer lip).
+        self.assertLess(float(out[50:90, 25:28].mean()), 80.0)
         self.assertGreater(
             float(out[50:90, 26, 2].mean()), float(out[50:90, 26, 0].mean())
         )
@@ -664,6 +664,53 @@ class ModelAgnosticRimTests(unittest.TestCase):
         btn = out[50:90, 36:40]
         self.assertLess(float(btn.mean()), 90.0)
         self.assertGreater(float(btn[:, :, 2].mean()), float(btn[:, :, 0].mean()))
+
+    def test_button_wrap_covers_specular_interior(self) -> None:
+        """A bright highlight inside the validated key must not punch a hole."""
+        h, w = 160, 100
+        output = np.full((h, w, 3), 255, dtype=np.uint8)
+        output[:, 40:] = (28, 48, 88)
+        wrap_src = np.zeros((h, w, 3), dtype=np.uint8)
+        wrap_src[:, 40:] = (28, 48, 88)
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[:, 40:] = (50, 50, 50)
+        phone[50:90, 36:40] = (70, 70, 75)
+        phone[70:72, 37:39] = (210, 210, 212)
+        tips = np.zeros((h, w), dtype=np.uint8)
+        tips[50:90, 36:40] = 255
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[:, 40:] = 255
+        comp = Compositor()
+        out = comp._composite_side_button_layer(
+            output,
+            phone,
+            tips,
+            phone_mask=body,
+            wrap_src=wrap_src,
+        )
+        btn = out[50:90, 36:40]
+        spec = out[70:72, 37:39]
+        self.assertLess(float(btn.mean()), 90.0)
+        self.assertLess(float(spec.mean()), 90.0)
+        self.assertTrue(np.array_equal(out[:, 40:], output[:, 40:]))
+        self.assertTrue(np.array_equal(out[tips == 0], output[tips == 0]))
+
+    def test_quiet_wall_ignores_false_nubs_between_keys(self) -> None:
+        """Median wall comes from rows without keys, not 1px segmentation nubs."""
+        h, w = 200, 80
+        body = np.zeros((h, w), dtype=bool)
+        body[:, 30:] = True
+        body[40:50, 28:30] = True
+        body[90:100, 29:30] = True
+        tips = np.zeros((h, w), dtype=bool)
+        tips[60:80, 24:30] = True
+        tips[120:140, 24:30] = True
+        wall = Compositor._quiet_mid_wall_x(
+            body, tips, side="left", y_lo=20, y_hi=180
+        )
+        self.assertIsNotNone(wall)
+        self.assertGreaterEqual(float(wall), 29.5)
+        self.assertLessEqual(float(wall), 30.5)
 
     def test_snap_keeps_nub_without_on_body_strip(self) -> None:
         """Stem to the wall is kept; a wide on-body rectangle is not invented."""
@@ -985,7 +1032,19 @@ class ModelAgnosticRimTests(unittest.TestCase):
 
         bin_xs = _left_xs(mask.astype(np.float32) / 255.0, 20, 48)
         gate_xs = _left_xs(gate, 20, 48)
-        self.assertLess(_kink(gate_xs), _kink(bin_xs) * 0.75)
+        self.assertLess(_kink(gate_xs), _kink(bin_xs) * 0.50)
+        dist_out = cv2.distanceTransform(
+            (~body).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        corner = Compositor._corner_weight_from_silhouette(mask) >= 0.18
+        specks = (
+            corner
+            & (~body)
+            & (gate > 0.02)
+            & (gate < 0.18)
+            & (dist_out > 1.25)
+        )
+        self.assertLess(int(np.count_nonzero(specks)), 8)
 
     def test_finalize_keeps_corner_coverage_aa(self) -> None:
         """Final raster must not snap rounded corners back to binary stairs."""
@@ -1010,6 +1069,101 @@ class ModelAgnosticRimTests(unittest.TestCase):
             aa_counts.append(int(np.count_nonzero((gray > 40.0) & (gray < 230.0))))
             self.assertGreater(aa_counts[-1], 8)
         self.assertGreater(min(aa_counts), int(max(aa_counts) * 0.35))
+
+    def test_finalize_inner_lip_is_solid_wrap(self) -> None:
+        """Studio-white inside the rim fills with wrap; the silver lip is kept."""
+        h, w = 200, 120
+        body = _rounded_rect_mask(h, w, 20, 16, 100, 184, 22)
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[body > 0] = (40, 42, 48)
+        ink = np.array([20.0, 30.0, 180.0])
+        output = phone.copy()
+        on = body > 0
+        output[on] = ink.astype(np.uint8)
+        dist_in = cv2.distanceTransform(on.astype(np.uint8), cv2.DIST_L2, 5)
+        # Existing thin glossy lip — must not be treated as a white gap.
+        rim = on & (dist_in <= 1.2)
+        output[rim] = (210, 214, 220)
+        # True empty strip just inside that lip.
+        gap = on & (dist_in > 1.4) & (dist_in <= 3.2)
+        output[gap] = (255, 255, 255)
+        out = Compositor._finalize_body_boundary_raster(output, phone, body)
+        self.assertGreater(float(out[rim].mean()), 180.0)
+        inner = gap & (dist_in > 1.6) & (dist_in <= 2.8)
+        self.assertGreater(int(np.count_nonzero(inner)), 20)
+        self.assertLess(float(out[inner].mean()), 110.0)
+        self.assertGreater(float(np.mean(out[2, 2])), 250.0)
+
+    def test_finalize_fills_stair_notch_up_to_inner_rim(self) -> None:
+        """White notches outside binary wrap fill; silver rim stays."""
+        h, w = 80, 60
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[10:70, 16:50] = 255
+        # Stair notch: one column of body missing at a bottom-left corner.
+        body[64:70, 16] = 0
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[10:70, 16:50] = (40, 42, 48)
+        # Notch is still device in the photo — wrap mask just missed it.
+        phone[64:70, 16] = (40, 42, 48)
+        phone[64:70, 15] = (210, 214, 220)
+        output = phone.copy()
+        output[body > 0] = (20, 30, 180)
+        output[64:70, 16] = (255, 255, 255)
+        output[64:70, 15] = (210, 214, 220)
+        out = Compositor._finalize_body_boundary_raster(output, phone, body)
+        notch = out[64:70, 16].astype(np.float32)
+        self.assertLess(float(notch.mean()), 120.0)
+        rim = out[64:70, 15].astype(np.float32)
+        self.assertGreater(float(rim.mean()), 180.0)
+        self.assertGreater(float(np.mean(out[2, 2])), 250.0)
+
+    def test_finalize_fills_on_body_vis_gap_up_to_inner_rim(self) -> None:
+        """Pale vis=0 stairs on the binary body fill; existing lip stays."""
+        h, w = 80, 60
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[10:70, 16:50] = 255
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[10:70, 16:50] = (40, 42, 48)
+        phone[10:70, 15] = (210, 214, 220)
+        output = phone.copy()
+        wrap_vis = np.zeros((h, w), dtype=np.float32)
+        output[10:70, 18:50] = (20, 30, 180)
+        wrap_vis[10:70, 18:50] = 1.0
+        # Path iso inset: columns 16-17 are body but unpainted / pale plate.
+        output[10:70, 16:18] = (200, 200, 200)
+        output[10:70, 15] = (210, 214, 220)
+        out = Compositor._finalize_body_boundary_raster(
+            output, phone, body, wrap_vis=wrap_vis
+        )
+        gap = out[40:60, 16:18].astype(np.float32)
+        self.assertLess(float(gap.mean()), 120.0)
+        rim = out[40:60, 15].astype(np.float32)
+        self.assertGreater(float(rim.mean()), 180.0)
+        self.assertGreater(float(np.mean(out[2, 2])), 250.0)
+
+    def test_finalize_fills_outer_gap_even_if_cutout_mask_overlaps_rim(self) -> None:
+        """Dilated camera hole must not skip the outer inner-rim gap."""
+        h, w = 80, 60
+        body = np.zeros((h, w), dtype=np.uint8)
+        body[10:70, 16:50] = 255
+        phone = np.full((h, w, 3), 255, dtype=np.uint8)
+        phone[10:70, 16:50] = (40, 42, 48)
+        phone[10:70, 15] = (210, 214, 220)
+        output = phone.copy()
+        wrap_vis = np.zeros((h, w), dtype=np.float32)
+        output[10:70, 18:50] = (20, 30, 180)
+        wrap_vis[10:70, 18:50] = 1.0
+        output[10:70, 16:18] = (200, 200, 200)
+        output[10:70, 15] = (210, 214, 220)
+        exclusion = np.zeros((h, w), dtype=np.uint8)
+        exclusion[:30] = 255
+        out = Compositor._finalize_body_boundary_raster(
+            output, phone, body, exclusion_mask=exclusion, wrap_vis=wrap_vis
+        )
+        gap = out[12:28, 16:18].astype(np.float32)
+        self.assertLess(float(gap.mean()), 120.0)
+        rim = out[12:28, 15].astype(np.float32)
+        self.assertGreater(float(rim.mean()), 180.0)
 
     def test_finalize_does_not_paste_studio_onto_body_rim(self) -> None:
         h, w = 80, 60
@@ -1099,8 +1253,8 @@ class ModelAgnosticRimTests(unittest.TestCase):
         # Junction column just inside the wall is present (no 1px seam).
         self.assertGreater(int(np.count_nonzero(mask[44:96, 39])), 20)
 
-    def test_dest_raster_omits_native_aa_lip(self) -> None:
-        """Bright native outer lip is not a dest wrap column."""
+    def test_dest_raster_follows_native_validated_contour(self) -> None:
+        """Dest raster keeps the native key columns, including the outer lip."""
         h, w = 80, 40
         body = np.zeros((h, w), dtype=np.uint8)
         body[:, 20:] = 255
@@ -1116,9 +1270,9 @@ class ModelAgnosticRimTests(unittest.TestCase):
         mask, _ = comp._rasterize_side_buttons_at_size(
             (h * 2, w * 2), tips, None
         )
-        # Native solid key is x=18,19 → dest [36, 40). Outer AA x=17 stays out.
-        self.assertEqual(int(np.count_nonzero(mask[44:96, :36])), 0)
-        self.assertGreater(int(np.count_nonzero(mask[44:96, 36:40])), 40)
+        # Native x=17..19 → dest [34, 40). Do not drop the outer validated column.
+        self.assertEqual(int(np.count_nonzero(mask[44:96, :34])), 0)
+        self.assertGreater(int(np.count_nonzero(mask[44:96, 34:40])), 80)
         self.assertEqual(int(np.count_nonzero(mask[44:96, 40:])), 0)
 
     def test_button_wrap_wall_pixel_matches_body_ink(self) -> None:

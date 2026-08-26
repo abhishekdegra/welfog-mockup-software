@@ -201,6 +201,159 @@ class MaterialEngineTests(unittest.TestCase):
         # Interior of the pill is not flooded with wrap-colored fill.
         self.assertLess(float(np.mean(lift[110, 55])), 0.12)
 
+    def test_molded_lip_does_not_replace_hardware_with_solid_fill(self) -> None:
+        """Inner opening keeps phone RGB; rim is a thin annulus, not a plate."""
+        h, w = 240, 180
+        wrap_rgb = np.array([0.08, 0.04, 0.32], np.float32)
+        island = np.array([0.78, 0.76, 0.74], np.float32)
+        hole_u8 = np.zeros((h, w), np.uint8)
+        HardwareRegionDetector._paint_rounded_rect_aa(
+            hole_u8, 48.0, 40.0, 120.0, 170.0, 22.0, expand_px=0.0, aa=1.2
+        )
+        hole = hole_u8.astype(np.float32) / 255.0
+        img = np.broadcast_to(wrap_rgb, (h, w, 3)).copy()
+        solid = hole >= 0.50
+        img[solid] = island
+        opening, outer_lip, inner_lip = MaterialRenderingEngine.cutout_rim_geometry(
+            hole
+        )
+        # Opening is inset: centre is open, selected-path pixels are not.
+        self.assertGreater(float(opening[105, 84]), 0.95)
+        edge = cv2.Canny((solid.astype(np.uint8) * 255), 40, 120) > 0
+        if int(np.count_nonzero(edge)) >= 8:
+            self.assertLess(float(opening[edge].mean()), 0.35)
+        annulus = np.maximum(outer_lip, inner_lip)
+        self.assertGreater(float(np.max(annulus)), 0.4)
+        # Annulus must not cover the lens/island interior.
+        self.assertLess(float(annulus[105, 84]), 0.08)
+
+        wrap = (1.0 - opening).astype(np.float32)
+        out = MaterialRenderingEngine.apply_molded_cutout_lip(
+            img, hole, wrap, LIGHTING["Studio"],
+            shade_inner=True, shade_outer=True,
+        )
+        core = opening > 0.85
+        np.testing.assert_allclose(out[core], img[core], atol=1e-5)
+        # Opening stays the island, not a wrap-coloured or grey plate.
+        self.assertGreater(
+            float(np.mean(np.abs(out[core] - wrap_rgb))), 0.40
+        )
+        np.testing.assert_allclose(
+            out[core].reshape(-1, 3).mean(axis=0), island, atol=1e-4
+        )
+        # Rim pixels just outside the path moved (shaded wrap), not a fill.
+        dist_out = cv2.distanceTransform(
+            (~solid).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+        )
+        ring = (dist_out > 0.4) & (dist_out < 3.0) & (~solid)
+        self.assertGreater(float(np.max(np.abs(out[ring] - img[ring]))), 0.004)
+
+    def test_rim_geometry_is_identical_for_every_locked_shape(self) -> None:
+        """One engine: every editor shape yields an annulus from its own path."""
+        h, w = 200, 200
+
+        def circle(m):
+            cv2.circle(m, (100, 100), 36, 255, -1)
+
+        def square(m):
+            cv2.rectangle(m, (64, 64), (136, 136), 255, -1)
+
+        def rrect(m):
+            HardwareRegionDetector._paint_rounded_rect_aa(
+                m, 60.0, 62.0, 140.0, 138.0, 18.0, expand_px=0.0, aa=1.2
+            )
+
+        def oval(m):
+            cv2.ellipse(m, (100, 100), (28, 50), 0, 0, 360, 255, -1)
+
+        def diamond(m):
+            cv2.fillConvexPoly(
+                m, np.array([[100, 50], [150, 100], [100, 150], [50, 100]], np.int32), 255
+            )
+
+        def triangle(m):
+            cv2.fillConvexPoly(
+                m, np.array([[100, 48], [152, 150], [48, 150]], np.int32), 255
+            )
+
+        for painter in (circle, square, rrect, oval, diamond, triangle):
+            mask = np.zeros((h, w), np.uint8)
+            painter(mask)
+            hole = mask.astype(np.float32) / 255.0
+            opening, outer_lip, inner_lip = MaterialRenderingEngine.cutout_rim_geometry(
+                hole
+            )
+            solid = hole >= 0.50
+            self.assertGreater(float(opening[solid].max()), 0.95)
+            ys, xs = np.where(solid)
+            cy, cx = int(ys.mean()), int(xs.mean())
+            self.assertGreater(float(opening[cy, cx]), 0.9)
+            rim = np.maximum(outer_lip, inner_lip)
+            self.assertGreater(float(np.max(rim)), 0.35)
+            self.assertLess(float(rim[cy, cx]), 0.08)
+            # Rotate/scale identity: geometry comes from this raster, not AABB.
+            rot = cv2.warpAffine(
+                mask,
+                cv2.getRotationMatrix2D((100.0, 100.0), 25.0, 1.15),
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            hole_r = np.clip(rot.astype(np.float32) / 255.0, 0.0, 1.0)
+            op_r, out_r, in_r = MaterialRenderingEngine.cutout_rim_geometry(hole_r)
+            solid_r = hole_r >= 0.50
+            if int(np.count_nonzero(solid_r)) < 40:
+                continue
+            ys, xs = np.where(solid_r)
+            self.assertGreater(float(op_r[int(ys.mean()), int(xs.mean())]), 0.85)
+            self.assertGreater(float(np.max(np.maximum(out_r, in_r))), 0.30)
+
+    def test_compositor_show_through_keeps_hardware_not_a_fill_plate(self) -> None:
+        """Wrap is punched at the inset opening; camera RGB is not replaced."""
+        h, w = 220, 180
+        phone = np.full((h, w, 3), 255, np.uint8)
+        body = np.zeros((h, w), np.uint8)
+        cv2.rectangle(body, (24, 16), (156, 204), 255, -1)
+        phone[body > 0] = (48, 50, 54)
+        island = (196, 198, 202)
+        excl = np.zeros((h, w), np.uint8)
+        HardwareRegionDetector._paint_rounded_rect_aa(
+            excl, 46.0, 38.0, 118.0, 168.0, 20.0, expand_px=0.0, aa=1.2
+        )
+        phone[excl > 160] = island
+        cv2.circle(phone, (70, 78), 16, (18, 18, 22), -1)
+        cv2.circle(phone, (70, 128), 16, (16, 16, 20), -1)
+        wrap_bgr = np.array([18, 28, 170], np.uint8)
+        output = phone.copy()
+        output[body > 0] = wrap_bgr
+        # Artwork currently covers the island — the cutout must punch it.
+        comp = Compositor()
+        shown = comp._soft_phone_through_cutouts(output, phone, excl)
+        rimmed = comp._apply_manufactured_cutout_rim(shown, phone, excl)
+        opening, outer_lip, inner_lip = MaterialRenderingEngine.cutout_rim_geometry(
+            excl.astype(np.float32) / 255.0
+        )
+        core = cv2.erode(
+            (opening > 0.5).astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+        ) > 0
+        self.assertGreater(int(np.count_nonzero(core)), 40)
+        delta = np.abs(
+            rimmed.astype(np.int16) - phone.astype(np.int16)
+        )[core]
+        self.assertLessEqual(int(delta.max()), 2)
+        # Not a wrap-coloured plate.
+        wrap_delta = np.abs(
+            rimmed.astype(np.int16) - wrap_bgr.astype(np.int16)
+        )[core]
+        self.assertGreater(float(wrap_delta.mean()), 80.0)
+        # Lenses survive.
+        self.assertLess(float(rimmed[78, 70].mean()), 40.0)
+        self.assertLess(float(rimmed[128, 70].mean()), 40.0)
+        # Thin rim exists around the selected path (outer wrap side).
+        self.assertGreater(float(np.max(outer_lip)), 0.35)
+        self.assertLess(float((outer_lip > 0.2)[core].mean()), 0.02)
+
     def test_nearby_flash_keeps_its_own_thin_lip(self) -> None:
         """A small circle beside a large pill must not inherit a fat halo."""
         h, w = 200, 160

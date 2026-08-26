@@ -556,8 +556,8 @@ class MaterialRenderingEngine:
         Total rim is ~8% of the cutout short side, clamped to 5–12%.
         Nearby openings keep independent widths.
         """
-        del frame_short
         h, w = solid.shape[:2]
+        frame_cap = float(max(2.5, float(frame_short) * 0.016))
         outer_map = np.full((h, w), np.inf, dtype=np.float32)
         inner_map = np.zeros((h, w), dtype=np.float32)
         nlab, labels, stats, _ = cv2.connectedComponentsWithStats(solid, 8)
@@ -571,8 +571,8 @@ class MaterialRenderingEngine:
                     int(stats[lab, cv2.CC_STAT_HEIGHT]),
                 )
             )
-            total = float(np.clip(char * 0.085, char * 0.05, char * 0.12))
-            total = float(np.clip(total, 2.0, 12.0))
+            total = float(np.clip(char * 0.08, char * 0.05, char * 0.12))
+            total = float(np.clip(total, 2.0, frame_cap))
             outer = float(total * 0.62)
             inner = float(total * 0.38)
             sel = (labels == lab).astype(np.uint8)
@@ -594,6 +594,69 @@ class MaterialRenderingEngine:
         return outer_map, inner_map
 
     @staticmethod
+    def cutout_rim_geometry(
+        hole: np.ndarray,
+        *,
+        aa_px: float = 0.65,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Annulus + opening from the selected cutout's 0.5 iso.
+
+        Returns ``(opening, outer_lip, inner_lip)``:
+        - opening: camera/flash show-through inside the inset inner contour
+        - outer_lip / inner_lip: quarter-round height on the wrap annulus
+          (outer contour slightly outside the path, inner contour inset)
+        """
+        module = np.clip(np.asarray(hole, dtype=np.float32), 0.0, 1.0)
+        if float(np.max(module)) > 1.05:
+            module = module / 255.0
+        h, w = module.shape[:2]
+        zeros = np.zeros((h, w), dtype=np.float32)
+        if float(np.max(module)) < 0.05:
+            return zeros, zeros, zeros
+        solid = (module >= 0.50).astype(np.uint8)
+        if int(np.count_nonzero(solid)) < 8:
+            return module.copy(), zeros, zeros
+        ys, xs = np.where(solid > 0)
+        bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+        outer_map, inner_map = MaterialRenderingEngine._cutout_lip_widths(
+            solid, float(min(h, w))
+        )
+        max_outer = float(max(np.max(outer_map), 1.0))
+        margin = int(np.ceil(max_outer * 3.0)) + 4
+        dist_out = MaterialRenderingEngine._subpixel_outside_distance(
+            module, bbox, margin=margin
+        )
+        dist_in = MaterialRenderingEngine._subpixel_inside_distance(
+            module, bbox, margin=margin
+        )
+        outer_w = np.maximum(outer_map, 1e-3)
+        inner_w = np.maximum(inner_map, 1e-3)
+        aa = max(0.50, float(aa_px))
+        t_open = np.clip(0.5 + (dist_in - inner_w) / (2.0 * aa), 0.0, 1.0)
+        t_open = t_open * t_open * (3.0 - 2.0 * t_open)
+        opening = np.where(solid > 0, t_open, 0.0).astype(np.float32)
+
+        t_out = np.clip(dist_out / outer_w, 0.0, 1.0)
+        t_in = np.clip(dist_in / inner_w, 0.0, 1.0)
+        h_out = (0.5 * (1.0 + np.cos(np.pi * t_out))).astype(np.float32)
+        h_in = (0.5 * (1.0 + np.cos(np.pi * t_in))).astype(np.float32)
+        outer_lip = (
+            h_out
+            * (dist_out > 0.0)
+            * (dist_out <= outer_map)
+            * (solid == 0).astype(np.float32)
+        ).astype(np.float32)
+        inner_lip = (
+            h_in
+            * (dist_in > 0.0)
+            * (dist_in <= inner_map)
+            * solid.astype(np.float32)
+            * (1.0 - opening)
+        ).astype(np.float32)
+        return opening, outer_lip, inner_lip
+
+    @staticmethod
     def apply_molded_cutout_lip(
         image: np.ndarray,
         hole: np.ndarray,
@@ -602,12 +665,14 @@ class MaterialRenderingEngine:
         *,
         shade_inner: bool = True,
         shade_outer: bool = True,
+        rim_pack: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Molded case lip from the 0.5 iso of the selected cutout path.
 
-        Crest sits on the contour and falls off over a 5–12% offset — a
-        quarter-round of cover material, not a blurred halo or painted ring.
+        The rim is an annulus (outer contour + inset inner contour). Depth is
+        a cover-coloured highlight/shadow only — never a solid fill inside
+        the opening. Camera/flash pixels inside the inner contour stay put.
         """
         lighting = lighting or LightingProfile("Studio")
         result = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
@@ -629,55 +694,36 @@ class MaterialRenderingEngine:
             if wrap.shape[:2] != (h, w):
                 wrap = cv2.resize(wrap, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        solid = (module >= 0.50).astype(np.uint8)
-        if int(np.count_nonzero(solid)) < 8:
-            return result
-        ys, xs = np.where(solid > 0)
-        bbox = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
-        outer_map, inner_map = MaterialRenderingEngine._cutout_lip_widths(
-            solid, float(min(h, w))
-        )
-        max_outer = float(max(np.max(outer_map), 1.0))
-        margin = int(np.ceil(max_outer * 3.0)) + 4
-        dist_out = MaterialRenderingEngine._subpixel_outside_distance(
-            module, bbox, margin=margin
-        )
-        dist_in = MaterialRenderingEngine._subpixel_inside_distance(
-            module, bbox, margin=margin
-        )
-
-        outer_w = np.maximum(outer_map, 1e-3)
-        inner_w = np.maximum(inner_map, 1e-3)
-        t_out = np.clip(dist_out / outer_w, 0.0, 1.0)
-        t_in = np.clip(dist_in / inner_w, 0.0, 1.0)
-        # Crest ON the path (t=0), fade to the case over the offset.
-        # sin(πt) peaked mid-band and read as a detached glowing ring.
-        h_out = (0.5 * (1.0 + np.cos(np.pi * t_out))).astype(np.float32)
-        h_in = (0.5 * (1.0 + np.cos(np.pi * t_in))).astype(np.float32)
-        outer_lip = (
-            h_out
-            * (dist_out > 0.0)
-            * (dist_out <= outer_map)
-            * (solid == 0).astype(np.float32)
-            * (wrap > 0.35).astype(np.float32)
-        ).astype(np.float32)
-        inner_lip = (
-            h_in
-            * (dist_in > 0.0)
-            * (dist_in <= inner_map)
-            * solid.astype(np.float32)
-        ).astype(np.float32)
+        if rim_pack is not None:
+            opening, outer_lip, inner_lip = rim_pack
+            if opening.shape[:2] != (h, w):
+                opening = cv2.resize(
+                    opening, (w, h), interpolation=cv2.INTER_LINEAR
+                )
+                outer_lip = cv2.resize(
+                    outer_lip, (w, h), interpolation=cv2.INTER_LINEAR
+                )
+                inner_lip = cv2.resize(
+                    inner_lip, (w, h), interpolation=cv2.INTER_LINEAR
+                )
+        else:
+            opening, outer_lip, inner_lip = (
+                MaterialRenderingEngine.cutout_rim_geometry(module)
+            )
         if not shade_outer:
             outer_lip = np.zeros_like(outer_lip)
         if not shade_inner:
             inner_lip = np.zeros_like(inner_lip)
+        outer_lip = outer_lip * (wrap > 0.35).astype(np.float32)
+        # Inner wall is remaining wrap in the annulus, never the camera core.
+        inner_lip = inner_lip * np.clip(wrap, 0.0, 1.0)
         lip = np.maximum(outer_lip, inner_lip)
         if float(np.max(lip)) < 0.02:
             return result
 
-        signed = dist_out - dist_in
-        gx = cv2.Sobel(signed, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(signed, cv2.CV_32F, 0, 1, ksize=3)
+        height_f = (outer_lip - inner_lip).astype(np.float32)
+        gx = cv2.Sobel(height_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(height_f, cv2.CV_32F, 0, 1, ksize=3)
         gn = np.sqrt(gx * gx + gy * gy) + 1e-6
         nx, ny = gx / gn, gy / gn
         dx, dy = lighting.direction
@@ -686,32 +732,20 @@ class MaterialRenderingEngine:
         ndot = np.clip(lx * nx + ly * ny, -1.0, 1.0)
         hi = float(max(0.70, getattr(lighting, "highlight_scale", 1.0) or 1.0))
         # Multiplicative, cover-coloured: highlight facing the key, shadow
-        # opposite. No additive white/grey catch (that was the glow).
-        gain = (1.0 + 0.16 * hi * ndot * lip).astype(np.float32)
+        # opposite. No additive white/grey catch and no median fill plate.
+        gain = (1.0 + 0.22 * hi * ndot * lip).astype(np.float32)
         mixed = np.clip(result * gain[:, :, np.newaxis], 0.0, 1.0)
-        lift = np.clip(ndot, 0.0, 1.0) * lip * (0.06 * hi)
+        lift = np.clip(ndot, 0.0, 1.0) * lip * (0.08 * hi)
         mixed = np.clip(
             mixed + result * lift[:, :, np.newaxis], 0.0, 1.0
         )
-        if shade_inner and float(np.max(inner_lip)) > 0.02:
-            # Thin inner wall of cover material (case thickness), not a fill.
-            sample = (
-                (dist_out > 0.35)
-                & (dist_out <= np.maximum(outer_map, 0.35))
-                & (solid == 0)
-            )
-            if np.any(sample):
-                cover_rgb = np.median(result[sample], axis=0).astype(np.float32)
-            else:
-                cover_rgb = np.median(
-                    result[solid == 0], axis=0
-                ).astype(np.float32)
-            wall = (
-                inner_lip * np.clip(1.0 - t_in * 1.35, 0.0, 1.0) * 0.42
-            ).astype(np.float32)
-            wall3 = wall[:, :, np.newaxis]
-            wall_rgb = cover_rgb[np.newaxis, np.newaxis, :] * gain[:, :, np.newaxis]
-            mixed = mixed * (1.0 - wall3) + wall_rgb * wall3
+        # Contact shadow on the inner crest — darkens existing cover pixels,
+        # never replaces camera RGB with a flat colour.
+        contact = inner_lip * np.clip(0.55 - ndot, 0.0, 1.0) * 0.10
+        mixed = np.clip(mixed * (1.0 - contact[:, :, np.newaxis]), 0.0, 1.0)
+        # Hardware inside the inset opening stays identical to the input.
+        keep = opening > 0.50
+        mixed = np.where(keep[:, :, np.newaxis], result, mixed)
         return np.clip(mixed, 0.0, 1.0)
 
     @staticmethod

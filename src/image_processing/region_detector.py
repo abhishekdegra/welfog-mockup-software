@@ -1,5 +1,6 @@
 """Offline phone boundary, printable surface, and hardware estimation."""
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -323,11 +324,44 @@ class PhoneBoundaryDetector:
     """Multi-candidate, confidence-scored phone silhouette estimator."""
 
     MAX_ANALYSIS_EDGE = 1000
+    _DETECT_CACHE: "OrderedDict[tuple, BoundaryEstimate]" = OrderedDict()
+    _DETECT_CACHE_MAX = 6
+
+    @staticmethod
+    def _cache_key(image: np.ndarray) -> tuple:
+        a = np.asarray(image)
+        h, w = int(a.shape[0]), int(a.shape[1])
+        sy = max(1, h // 20)
+        sx = max(1, w // 20)
+        samp = np.ascontiguousarray(a[::sy, ::sx])
+        return (h, w, int(a.ndim), int(samp.reshape(-1)[::13].sum()))
+
+    @staticmethod
+    def _cached_copy(est: "BoundaryEstimate") -> "BoundaryEstimate":
+        return BoundaryEstimate(
+            np.asarray(est.quad, dtype=np.float32).copy(),
+            np.asarray(est.contour).copy(),
+            np.asarray(est.mask).copy(),
+            float(est.confidence),
+        )
+
+    @staticmethod
+    def _remember_detect(key: tuple, est: "BoundaryEstimate") -> None:
+        cache = PhoneBoundaryDetector._DETECT_CACHE
+        cache[key] = PhoneBoundaryDetector._cached_copy(est)
+        cache.move_to_end(key)
+        while len(cache) > PhoneBoundaryDetector._DETECT_CACHE_MAX:
+            cache.popitem(last=False)
 
     @staticmethod
     def detect(image: np.ndarray) -> BoundaryEstimate:
         """Estimate the outer phone/cover silhouette without learned models."""
         source = np.asarray(image)
+        key = PhoneBoundaryDetector._cache_key(source)
+        cached = PhoneBoundaryDetector._DETECT_CACHE.get(key)
+        if cached is not None:
+            PhoneBoundaryDetector._DETECT_CACHE.move_to_end(key)
+            return PhoneBoundaryDetector._cached_copy(cached)
         bgr = to_bgr(source)
         original_h, original_w = bgr.shape[:2]
         scale = min(
@@ -379,7 +413,9 @@ class PhoneBoundaryDetector:
                 mask, np.round(quad).astype(np.int32), 255, cv2.LINE_AA
             )
             contour = np.round(quad).astype(np.int32).reshape(-1, 1, 2)
-            return BoundaryEstimate(quad, contour, mask, 0.35)
+            estimate = BoundaryEstimate(quad, contour, mask, 0.35)
+            PhoneBoundaryDetector._remember_detect(key, estimate)
+            return estimate
 
         score, contour, mask = best
         contour = contour.astype(np.float32) / scale
@@ -391,7 +427,9 @@ class PhoneBoundaryDetector:
             full_mask, [np.round(contour).astype(np.int32)],
             -1, 255, -1, cv2.LINE_AA,
         )
-        return BoundaryEstimate(quad, contour, full_mask, score)
+        estimate = BoundaryEstimate(quad, contour, full_mask, score)
+        PhoneBoundaryDetector._remember_detect(key, estimate)
+        return estimate
 
     @staticmethod
     def _border_colour_mask(image: np.ndarray) -> np.ndarray:
@@ -611,6 +649,9 @@ class HardwareRegionDetector:
     size/aspect rules stable even when the source photograph has perspective.
     """
 
+    _DETECT_CACHE: "OrderedDict[tuple, Tuple[np.ndarray, List[np.ndarray], float]]" = OrderedDict()
+    _DETECT_CACHE_MAX = 4
+
     @staticmethod
     def detect(
         phone_image: np.ndarray, outer_quad: np.ndarray
@@ -626,6 +667,25 @@ class HardwareRegionDetector:
                 np.zeros((image_h, image_w), dtype=np.uint8),
                 [],
                 0.0,
+            )
+
+        sy = max(1, image_h // 20)
+        sx = max(1, image_w // 20)
+        samp = np.ascontiguousarray(phone[::sy, ::sx])
+        hw_key = (
+            image_h,
+            image_w,
+            int(samp.reshape(-1)[::13].sum()),
+            tuple(np.round(quad.reshape(-1), 1).tolist()),
+        )
+        cached = HardwareRegionDetector._DETECT_CACHE.get(hw_key)
+        if cached is not None:
+            HardwareRegionDetector._DETECT_CACHE.move_to_end(hw_key)
+            mask_c, contours_c, conf_c = cached
+            return (
+                mask_c.copy(),
+                [np.asarray(c).copy() for c in contours_c],
+                float(conf_c),
             )
 
         scale = min(
@@ -678,25 +738,10 @@ class HardwareRegionDetector:
         full_mask = (full_mask > 96).astype(np.uint8) * 255
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, close_k)
-        # Full-resolution side pass — thin button ridges survive perspective
-        # better in the original photo than in the rectified strip alone.
-        # Side buttons painted after the soft AA blur so their cores stay hard
-        # (pixel-identical phone restore in the compositor).
-        soft = cv2.GaussianBlur(full_mask, (3, 3), 0)
-        side_only = np.zeros_like(full_mask)
-        HardwareRegionDetector._detect_side_hardware_fullres(
-            phone, side_only, quad
-        )
-        if np.count_nonzero(side_only):
-            # Slightly dilate so wrap faces clear the whole button ridge.
-            dilate = max(1, int(round(min(image_w, image_h) * 0.0018)))
-            k = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (dilate * 2 + 1, dilate * 2 + 1)
-            )
-            side_only = cv2.dilate(side_only, k, iterations=1)
-            full_mask = cv2.max(soft, side_only)
-        else:
-            full_mask = soft
+        # Side buttons are wrapped (validated mask + relief), not punched.
+        # Merging a full-res side pass into the exclusion mask cost ~20s per
+        # detect and punched keys the compositor then had to restore.
+        full_mask = cv2.GaussianBlur(full_mask, (3, 3), 0)
 
         # Drop corner glare / false side hits after full-res merge, then snap
         # the primary camera island to a clean rounded rectangle — but only
@@ -717,6 +762,15 @@ class HardwareRegionDetector:
         # Dense / circular contours → smooth overlay & editable cutouts.
         contours = HardwareRegionDetector._smooth_exclusion_contours(full_mask)
         confidence = min(0.45, sum(scores) / max(len(scores), 1) * 0.45)
+        cache = HardwareRegionDetector._DETECT_CACHE
+        cache[hw_key] = (
+            full_mask.copy(),
+            [np.asarray(c).copy() for c in contours],
+            float(confidence),
+        )
+        cache.move_to_end(hw_key)
+        while len(cache) > HardwareRegionDetector._DETECT_CACHE_MAX:
+            cache.popitem(last=False)
         return full_mask, contours, confidence
 
     @staticmethod

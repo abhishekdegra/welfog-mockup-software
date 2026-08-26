@@ -8,6 +8,7 @@ or hardware openings.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -89,6 +90,17 @@ class CoverSurfaceEngine:
     """
 
     ANALYSIS_LONG_EDGE = 900
+    _WRAP_SIL_CACHE: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+    _WRAP_SIL_CACHE_MAX = 4
+
+    @staticmethod
+    def _image_cache_key(image: np.ndarray) -> tuple:
+        a = np.asarray(image)
+        h, w = int(a.shape[0]), int(a.shape[1])
+        sy = max(1, h // 20)
+        sx = max(1, w // 20)
+        samp = np.ascontiguousarray(a[::sy, ::sx])
+        return (h, w, int(a.ndim), int(samp.reshape(-1)[::13].sum()))
 
     @staticmethod
     def _absorb_fresh_hardware(
@@ -197,31 +209,6 @@ class CoverSurfaceEngine:
             cached = self.templates.find(phone, cheap)
             if cached is not None:
                 region = self.templates.materialise(cached, phone.shape[:2])
-                # Always refresh hardware exclusions (side buttons / speakers
-                # especially). Older templates often only stored camera holes.
-                fresh_excl, fresh_contours, hw_conf = (
-                    HardwareRegionDetector.detect(
-                        phone,
-                        CoverSurfaceEngine._canonical_hardware_quad(
-                            phone, region.mesh.corner_points()
-                        ),
-                    )
-                )
-                if np.count_nonzero(fresh_excl) > 0:
-                    CoverSurfaceEngine._absorb_fresh_hardware(
-                        region, fresh_excl, fresh_contours
-                    )
-                    region.confidence = min(
-                        1.0, region.confidence * 0.7 + hw_conf * 0.3
-                    )
-                    # Keep printable clear of refreshed exclusions.
-                    if region.printable_mask is not None:
-                        hard = (
-                            (region.exclusion_mask > 96).astype(np.uint8) * 255
-                        )
-                        region.printable_mask = cv2.bitwise_and(
-                            region.printable_mask, cv2.bitwise_not(hard)
-                        )
                 # Upgrade coarse legacy templates (e.g. 7×5) to production
                 # mesh density. Wrap cage always comes from the live phone
                 # silhouette — frozen template meshes / skewed phone_masks are
@@ -306,17 +293,22 @@ class CoverSurfaceEngine:
                         region.mesh.corner_points(), rows, cols, adaptive=True
                     )
                     region.mesh = denser
-                # Refresh exclusions against the upright live cage so orphan
-                # template holes (false top-right circles) are not restored.
-                fresh_excl2, fresh_contours2, _ = HardwareRegionDetector.detect(
-                    phone,
-                    CoverSurfaceEngine._canonical_hardware_quad(
-                        phone, region.mesh.corner_points(), phone_gate
-                    ),
+                # One hardware refresh against the live cage (not a second
+                # pass on the stale template quad — that doubled load time).
+                fresh_excl, fresh_contours, hw_conf = (
+                    HardwareRegionDetector.detect(
+                        phone,
+                        CoverSurfaceEngine._canonical_hardware_quad(
+                            phone, region.mesh.corner_points(), phone_gate
+                        ),
+                    )
                 )
-                if np.count_nonzero(fresh_excl2) > 0:
+                if np.count_nonzero(fresh_excl) > 0:
                     CoverSurfaceEngine._absorb_fresh_hardware(
-                        region, fresh_excl2, fresh_contours2
+                        region, fresh_excl, fresh_contours
+                    )
+                    region.confidence = min(
+                        1.0, region.confidence * 0.7 + hw_conf * 0.3
                     )
                     if region.printable_mask is not None:
                         hard = (
@@ -1068,6 +1060,14 @@ class CoverSurfaceEngine:
 
         img = to_bgr(phone_bgr)
         h, w = img.shape[:2]
+        sil_key = (
+            CoverSurfaceEngine._image_cache_key(img),
+            cover_quad is not None,
+        )
+        cached_sil = CoverSurfaceEngine._WRAP_SIL_CACHE.get(sil_key)
+        if cached_sil is not None:
+            CoverSurfaceEngine._WRAP_SIL_CACHE.move_to_end(sil_key)
+            return cached_sil.copy()
         frame = float(h * w)
 
         photo: Optional[np.ndarray] = None
@@ -1163,6 +1163,11 @@ class CoverSurfaceEngine:
             filled = cv2.bitwise_and(filled, device)
             if float(np.count_nonzero(filled)) <= float(h * w) * 0.82:
                 out = filled
+        cache = CoverSurfaceEngine._WRAP_SIL_CACHE
+        cache[sil_key] = out.copy()
+        cache.move_to_end(sil_key)
+        while len(cache) > CoverSurfaceEngine._WRAP_SIL_CACHE_MAX:
+            cache.popitem(last=False)
         return out
 
     @staticmethod
